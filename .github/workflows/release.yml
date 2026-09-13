@@ -88,7 +88,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
             librsvg2-dev \
             patchelf \
             libgtk-3-dev \
@@ -109,14 +108,12 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # --- Optional code signing (only used if the secrets are set) ---
-          # macOS notarization / signing:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        # macOS/Windows builds are UNSIGNED by default (first-run warning on the
+        # user's machine). To enable Apple signing + notarization, add a separate
+        # step that sets APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
+        # APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID from
+        # secrets ONLY when they exist. Passing them here empty makes the bundler
+        # try (and fail) to import an empty certificate.
         with:
           # Attach to the release semantic-release already created for this tag.
           tagName: v${{ needs.release.outputs.version }}
