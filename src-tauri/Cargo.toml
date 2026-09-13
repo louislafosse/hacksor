@@ -1,6 +1,6 @@
 [package]
 name = "hacksor"
-version = "0.1.0"
+version = "1.0.0"
 description = "Hacksor: local-first AI penetration testing assistant on the Codex harness"
 authors = ["Hacksor"]
 edition = "2021"
