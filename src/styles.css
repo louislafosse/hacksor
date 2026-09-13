@@ -280,7 +280,7 @@ button.ghost:hover { background: var(--accent); }
 .wincontrols .win-btn:hover { background: rgba(127, 127, 127, 0.18); }
 /* The maximize glyph (U+25A1) fills less of its em box than the others, so it
    reads as tiny at the base size; bump it so the square matches the caption row. */
-.wincontrols #win-max { font-size: 14px; }
+.wincontrols #win-max { font-size: 17px; }
 .wincontrols .win-close { font-size: 17px; }
 .wincontrols .win-close:hover { background: #e81123; color: #fff; }
 [data-tauri-drag-region] { -webkit-app-region: drag; }
