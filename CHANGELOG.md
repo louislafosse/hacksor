@@ -1,3 +1,15 @@
+# [1.3.0](https://github.com/louislafosse/hacksor/compare/v1.2.1...v1.3.0) (2026-09-13)
+
+
+### Bug Fixes
+
+* **runtime:** bridge ocx to the published port on Docker Desktop ([024d164](https://github.com/louislafosse/hacksor/commit/024d1643e5038e72ba2f275a431d1bc4c40db9cb))
+
+
+### Features
+
+* **ui:** show an install-Docker banner when Docker is missing ([29b8424](https://github.com/louislafosse/hacksor/commit/29b8424a5f14299ceffb793541a2baf243007509))
+
 ## [1.2.1](https://github.com/louislafosse/hacksor/compare/v1.2.0...v1.2.1) (2026-09-13)
 
 
