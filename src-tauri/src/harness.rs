@@ -117,6 +117,15 @@ pub struct Harness {
     _child: Mutex<Child>,
 }
 
+/// The last few non-empty lines of the app-server's captured stderr, for error
+/// messages. Empty when nothing was captured.
+async fn stderr_tail(buf: &Arc<Mutex<String>>) -> String {
+    let s = buf.lock().await;
+    let mut tail: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).rev().take(4).collect();
+    tail.reverse();
+    tail.join("\n")
+}
+
 impl Harness {
     pub async fn new(codex_home: PathBuf, app: AppHandle, launch: LaunchMode) -> Result<Arc<Self>> {
         // Register the Playwright MCP browser server only in Docker mode, where it
@@ -170,16 +179,39 @@ impl Harness {
                 c
             }
         };
-        let mut child = cmd
-            .stdin(Stdio::piped())
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
+            // Capture stderr so an unexpected exit can report WHY (was discarded).
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        // On Windows the app-server is a long-lived `docker exec`; hide its console.
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let mut child = cmd
             .spawn()
             .context("spawn codex app-server (host: is codex installed? docker: is the runtime container running?)")?;
 
         let stdin = child.stdin.take().context("codex stdin")?;
         let stdout = child.stdout.take().context("codex stdout")?;
+        let stderr = child.stderr.take().context("codex stderr")?;
+
+        // Accumulate the app-server's stderr (bounded) for crash diagnostics.
+        let stderr_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        {
+            let buf = Arc::clone(&stderr_buf);
+            tauri::async_runtime::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let mut b = buf.lock().await;
+                    b.push_str(&line);
+                    b.push('\n');
+                    if b.len() > 4000 {
+                        let cut = b.len() - 4000;
+                        *b = b.split_off(cut);
+                    }
+                }
+            });
+        }
 
         let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -206,6 +238,7 @@ impl Harness {
         // surface the drop; the next command respawns a fresh harness.
         {
             let harness = Arc::clone(&harness);
+            let stderr_buf = Arc::clone(&stderr_buf);
             tauri::async_runtime::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -217,23 +250,32 @@ impl Harness {
                     }
                 }
                 harness.alive.store(false, Ordering::SeqCst);
+                let tail = stderr_tail(&stderr_buf).await;
+                let exit_msg = if tail.is_empty() { "codex app-server exited".to_string() } else { format!("codex app-server exited: {tail}") };
                 let mut pend = harness.pending.lock().await;
                 for (_, tx) in pend.drain() {
-                    let _ = tx.send(Err("codex app-server exited".into()));
+                    let _ = tx.send(Err(exit_msg.clone()));
                 }
                 // Only surface a crash notice for an UNEXPECTED exit. A deliberate
                 // teardown (settings/key/runtime change, app exit) set `intentional`,
                 // so the next command silently respawns a fresh harness instead.
                 if !harness.intentional.load(Ordering::SeqCst) {
+                    let base = "The agent backend stopped unexpectedly and was restarted. Please resend your last message.";
+                    let message = if tail.is_empty() { base.to_string() } else { format!("{base}\n\n{tail}") };
                     let _ = harness.app.emit(
                         "hacksor://event",
-                        json!({ "method": "error", "params": { "message": "The agent backend stopped unexpectedly and was restarted. Please resend your last message." } }),
+                        json!({ "method": "error", "params": { "message": message } }),
                     );
                 }
             });
         }
 
-        harness.initialize().await?;
+        // Surface the app-server's own stderr if the initialize handshake fails
+        // because the process died on startup.
+        if let Err(e) = harness.initialize().await {
+            let tail = stderr_tail(&stderr_buf).await;
+            return Err(if tail.is_empty() { e } else { anyhow::anyhow!("{e}\n{tail}") });
+        }
         Ok(harness)
     }
 
