@@ -512,12 +512,21 @@ pub async fn list_models(
         .await
         .map_err(|e| e.to_string())?;
     // A keyed upstream (OpenRouter/Vercel) with a configured key but zero models
-    // means ocx couldn't load that provider's catalog — usually a rejected key,
-    // or it hasn't synced yet. Surface the reason instead of a silent empty list
-    // (which just looks like "no models available").
+    // means ocx hasn't surfaced that provider's catalog. ocx only exposes a
+    // provider's models on /v1/models after a live discovery + catalog sync, and
+    // a provider added after the last start won't be synced yet — so force a
+    // fetch and retry once before giving up.
     if models.is_empty() {
         if let Some(upstream) = p.ocx_upstream() {
             let docker = docker_runtime(&state).await;
+            // `ocx sync` fetches the configured providers' catalogs into the live
+            // catalog (does not restart the running app-server).
+            let _ = run_ocx(&["sync"], None, docker).await;
+            let retry = models::fetch_models(p, key.as_deref()).await.map_err(|e| e.to_string())?;
+            if !retry.is_empty() {
+                return Ok(retry);
+            }
+            // Still empty — run a live provider test and report the reason.
             let diag = match run_ocx(&["provider", "test", upstream], None, docker).await {
                 Ok(o) | Err(o) => o.to_lowercase(),
             };
@@ -527,10 +536,12 @@ pub async fn list_models(
                 "the key was forbidden (HTTP 403) — it may lack model access."
             } else if diag.contains("not running") {
                 "the proxy isn't ready yet. Try again in a moment."
+            } else if diag.contains(": ok") || diag.contains("success") {
+                "the key works, but the gateway returned no models — make sure models are enabled/allowed in your provider dashboard."
             } else if diag.contains("discovery") || diag.contains("failed") {
                 "the provider rejected the request or exposes no models for this key."
             } else {
-                "the key may be invalid, or the catalog hasn't synced yet — reopen this menu in a moment."
+                "the key may be invalid, or the catalog hasn't synced — reopen this menu in a moment."
             };
             return Err(format!("No {} models — {reason}", p.display()));
         }
