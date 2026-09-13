@@ -1,3 +1,10 @@
+## [1.0.1](https://github.com/louislafosse/hacksor/compare/v1.0.0...v1.0.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* **providers:** list models from ocx live catalog; open web dashboard ([ff5b90c](https://github.com/louislafosse/hacksor/commit/ff5b90c0cb8715a10da2a8391b1ed4d9b672c9be))
+
 # 1.0.0 (2026-09-13)
 
 
