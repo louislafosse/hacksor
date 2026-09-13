@@ -214,12 +214,12 @@ pub async fn ensure_opencodex_cmd(state: State<'_, AppState>) -> Result<(), Stri
 /// Open OpenCodex's setup GUI (`ocx gui`) so the user can add providers/keys.
 #[tauri::command]
 pub fn open_opencodex_setup() -> Result<(), String> {
-    let bin = which_bin("ocx")
-        .ok_or_else(|| "OpenCodex is not installed. Run `npm i -g @bitkyc08/opencodex`.".to_string())?;
-    // spawn_detached wraps Windows `.cmd`/`.bat` shims in `cmd /C` (CreateProcess
-    // can't launch them directly), so the dashboard opens on every platform.
-    platform::spawn_detached(&bin, &["gui"]).map_err(|e| e.to_string())?;
-    Ok(())
+    // ocx serves its provider dashboard as a web page at the proxy root. Open that
+    // in the browser instead of running `ocx gui`: it works on every platform and
+    // in Docker mode (where ocx is only in the container — the port is published/
+    // bridged to the host), with no host ocx install and no display needed.
+    let url = format!("http://127.0.0.1:{}/", models::OPENCODEX_PORT);
+    platform::open_url(&url).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -505,28 +505,21 @@ pub async fn list_models(
             p.display()
         ));
     }
-    if p.is_local_proxy() {
-        ensure_opencodex(&state).await?;
-    }
-    let models = models::fetch_models(p, key.as_deref())
+    let docker = docker_runtime(&state).await;
+    // ocx must be up (with its upstreams configured from the saved keys) to
+    // enumerate the live catalog.
+    ensure_opencodex(&state).await?;
+    // ocx exposes provider catalogs ONLY through `models live` — /v1/models
+    // carries just its own native models. Read the live catalog (JSON) and keep
+    // this provider's upstream.
+    let json = run_ocx(&["models", "live", "--json"], None, docker)
         .await
-        .map_err(|e| e.to_string())?;
-    // A keyed upstream (OpenRouter/Vercel) with a configured key but zero models
-    // means ocx hasn't surfaced that provider's catalog. ocx only exposes a
-    // provider's models on /v1/models after a live discovery + catalog sync, and
-    // a provider added after the last start won't be synced yet — so force a
-    // fetch and retry once before giving up.
+        .map_err(|e| format!("Could not read the model catalog from OpenCodex: {e}"))?;
+    let models = models::parse_live_models(&json, p.ocx_upstream());
+    // A keyed upstream (OpenRouter/Vercel) with a key but zero models: explain why
+    // instead of showing a silent empty list.
     if models.is_empty() {
         if let Some(upstream) = p.ocx_upstream() {
-            let docker = docker_runtime(&state).await;
-            // `ocx sync` fetches the configured providers' catalogs into the live
-            // catalog (does not restart the running app-server).
-            let _ = run_ocx(&["sync"], None, docker).await;
-            let retry = models::fetch_models(p, key.as_deref()).await.map_err(|e| e.to_string())?;
-            if !retry.is_empty() {
-                return Ok(retry);
-            }
-            // Still empty — run a live provider test and report the reason.
             let diag = match run_ocx(&["provider", "test", upstream], None, docker).await {
                 Ok(o) | Err(o) => o.to_lowercase(),
             };
@@ -536,12 +529,10 @@ pub async fn list_models(
                 "the key was forbidden (HTTP 403) — it may lack model access."
             } else if diag.contains("not running") {
                 "the proxy isn't ready yet. Try again in a moment."
-            } else if diag.contains(": ok") || diag.contains("success") {
-                "the key works, but the gateway returned no models — make sure models are enabled/allowed in your provider dashboard."
-            } else if diag.contains("discovery") || diag.contains("failed") {
-                "the provider rejected the request or exposes no models for this key."
+            } else if diag.contains("connected") || diag.contains(": ok") || diag.contains("success") {
+                "the key works, but no models are exposed for it — make sure models are enabled in your provider dashboard."
             } else {
-                "the key may be invalid, or the catalog hasn't synced — reopen this menu in a moment."
+                "the key may be invalid, or the proxy is still starting — reopen this menu in a moment."
             };
             return Err(format!("No {} models — {reason}", p.display()));
         }

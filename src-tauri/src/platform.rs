@@ -47,22 +47,20 @@ pub fn which(tool: &str) -> Option<String> {
     None
 }
 
-/// Spawn a resolved tool executable with args, detached (stdio nulled). On
-/// Windows, npm-installed CLIs are `.cmd`/`.bat` shims that `CreateProcess`
-/// cannot run directly, so wrap those in `cmd /C`; a hidden console avoids a
-/// flashing window. Used to launch external helpers like `ocx gui`.
-pub fn spawn_detached(bin: &str, args: &[&str]) -> std::io::Result<std::process::Child> {
-    let is_shim = {
-        let l = bin.to_ascii_lowercase();
-        l.ends_with(".cmd") || l.ends_with(".bat")
-    };
-    let mut cmd = if IS_WINDOWS && is_shim {
+/// Open a URL in the user's default browser, per platform. Detached, no console.
+pub fn open_url(url: &str) -> std::io::Result<()> {
+    let mut cmd = if IS_WINDOWS {
         let mut c = Command::new("cmd");
-        c.arg("/C").arg(bin).args(args);
+        // `start` treats the first quoted arg as the window title, so pass "" then the url.
+        c.args(["/C", "start", "", url]);
+        c
+    } else if IS_MACOS {
+        let mut c = Command::new("open");
+        c.arg(url);
         c
     } else {
-        let mut c = Command::new(bin);
-        c.args(args);
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
         c
     };
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -71,7 +69,7 @@ pub fn spawn_detached(bin: &str, args: &[&str]) -> std::io::Result<std::process:
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    cmd.spawn()
+    cmd.spawn().map(|_| ())
 }
 
 /// The `-u uid:gid` identity for `docker exec`, or `None` to run as the container

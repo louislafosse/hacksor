@@ -123,89 +123,59 @@ pub struct ModelInfo {
     pub reasoning_effort: String,
 }
 
-/// Fetch the model catalog from the OpenCodex proxy and return the subset that
-/// belongs to this composer provider's upstream. ocx serves a merged catalog
-/// where each model id is prefixed with its upstream (`openrouter/…`,
-/// `vercel-ai-gateway/…`, `anthropic/…`); we filter by that prefix so the
-/// OpenRouter/Vercel selections show only their own models, while the OpenCodex
-/// selection shows everything. `_api_key` is unused (the proxy is local).
-pub async fn fetch_models(provider: Provider, _api_key: Option<&str>) -> anyhow::Result<Vec<ModelInfo>> {
-    let client = reqwest::Client::builder()
-        .user_agent("hacksor/0.1")
-        .build()?;
-    let resp = client.get(provider.models_url()).send().await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("OpenCodex proxy returned {status}: {}", truncate(&body, 200));
-    }
-    let value: serde_json::Value = resp.json().await?;
-    let data = value
-        .get("data")
-        .and_then(|d| d.as_array())
-        .or_else(|| value.get("models").and_then(|d| d.as_array()))
-        .or_else(|| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let prefix = provider.ocx_upstream().map(|u| format!("{u}/"));
-    let mut models: Vec<ModelInfo> = data
+/// Parse the JSON array from `ocx models live --json` into the subset that
+/// belongs to `upstream` (e.g. `openrouter`, `vercel-ai-gateway`), or the native
+/// OpenCodex routing models when `upstream` is `None`. This is the authoritative
+/// live catalog — ocx does NOT expose provider models on `/v1/models`, only its
+/// own native models, so per-provider selection must read this instead.
+pub fn parse_live_models(json: &str, upstream: Option<&str>) -> Vec<ModelInfo> {
+    let arr: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
+    let mut models: Vec<ModelInfo> = arr
         .iter()
-        .filter_map(parse_model)
-        .filter(|m| match &prefix {
-            Some(p) => m.id.starts_with(p.as_str()),
-            None => true,
+        .filter(|m| match upstream {
+            // A provider view: only that upstream's models.
+            Some(u) => m.get("provider").and_then(|p| p.as_str()) == Some(u),
+            // OpenCodex view: its native routing models.
+            None => m.get("native").and_then(|n| n.as_bool()).unwrap_or(false),
         })
+        .filter_map(parse_live_model)
         .collect();
     models.sort_by(|a, b| a.id.to_lowercase().cmp(&b.id.to_lowercase()));
-    Ok(models)
+    models
 }
 
-fn parse_model(v: &serde_json::Value) -> Option<ModelInfo> {
-    let id = v.get("id")?.as_str()?.to_string();
+fn parse_live_model(v: &serde_json::Value) -> Option<ModelInfo> {
+    // `namespaced` is the id ocx routes on (e.g. `openrouter/~anthropic/…`);
+    // `id` is the shorter per-provider slug used as the label.
+    let id = v.get("namespaced").and_then(|x| x.as_str())?.to_string();
     let display_name = v
-        .get("name")
-        .and_then(|n| n.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| id.clone());
-    let description = v
-        .get("description")
-        .and_then(|d| d.as_str())
-        .unwrap_or("")
-        .chars()
-        .take(180)
-        .collect::<String>();
+        .get("id")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&id)
+        .to_string();
     let context_length = v
-        .get("context_length")
+        .get("contextWindow")
         .or_else(|| v.get("context_window"))
-        .or_else(|| v.get("max_tokens"))
         .and_then(|c| c.as_u64());
-
-    // Vision support: OpenRouter → architecture.input_modalities; Vercel → modalities.input.
-    let modalities = v
-        .get("architecture")
-        .and_then(|a| a.get("input_modalities"))
-        .or_else(|| v.get("modalities").and_then(|m| m.get("input")))
-        .and_then(|m| m.as_array());
-    let supports_vision = modalities
-        .map(|arr| arr.iter().any(|x| x.as_str() == Some("image")))
+    let supports_vision = v
+        .get("inputModalities")
+        .and_then(|m| m.as_array())
+        .map(|a| a.iter().any(|x| x.as_str() == Some("image")))
         .unwrap_or(false);
-
-    let prompt_price = v
-        .get("pricing")
-        .and_then(|p| p.get("prompt").or_else(|| p.get("input")))
-        .and_then(|p| p.as_str())
-        .map(|s| s.to_string());
-
-    let reasoning_effort = infer_effort(&id).to_string();
-
+    let reasoning_effort = v
+        .get("defaultReasoningEffort")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| infer_effort(&id).to_string());
     Some(ModelInfo {
         id,
         display_name,
-        description,
+        description: String::new(),
         context_length,
         supports_vision,
-        prompt_price,
+        prompt_price: None,
         reasoning_effort,
     })
 }
@@ -223,9 +193,6 @@ pub fn infer_effort(slug: &str) -> &'static str {
     }
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
-}
 
 #[cfg(test)]
 mod tests {
