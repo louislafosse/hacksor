@@ -135,6 +135,27 @@ async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
             platform::docker_exec_user(),
         )
         .await;
+        // Docker Desktop (macOS/Windows): ocx binds only to 127.0.0.1 inside the
+        // container, so the published host port (which forwards to the container's
+        // external interface) can't reach it and the proxy never looks "ready".
+        // Bridge the container's own IP to ocx's loopback with socat so both the
+        // published port and in-container clients reach it. On Linux the container
+        // shares the host's 127.0.0.1 (host networking), so no bridge is needed.
+        if !platform::IS_LINUX {
+            let port = models::OPENCODEX_PORT;
+            let _ = runtime::exec_detached(
+                RUNTIME_CONTAINER,
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!(
+                        "socat TCP-LISTEN:{port},fork,reuseaddr,bind=$(hostname -i | awk '{{print $1}}') TCP:127.0.0.1:{port}"
+                    ),
+                ],
+                platform::docker_exec_user(),
+            )
+            .await;
+        }
         for _ in 0..24 {
             if opencodex_up().await {
                 return Ok(());
