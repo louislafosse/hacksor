@@ -468,6 +468,37 @@ const EFFORTS: { v: string; label: string }[] = [
 const sendBtn = document.getElementById("send") as HTMLButtonElement;
 const hint = document.getElementById("hint") as HTMLDivElement;
 
+// Runtime provisioning state: while the Docker runtime is pulling/building/
+// starting, the composer is blocked and the full build log is accumulated so the
+// user can open it from the banner.
+let runtimeBusy = false;
+let runtimeLog = "";
+let buildDrawerOpen = false;
+
+// Block/unblock the composer and tell the user to wait during a runtime build.
+function applyRuntimeLock() {
+  const composer = document.getElementById("composer");
+  if (!composer) return;
+  input.disabled = runtimeBusy;
+  sendBtn.disabled = runtimeBusy;
+  composer.classList.toggle("locked", runtimeBusy);
+  if (runtimeBusy) {
+    if (input.dataset.ph === undefined) input.dataset.ph = input.placeholder;
+    input.placeholder = "Preparing the runtime environment — please wait until the build finishes…";
+  } else if (input.dataset.ph !== undefined) {
+    input.placeholder = input.dataset.ph;
+    delete input.dataset.ph;
+  }
+}
+
+// Open the right-side drawer showing the live Docker build output.
+function showBuildLog() {
+  openToolDrawer("🐳", "Runtime build output", runtimeLog || "Waiting for build output…");
+  buildDrawerOpen = true;
+  const body = document.getElementById("td-body") as HTMLElement;
+  body.scrollTop = body.scrollHeight;
+}
+
 function toggleSidebar() {
   sidebar.classList.toggle("collapsed");
 }
@@ -1271,9 +1302,15 @@ async function boot() {
 // runtime switch. Errors surface in the banner (e.g. Docker not installed).
 function prepareRuntime() {
   invoke("prepare_runtime").catch((e) => {
-    // Don't nag on host mode or when Docker just isn't there yet; the banner /
-    // next action will report it. Log to the hint softly.
+    // Provisioning failed (e.g. Docker missing, or the build errored): never leave
+    // the composer stuck as blocked. Unblock it and surface the reason.
+    runtimeBusy = false;
+    applyRuntimeLock();
     const msg = String(e);
+    if (rtBanner) {
+      rtBanner.classList.remove("busy");
+      (rtBanner.querySelector(".rt-msg") as HTMLElement).textContent = "⚠ " + msg;
+    }
     if (/docker/i.test(msg)) hint.textContent = msg;
   });
 }
@@ -1434,6 +1471,8 @@ function renderEmpty(session: Session) {
 }
 
 async function onSend() {
+  // Runtime still provisioning: don't send, show the user why (the build log).
+  if (runtimeBusy) { showBuildLog(); return; }
   const text = input.value.trim();
   const session = activeSession();
   if (!text || !session) return;
@@ -2134,6 +2173,7 @@ function toolCard(icon: string, label: string, extraCls = "") {
 
 // Right-side drawer showing one tool's full output, larger and copyable.
 function openToolDrawer(icon: string, title: string, content: string) {
+  buildDrawerOpen = false; // a tool output, not the live build log (the caller re-sets it)
   const drawer = document.getElementById("tooldrawer") as HTMLElement;
   (document.getElementById("td-icon") as HTMLElement).textContent = icon;
   (document.getElementById("td-title") as HTMLElement).textContent = title;
@@ -2142,6 +2182,7 @@ function openToolDrawer(icon: string, title: string, content: string) {
   document.getElementById("app")!.classList.add("drawer-open");
 }
 function closeToolDrawer() {
+  buildDrawerOpen = false;
   (document.getElementById("tooldrawer") as HTMLElement).hidden = true;
   document.getElementById("app")!.classList.remove("drawer-open");
 }
@@ -2350,18 +2391,33 @@ function reviewerModel(): string {
 // ---------------------------------------------------------------- events
 
 // Runtime provisioning banner (Docker mode auto-pull/build/start progress).
+// Accumulate the Docker build output; update the drawer live if it's open.
+listen<{ line: string }>("hacksor://runtime-log", (evt) => {
+  runtimeLog += evt.payload.line + "\n";
+  if (buildDrawerOpen) {
+    const body = document.getElementById("td-body") as HTMLElement;
+    body.textContent = runtimeLog;
+    body.scrollTop = body.scrollHeight;
+  }
+});
+
 let rtBanner: HTMLElement | null = null;
 listen<{ phase: string; message: string; percent?: number }>("hacksor://runtime", (evt) => {
   const { phase, message, percent } = evt.payload;
   if (!rtBanner) {
     rtBanner = el("div", "runtime-banner");
-    rtBanner.innerHTML = `<div class="rt-row"><span class="rt-msg"></span><span class="rt-pct"></span></div><div class="rt-bar"><div class="rt-fill"></div></div>`;
+    rtBanner.innerHTML = `<div class="rt-row"><span class="rt-msg"></span><button class="rt-view" type="button">View build output</button><span class="rt-pct"></span></div><div class="rt-bar"><div class="rt-fill"></div></div>`;
+    rtBanner.querySelector(".rt-view")!.addEventListener("click", showBuildLog);
     app.appendChild(rtBanner);
   }
   const busy = phase === "building" || phase === "starting" || phase === "pulling";
+  runtimeBusy = busy;
+  applyRuntimeLock();
   const icon = busy ? "⏳ " : "✓ ";
   (rtBanner.querySelector(".rt-msg") as HTMLElement).textContent = icon + message;
   rtBanner.classList.toggle("busy", busy);
+  // The "View build output" button is useful once there's build output to show.
+  (rtBanner.querySelector(".rt-view") as HTMLElement).hidden = !(phase === "building" || runtimeLog.length > 0);
   // Show a real progress bar while pulling (percent present); hide it otherwise.
   const hasPct = typeof percent === "number" && phase === "pulling";
   const bar = rtBanner.querySelector(".rt-bar") as HTMLElement;
@@ -2776,6 +2832,30 @@ function openSettings(force = false) {
   };
   bg.querySelector("#s-or-clear")?.addEventListener("click", () => clearKey("openrouter_api_key"));
   bg.querySelector("#s-vc-clear")?.addEventListener("click", () => clearKey("vercel_api_key"));
+  // Enter in a key field saves just that key and shows it as set (badge → Saved,
+  // masked placeholder), without discarding other unsaved fields in the modal.
+  const saveKeyInline = async (which: "openrouter_api_key" | "vercel_api_key", inputEl: HTMLInputElement) => {
+    const val = inputEl.value.trim();
+    if (!val) return;
+    inputEl.disabled = true;
+    try {
+      await invoke("save_settings", { args: { [which]: val } });
+      const s = await invoke<SettingsView>("get_settings");
+      state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key };
+      inputEl.value = "";
+      inputEl.classList.add("saved");
+      inputEl.placeholder = "•••••••••••••• — leave blank to keep";
+      const badge = inputEl.closest(".field")?.querySelector(".unset-badge, .saved-badge") as HTMLElement | null;
+      if (badge) { badge.textContent = "✓ Saved"; badge.className = "saved-badge"; }
+      loadModels();
+    } catch (e) {
+      alert(String(e));
+    } finally {
+      inputEl.disabled = false;
+    }
+  };
+  orInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveKeyInline("openrouter_api_key", orInput); } });
+  vcInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveKeyInline("vercel_api_key", vcInput); } });
   // Cloudflare creds (for cloudfish): populate current state from get_settings.
   const cfKey = bg.querySelector("#s-cf-key") as HTMLInputElement;
   const cfEmail = bg.querySelector("#s-cf-email") as HTMLInputElement;

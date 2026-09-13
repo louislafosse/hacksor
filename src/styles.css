@@ -278,7 +278,10 @@ button.ghost:hover { background: var(--accent); }
   font-size: 12px; line-height: 1; color: var(--foreground);
 }
 .wincontrols .win-btn:hover { background: rgba(127, 127, 127, 0.18); }
-.wincontrols .win-close { font-size: 15px; }
+/* The maximize glyph (U+25A1) fills less of its em box than the others, so it
+   reads as tiny at the base size; bump it so the square matches the caption row. */
+.wincontrols #win-max { font-size: 14px; }
+.wincontrols .win-close { font-size: 17px; }
 .wincontrols .win-close:hover { background: #e81123; color: #fff; }
 [data-tauri-drag-region] { -webkit-app-region: drag; }
 .topbar button, .topbar select { -webkit-app-region: no-drag; }
@@ -677,6 +680,15 @@ input::placeholder, textarea::placeholder { color: var(--muted-foreground); }
 .runtime-banner .rt-bar { margin-top: 7px; height: 6px; border-radius: 999px; background: var(--muted); overflow: hidden; }
 .runtime-banner .rt-fill { height: 100%; width: 0; border-radius: 999px; background: #51da4c; transition: width 0.25s ease; }
 .runtime-banner.busy .rt-msg { animation: think-pulse 1.4s ease-in-out infinite; }
+.runtime-banner .rt-view {
+  flex: none; border: 1px solid var(--border); background: transparent; color: var(--foreground);
+  font: inherit; font-size: 12px; padding: 3px 9px; border-radius: 7px; cursor: pointer; white-space: nowrap;
+}
+.runtime-banner .rt-view:hover { background: rgba(127, 127, 127, 0.16); }
+/* Composer blocked while the runtime image builds/starts. */
+.composer.locked { opacity: 0.55; }
+.composer.locked #input { cursor: progress; }
+.composer.locked .send { cursor: not-allowed; }
 
 /* Syntax highlighting (highlight.js) — a compact, mid-tone palette that reads on
    both the light (#f8f8f8) and dark (#222) code backgrounds. */

@@ -18,9 +18,21 @@ use bollard::models::{DeviceMapping, HostConfig, PortBinding};
 use bollard::Docker;
 use futures_util::StreamExt;
 
-/// Connect to the local Docker engine (socket/pipe per platform).
-pub fn connect() -> Result<Docker, String> {
-    Docker::connect_with_local_defaults().map_err(|e| format!("cannot reach the Docker engine: {e}"))
+/// Connect to the local Docker engine (socket/pipe per platform) and negotiate
+/// the API version with the daemon. The negotiation matters on Docker Desktop
+/// (especially Windows): without it bollard uses its built-in default API
+/// version, and a mismatch makes POST endpoints like `/containers/create`
+/// return a body bollard can't parse ("expected value at line 1 column 1")
+/// even though GET calls (ping/inspect/build) succeed. If negotiation itself
+/// fails we fall back to the default client so nothing regresses.
+pub async fn connect() -> Result<Docker, String> {
+    let d = Docker::connect_with_local_defaults()
+        .map_err(|e| format!("cannot reach the Docker engine: {e}"))?;
+    match d.negotiate_version().await {
+        Ok(d) => Ok(d),
+        Err(_) => Docker::connect_with_local_defaults()
+            .map_err(|e| format!("cannot reach the Docker engine: {e}")),
+    }
 }
 
 /// Is the Docker engine reachable? (Replaces the old `docker --version` probe.)
@@ -33,7 +45,7 @@ pub async fn docker_present() -> bool {
 
 /// Does a local image with this name exist?
 pub async fn image_exists(name: &str) -> bool {
-    match connect() {
+    match connect().await {
         Ok(d) => d.inspect_image(name).await.is_ok(),
         Err(_) => false,
     }
@@ -41,7 +53,7 @@ pub async fn image_exists(name: &str) -> bool {
 
 /// Is a container with this name currently running?
 pub async fn container_running(name: &str) -> bool {
-    let Ok(d) = connect() else { return false };
+    let Ok(d) = connect().await else { return false };
     match d.inspect_container(name, None).await {
         Ok(info) => info.state.and_then(|s| s.running).unwrap_or(false),
         Err(_) => false,
@@ -50,7 +62,7 @@ pub async fn container_running(name: &str) -> bool {
 
 /// Force-remove a container (ignore "not found").
 pub async fn remove_container(name: &str) {
-    if let Ok(d) = connect() {
+    if let Ok(d) = connect().await {
         let _ = d
             .remove_container(name, Some(RemoveContainerOptions { force: true, ..Default::default() }))
             .await;
@@ -71,7 +83,7 @@ pub struct RunSpec {
 /// Create + start the runtime container with the platform-appropriate config.
 /// Mirrors the previous `docker run` argv exactly, expressed via the API.
 pub async fn create_and_start(spec: &RunSpec) -> Result<(), String> {
-    let d = connect()?;
+    let d = connect().await?;
     remove_container(&spec.name).await;
 
     let mut host_config = HostConfig {
@@ -142,7 +154,7 @@ pub async fn exec_output(
     user: Option<String>,
     stdin: Option<&str>,
 ) -> Result<(String, i64), String> {
-    let d = connect()?;
+    let d = connect().await?;
     let exec = d
         .create_exec(
             container,
@@ -181,7 +193,7 @@ pub async fn exec_output(
 
 /// Start a command in the container detached (fire-and-forget), as `user`.
 pub async fn exec_detached(container: &str, cmd: Vec<String>, user: Option<String>) -> Result<(), String> {
-    let d = connect()?;
+    let d = connect().await?;
     let exec = d
         .create_exec(
             container,
@@ -204,7 +216,7 @@ pub async fn exec_detached(container: &str, cmd: Vec<String>, user: Option<Strin
 
 /// Tag an image locally (e.g. the pulled registry image → `hacksor-runtime:latest`).
 pub async fn tag(source: &str, dest_repo: &str, dest_tag: &str) -> Result<(), String> {
-    let d = connect()?;
+    let d = connect().await?;
     d.tag_image(source, Some(TagImageOptions { repo: dest_repo, tag: dest_tag }))
         .await
         .map_err(|e| format!("tag image: {e}"))
@@ -213,7 +225,7 @@ pub async fn tag(source: &str, dest_repo: &str, dest_tag: &str) -> Result<(), St
 /// Pull an image, invoking `on_progress(current_bytes, total_bytes)` as layers
 /// download so the caller can render a progress bar.
 pub async fn pull<F: Fn(i64, i64)>(image: &str, on_progress: F) -> Result<(), String> {
-    let d = connect()?;
+    let d = connect().await?;
     let opts = CreateImageOptions { from_image: image, ..Default::default() };
     let mut stream = d.create_image(Some(opts), None, None);
     let mut layers: std::collections::HashMap<String, (i64, i64)> = std::collections::HashMap::new();
@@ -238,7 +250,7 @@ pub async fn pull<F: Fn(i64, i64)>(image: &str, on_progress: F) -> Result<(), St
 /// context is a minimal in-memory tar containing just the Dockerfile. Invokes
 /// `on_line(&str)` for each build log line so the caller can surface progress.
 pub async fn build<F: Fn(&str)>(dockerfile: &str, tag_name: &str, on_line: F) -> Result<(), String> {
-    let d = connect()?;
+    let d = connect().await?;
     // Tar the context (just the Dockerfile).
     let mut tar_buf = Vec::new();
     {

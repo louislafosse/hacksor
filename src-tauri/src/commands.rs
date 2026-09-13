@@ -195,13 +195,9 @@ pub async fn ensure_opencodex_cmd(state: State<'_, AppState>) -> Result<(), Stri
 pub fn open_opencodex_setup() -> Result<(), String> {
     let bin = which_bin("ocx")
         .ok_or_else(|| "OpenCodex is not installed. Run `npm i -g @bitkyc08/opencodex`.".to_string())?;
-    std::process::Command::new(bin)
-        .arg("gui")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    // spawn_detached wraps Windows `.cmd`/`.bat` shims in `cmd /C` (CreateProcess
+    // can't launch them directly), so the dashboard opens on every platform.
+    platform::spawn_detached(&bin, &["gui"]).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1526,6 +1522,9 @@ async fn build_runtime_image(app: &AppHandle, codex_home: &std::path::Path) -> R
     let dockerfile = effective_dockerfile(codex_home);
     let app2 = app.clone();
     runtime::build(&dockerfile, RUNTIME_IMAGE, move |line| {
+        // Full build log, streamed line-by-line for the output viewer the user
+        // can open from the build banner.
+        let _ = app2.emit("hacksor://runtime-log", serde_json::json!({ "line": line }));
         // Surface the last build step so the banner isn't a dead "Building…".
         if line.starts_with("Step") || line.starts_with("#") {
             let _ = app2.emit("hacksor://runtime", serde_json::json!({

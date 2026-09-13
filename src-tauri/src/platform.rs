@@ -47,6 +47,33 @@ pub fn which(tool: &str) -> Option<String> {
     None
 }
 
+/// Spawn a resolved tool executable with args, detached (stdio nulled). On
+/// Windows, npm-installed CLIs are `.cmd`/`.bat` shims that `CreateProcess`
+/// cannot run directly, so wrap those in `cmd /C`; a hidden console avoids a
+/// flashing window. Used to launch external helpers like `ocx gui`.
+pub fn spawn_detached(bin: &str, args: &[&str]) -> std::io::Result<std::process::Child> {
+    let is_shim = {
+        let l = bin.to_ascii_lowercase();
+        l.ends_with(".cmd") || l.ends_with(".bat")
+    };
+    let mut cmd = if IS_WINDOWS && is_shim {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(bin).args(args);
+        c
+    } else {
+        let mut c = Command::new(bin);
+        c.args(args);
+        c
+    };
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.spawn()
+}
+
 /// The `-u uid:gid` identity for `docker exec`, or `None` to run as the container
 /// default (root). Only meaningful on Linux, where a root process in the
 /// container would create root-owned files in the bind-mounted home. Docker
