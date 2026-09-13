@@ -1,3 +1,10 @@
+## [1.0.2](https://github.com/louislafosse/hacksor/compare/v1.0.1...v1.0.2) (2026-09-13)
+
+
+### Bug Fixes
+
+* **harness:** capture app-server stderr for crash diagnostics ([45fe5bc](https://github.com/louislafosse/hacksor/commit/45fe5bc5c53630b5208056385e0e4084e17170c2))
+
 ## [1.0.1](https://github.com/louislafosse/hacksor/compare/v1.0.0...v1.0.1) (2026-09-13)
 
 
