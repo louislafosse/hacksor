@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/louislafosse/hacksor/compare/v1.0.1...v1.1.0) (2026-09-13)
+
+
+### Features
+
+* **bundle:** add Linux AppImage target ([1c42e69](https://github.com/louislafosse/hacksor/commit/1c42e69c962ff3bec487eab64b0af966817a15cf))
+
 ## [1.0.1](https://github.com/louislafosse/hacksor/compare/v1.0.0...v1.0.1) (2026-09-13)
 
 
