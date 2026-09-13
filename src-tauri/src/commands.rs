@@ -508,9 +508,34 @@ pub async fn list_models(
     if p.is_local_proxy() {
         ensure_opencodex(&state).await?;
     }
-    models::fetch_models(p, key.as_deref())
+    let models = models::fetch_models(p, key.as_deref())
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // A keyed upstream (OpenRouter/Vercel) with a configured key but zero models
+    // means ocx couldn't load that provider's catalog — usually a rejected key,
+    // or it hasn't synced yet. Surface the reason instead of a silent empty list
+    // (which just looks like "no models available").
+    if models.is_empty() {
+        if let Some(upstream) = p.ocx_upstream() {
+            let docker = docker_runtime(&state).await;
+            let diag = match run_ocx(&["provider", "test", upstream], None, docker).await {
+                Ok(o) | Err(o) => o.to_lowercase(),
+            };
+            let reason = if diag.contains("401") || diag.contains("unauthorized") {
+                "the API key was rejected (HTTP 401). Double-check the key in Settings → Providers."
+            } else if diag.contains("403") {
+                "the key was forbidden (HTTP 403) — it may lack model access."
+            } else if diag.contains("not running") {
+                "the proxy isn't ready yet. Try again in a moment."
+            } else if diag.contains("discovery") || diag.contains("failed") {
+                "the provider rejected the request or exposes no models for this key."
+            } else {
+                "the key may be invalid, or the catalog hasn't synced yet — reopen this menu in a moment."
+            };
+            return Err(format!("No {} models — {reason}", p.display()));
+        }
+    }
+    Ok(models)
 }
 
 #[derive(Serialize)]
