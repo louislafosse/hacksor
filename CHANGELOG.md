@@ -1,3 +1,10 @@
+## [1.3.1](https://github.com/louislafosse/hacksor/compare/v1.3.0...v1.3.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* **providers:** explain why a provider model list is empty ([fc9d360](https://github.com/louislafosse/hacksor/commit/fc9d360fe21c17fb9ab1813ce5a2c4d7556fa092))
+
 # [1.3.0](https://github.com/louislafosse/hacksor/compare/v1.2.1...v1.3.0) (2026-09-13)
 
 
