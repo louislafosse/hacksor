@@ -685,6 +685,10 @@ input::placeholder, textarea::placeholder { color: var(--muted-foreground); }
   font: inherit; font-size: 12px; padding: 3px 9px; border-radius: 7px; cursor: pointer; white-space: nowrap;
 }
 .runtime-banner .rt-view:hover { background: rgba(127, 127, 127, 0.16); }
+/* Error state (e.g. Docker not installed): amber, steady, does not auto-dismiss. */
+.runtime-banner.error { border-color: #e0a500; background: rgba(224, 165, 0, 0.08); }
+.runtime-banner.error .rt-msg { animation: none; opacity: 1; }
+.runtime-banner .rt-link { color: #6ea8fe; text-decoration: underline; }
 /* Composer blocked while the runtime image builds/starts. */
 .composer.locked { opacity: 0.55; }
 .composer.locked #input { cursor: progress; }

@@ -474,6 +474,21 @@ const hint = document.getElementById("hint") as HTMLDivElement;
 let runtimeBusy = false;
 let runtimeLog = "";
 let buildDrawerOpen = false;
+let rtBanner: HTMLElement | null = null;
+
+// Create the runtime banner element once (message row + build-log button +
+// progress bar); return it. Both the provisioning-event listener and the
+// error handler use it, so a Docker-missing error (which is returned before any
+// runtime event fires) still gets a visible banner.
+function ensureRuntimeBanner(): HTMLElement {
+  if (!rtBanner) {
+    rtBanner = el("div", "runtime-banner");
+    rtBanner.innerHTML = `<div class="rt-row"><span class="rt-msg"></span><button class="rt-view" type="button">View build output</button><span class="rt-pct"></span></div><div class="rt-bar"><div class="rt-fill"></div></div>`;
+    rtBanner.querySelector(".rt-view")!.addEventListener("click", showBuildLog);
+    app.appendChild(rtBanner);
+  }
+  return rtBanner;
+}
 
 // Block/unblock the composer and tell the user to wait during a runtime build.
 function applyRuntimeLock() {
@@ -1303,13 +1318,26 @@ async function boot() {
 function prepareRuntime() {
   invoke("prepare_runtime").catch((e) => {
     // Provisioning failed (e.g. Docker missing, or the build errored): never leave
-    // the composer stuck as blocked. Unblock it and surface the reason.
+    // the composer stuck as blocked. Unblock it and surface the reason in a
+    // persistent banner (a Docker-missing error is returned before any runtime
+    // event fires, so we must create the banner here).
     runtimeBusy = false;
     applyRuntimeLock();
     const msg = String(e);
-    if (rtBanner) {
-      rtBanner.classList.remove("busy");
-      (rtBanner.querySelector(".rt-msg") as HTMLElement).textContent = "⚠ " + msg;
+    const banner = ensureRuntimeBanner();
+    banner.classList.remove("busy");
+    banner.classList.add("error");
+    (banner.querySelector(".rt-view") as HTMLElement).hidden = true;
+    (banner.querySelector(".rt-bar") as HTMLElement).hidden = true;
+    (banner.querySelector(".rt-pct") as HTMLElement).textContent = "";
+    const msgEl = banner.querySelector(".rt-msg") as HTMLElement;
+    const dockerMissing = /docker/i.test(msg) && /(install|not installed|isn't installed|not running)/i.test(msg);
+    if (dockerMissing) {
+      // Clear guidance: install Docker, or switch to Host mode.
+      msgEl.innerHTML =
+        `⚠ Docker isn't installed or running. Install <a class="rt-link" href="https://www.docker.com/products/docker-desktop/" target="_blank" rel="noreferrer">Docker Desktop</a> (docker.com) to use the runtime, or switch Runtime to Host in Settings.`;
+    } else {
+      msgEl.textContent = "⚠ " + msg;
     }
     if (/docker/i.test(msg)) hint.textContent = msg;
   });
@@ -2401,28 +2429,24 @@ listen<{ line: string }>("hacksor://runtime-log", (evt) => {
   }
 });
 
-let rtBanner: HTMLElement | null = null;
 listen<{ phase: string; message: string; percent?: number }>("hacksor://runtime", (evt) => {
   const { phase, message, percent } = evt.payload;
-  if (!rtBanner) {
-    rtBanner = el("div", "runtime-banner");
-    rtBanner.innerHTML = `<div class="rt-row"><span class="rt-msg"></span><button class="rt-view" type="button">View build output</button><span class="rt-pct"></span></div><div class="rt-bar"><div class="rt-fill"></div></div>`;
-    rtBanner.querySelector(".rt-view")!.addEventListener("click", showBuildLog);
-    app.appendChild(rtBanner);
-  }
+  const banner = ensureRuntimeBanner();
+  banner.classList.remove("error");
+  (banner.querySelector(".rt-bar") as HTMLElement).hidden = false;
   const busy = phase === "building" || phase === "starting" || phase === "pulling";
   runtimeBusy = busy;
   applyRuntimeLock();
   const icon = busy ? "⏳ " : "✓ ";
-  (rtBanner.querySelector(".rt-msg") as HTMLElement).textContent = icon + message;
-  rtBanner.classList.toggle("busy", busy);
+  (banner.querySelector(".rt-msg") as HTMLElement).textContent = icon + message;
+  banner.classList.toggle("busy", busy);
   // The "View build output" button is useful once there's build output to show.
-  (rtBanner.querySelector(".rt-view") as HTMLElement).hidden = !(phase === "building" || runtimeLog.length > 0);
+  (banner.querySelector(".rt-view") as HTMLElement).hidden = !(phase === "building" || runtimeLog.length > 0);
   // Show a real progress bar while pulling (percent present); hide it otherwise.
   const hasPct = typeof percent === "number" && phase === "pulling";
-  const bar = rtBanner.querySelector(".rt-bar") as HTMLElement;
-  const fill = rtBanner.querySelector(".rt-fill") as HTMLElement;
-  const pctEl = rtBanner.querySelector(".rt-pct") as HTMLElement;
+  const bar = banner.querySelector(".rt-bar") as HTMLElement;
+  const fill = banner.querySelector(".rt-fill") as HTMLElement;
+  const pctEl = banner.querySelector(".rt-pct") as HTMLElement;
   bar.hidden = !hasPct;
   if (hasPct) {
     fill.style.width = `${Math.max(0, Math.min(100, percent!))}%`;
