@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""hacksor-session: interactive terminal (PTY) sessions for tools that need a live
+console -- msfconsole, ssh, nc, sqlmap --sql-shell, python/mysql REPLs, wpscan
+prompts, sudo/password prompts, etc. Backed by tmux, so sessions persist between
+calls and survive the one-shot command model the agent runs under.
+
+Usage:
+  hacksor-session start [--name N] -- <command...>   # e.g. -- msfconsole -q
+  hacksor-session send  <id> "<text>" [--wait S] [--enter/--no-enter]
+  hacksor-session key   <id> <keyname>               # Enter, C-c, C-d, Up, Tab, ...
+  hacksor-session read  <id> [--lines N]             # current screen + scrollback tail
+  hacksor-session list
+  hacksor-session close <id>
+
+Typical flow:
+  id=$(hacksor-session start -- msfconsole -q); \
+  hacksor-session send "$id" "search cve:2021-44228"; \
+  hacksor-session send "$id" "use exploit/multi/http/log4shell..."; ...
+"""
+
+import argparse
+import subprocess
+import sys
+import time
+
+PREFIX = "hs_"
+
+
+def tmux(*args, check=False, capture=True):
+    r = subprocess.run(["tmux", *args], capture_output=capture, text=True)
+    if check and r.returncode != 0:
+        sys.exit(f"hacksor-session: tmux error: {(r.stderr or r.stdout or '').strip()}")
+    return r
+
+
+def full_name(sid):
+    return sid if sid.startswith(PREFIX) else PREFIX + sid
+
+
+def alive(name):
+    return tmux("has-session", "-t", name).returncode == 0
+
+
+def capture(name, lines=200):
+    r = tmux("capture-pane", "-p", "-t", name, "-S", f"-{lines}")
+    return r.stdout if r.returncode == 0 else ""
+
+
+def cmd_start(a):
+    name = full_name(a.name) if a.name else f"{PREFIX}{int(time.time() * 1000) % 100000}"
+    if alive(name):
+        sys.exit(f"hacksor-session: '{name}' already exists (close it or pick another --name)")
+    if not a.command:
+        sys.exit("hacksor-session: nothing to run -- pass the command after `--`, e.g. `-- msfconsole -q`")
+    # Wide pane so tool output isn't hard-wrapped; a login shell if no command.
+    inner = " ".join(a.command)
+    tmux("new-session", "-d", "-s", name, "-x", "220", "-y", "50", inner, check=True)
+    time.sleep(1.0)  # let the program print its banner/prompt
+    # Only the id goes to stdout, so `id=$(hacksor-session start ...)` captures a
+    # clean id; the initial banner/prompt goes to stderr for the human/agent to see.
+    print(name)
+    out = capture(name, 60).rstrip()
+    if out:
+        print("--- initial output ---", file=sys.stderr)
+        print(out, file=sys.stderr)
+
+
+def _settle(name, wait):
+    """Poll the pane until it stops changing (output settled) or `wait` elapses."""
+    deadline = time.time() + wait
+    prev = capture(name, 400)
+    while time.time() < deadline:
+        time.sleep(0.4)
+        cur = capture(name, 400)
+        if cur == prev:
+            break
+        prev = cur
+    return prev
+
+
+def cmd_send(a):
+    name = full_name(a.id)
+    if not alive(name):
+        sys.exit(f"hacksor-session: no session '{a.id}' (see `hacksor-session list`)")
+    # -l sends the text literally (no key-name interpretation); Enter submits it.
+    tmux("send-keys", "-t", name, "-l", a.text, check=True)
+    if a.enter:
+        tmux("send-keys", "-t", name, "Enter")
+    out = _settle(name, a.wait)
+    print("\n".join(out.rstrip().splitlines()[-(a.lines):]))
+
+
+def cmd_key(a):
+    name = full_name(a.id)
+    if not alive(name):
+        sys.exit(f"hacksor-session: no session '{a.id}'")
+    tmux("send-keys", "-t", name, a.key, check=True)
+    out = _settle(name, a.wait)
+    print("\n".join(out.rstrip().splitlines()[-(a.lines):]))
+
+
+def cmd_read(a):
+    name = full_name(a.id)
+    if not alive(name):
+        sys.exit(f"hacksor-session: no session '{a.id}'")
+    print(capture(name, a.lines).rstrip())
+
+
+def cmd_list(a):
+    r = tmux("list-sessions", "-F", "#{session_name}\t#{session_windows}w\t#{?session_attached,attached,detached}")
+    rows = [l for l in (r.stdout or "").splitlines() if l.startswith(PREFIX)]
+    if not rows:
+        print("(no interactive sessions)")
+        return
+    for l in rows:
+        print(l.replace(PREFIX, "", 1))
+
+
+def cmd_close(a):
+    name = full_name(a.id)
+    tmux("kill-session", "-t", name)
+    print(f"closed {a.id}")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="hacksor-session", description="Interactive PTY sessions via tmux.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    st = sub.add_parser("start", help="start an interactive session")
+    st.add_argument("--name")
+    st.add_argument("command", nargs=argparse.REMAINDER, help="command after `--`")
+    st.set_defaults(fn=cmd_start)
+
+    se = sub.add_parser("send", help="send a line of text (submitted with Enter)")
+    se.add_argument("id"); se.add_argument("text")
+    se.add_argument("--wait", type=float, default=6.0, help="max seconds to wait for output to settle")
+    se.add_argument("--lines", type=int, default=100, help="lines of output to show")
+    se.add_argument("--enter", dest="enter", action="store_true", default=True)
+    se.add_argument("--no-enter", dest="enter", action="store_false")
+    se.set_defaults(fn=cmd_send)
+
+    ky = sub.add_parser("key", help="send a control/named key (Enter, C-c, C-d, Up, Tab, ...)")
+    ky.add_argument("id"); ky.add_argument("key")
+    ky.add_argument("--wait", type=float, default=4.0); ky.add_argument("--lines", type=int, default=100)
+    ky.set_defaults(fn=cmd_key)
+
+    rd = sub.add_parser("read", help="show current screen + scrollback tail")
+    rd.add_argument("id"); rd.add_argument("--lines", type=int, default=200)
+    rd.set_defaults(fn=cmd_read)
+
+    sub.add_parser("list", help="list sessions").set_defaults(fn=cmd_list)
+
+    cl = sub.add_parser("close", help="kill a session"); cl.add_argument("id"); cl.set_defaults(fn=cmd_close)
+    return p
+
+
+def main():
+    # Drop a leading "--" that argparse REMAINDER leaves on `start`.
+    args = build_parser().parse_args()
+    if getattr(args, "command", None) and args.command and args.command[0] == "--":
+        args.command = args.command[1:]
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

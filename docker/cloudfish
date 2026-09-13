@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""cloudfish — passive subdomain discovery via Cloudflare's DNS scanner.
+
+Reworked for Hacksor: stdlib-only, credentials from flags / env / a creds file,
+and the temporary zone is ALWAYS deleted (even on error) so it never litters your
+Cloudflare account.
+
+Technique: add the target as a temporary Cloudflare zone, let Cloudflare's own DNS
+scanner import the existing records (a data source distinct from CT logs / passive
+DNS), read them back, then delete the zone. Merge the output with subfinder/amass.
+
+Credentials (a Cloudflare *global* API key — high privilege), resolved in order:
+  1. --key/--email/--account flags
+  2. env  CLOUDFLARE_API_KEY / CLOUDFLARE_EMAIL / CLOUDFLARE_ACCOUNT_ID
+  3. a KEY=VALUE creds file: --creds-file, else $CLOUDFISH_CREDS, else ~/.cloudflare
+     (keys: CLOUDFLARE_API_KEY, CLOUDFLARE_EMAIL, CLOUDFLARE_ACCOUNT_ID)
+
+Usage:
+  cloudfish -d example.com [--json] [--verbose]
+  cloudfish -d example.com -k <key> -e <email> -a <account_id>
+
+Only run this against domains you are authorized to assess.
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+API = "https://api.cloudflare.com/client/v4"
+
+
+def log(msg, verbose):
+    if verbose:
+        print(f"[cloudfish] {msg}", file=sys.stderr)
+
+
+def load_creds(args):
+    key = args.key or os.environ.get("CLOUDFLARE_API_KEY")
+    email = args.email or os.environ.get("CLOUDFLARE_EMAIL")
+    account = args.account or os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+    if not (key and email and account):
+        path = args.creds_file or os.environ.get("CLOUDFISH_CREDS") or os.path.expanduser("~/.cloudflare")
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip().strip('"').strip("'")
+                    if k == "CLOUDFLARE_API_KEY" and not key:
+                        key = v
+                    elif k == "CLOUDFLARE_EMAIL" and not email:
+                        email = v
+                    elif k == "CLOUDFLARE_ACCOUNT_ID" and not account:
+                        account = v
+        except OSError:
+            pass
+    missing = [n for n, v in (("API key", key), ("email", email), ("account id", account)) if not v]
+    if missing:
+        raise SystemExit(
+            "cloudfish: missing Cloudflare " + ", ".join(missing) +
+            ". Set them in Hacksor Settings, or pass -k/-e/-a, or export "
+            "CLOUDFLARE_API_KEY / CLOUDFLARE_EMAIL / CLOUDFLARE_ACCOUNT_ID."
+        )
+    return key, email, account
+
+
+def cf(method, path, key, email, body=None, timeout=60):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(API + path, data=data, method=method)
+    req.add_header("X-Auth-Key", key)
+    req.add_header("X-Auth-Email", email)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        # Cloudflare returns a JSON error envelope even on 4xx.
+        try:
+            return json.loads(e.read().decode())
+        except Exception:
+            return {"success": False, "errors": [{"message": f"HTTP {e.code}"}]}
+    except Exception as e:
+        return {"success": False, "errors": [{"message": str(e)}]}
+
+
+def cf_errors(res):
+    return "; ".join(str(x.get("message", x)) for x in (res.get("errors") or [])) or "unknown error"
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="cloudfish", description="Subdomain discovery via Cloudflare's DNS scanner.")
+    ap.add_argument("-d", "--domain", required=True, help="base domain (no subdomain), e.g. example.com")
+    ap.add_argument("-k", "--key", help="Cloudflare global API key")
+    ap.add_argument("-e", "--email", help="Cloudflare account email")
+    ap.add_argument("-a", "--account", help="Cloudflare account id")
+    ap.add_argument("--creds-file", help="KEY=VALUE creds file (default ~/.cloudflare)")
+    ap.add_argument("--json", action="store_true", help="emit JSON records instead of TSV")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    a = ap.parse_args()
+
+    key, email, account = load_creds(a)
+    domain = a.domain.strip().lower().lstrip("*.")
+
+    zone_id = None
+    try:
+        log(f"creating temporary zone for {domain}", a.verbose)
+        res = cf("POST", "/zones", key, email,
+                 body={"name": domain, "account": {"id": account}, "jump_start": True, "type": "full"})
+        if not res.get("success"):
+            raise SystemExit(f"cloudfish: could not create zone: {cf_errors(res)}")
+        zone_id = res["result"]["id"]
+
+        log("triggering DNS scan", a.verbose)
+        cf("POST", f"/zones/{zone_id}/dns_records/scan", key, email, body={}, timeout=90)
+
+        # jump_start + the scan populate records asynchronously; poll a few times.
+        records = []
+        for attempt in range(6):
+            records = []
+            page, total = 1, 1
+            while page <= total:
+                q = f"/zones/{zone_id}/dns_records?page={page}&per_page=100&direction=desc"
+                r = cf("GET", q, key, email)
+                if not r.get("success"):
+                    break
+                records.extend(r.get("result") or [])
+                total = ((r.get("result_info") or {}).get("total_pages")) or 1
+                page += 1
+            if records:
+                break
+            log(f"no records yet, waiting… ({attempt + 1}/6)", a.verbose)
+            time.sleep(2)
+    finally:
+        if zone_id:
+            log("deleting temporary zone", a.verbose)
+            cf("DELETE", f"/zones/{zone_id}", key, email)
+
+    # Deduplicate + sort for stable, mergeable output.
+    seen, rows = set(), []
+    for rec in records:
+        row = (rec.get("type", ""), rec.get("name", ""), str(rec.get("content", "")))
+        if row not in seen:
+            seen.add(row)
+            rows.append(row)
+    rows.sort(key=lambda x: (x[1], x[0]))
+
+    if a.json:
+        print(json.dumps([{"type": t, "name": n, "content": c} for t, n, c in rows], indent=2))
+    else:
+        for t, n, c in rows:
+            print(f"{t}\t{n}\t{c}")
+    log(f"{len(rows)} record(s) for {domain}", a.verbose)
+
+
+if __name__ == "__main__":
+    main()

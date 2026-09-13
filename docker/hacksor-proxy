@@ -1,0 +1,736 @@
+#!/usr/bin/env python3
+"""hacksor-proxy: a Burp Suite for the terminal, built on mitmproxy.
+
+One file, two roles:
+
+  * mitmproxy addon: loaded with `mitmdump -s hacksor-proxy`, it captures every
+    request/response to a JSONL history, and applies live scope + match/replace
+    rules (no restart needed to change them).
+
+  * CLI: run directly to drive a pentest the way you'd use Burp's tabs:
+      history        HTTP history with filters (Proxy > HTTP history)
+      show           full request + response for one flow
+      repeat         resend a captured request with edits (Repeater)
+      intruder       fuzz one insertion point over a payload list (Intruder)
+      decode/encode  url/base64/hex/html/jwt/gzip transforms (Decoder)
+      compare        diff two responses/requests (Comparer)
+      scope          restrict what gets logged (Target scope)
+      match-replace  auto-rewrite requests/responses in flight (Match/Replace)
+      start/stop/status  manage the mitmdump proxy itself
+
+History, scope and rules are plain files under codex_home/proxy, so state
+persists across runs and the whole toolkit shares one view of the traffic.
+"""
+
+import argparse
+import base64
+import difflib
+import gzip
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import html as _html
+
+STATE = "/tmp/hacksor-proxy.json"          # pointer written on proxy start
+DEFAULT_PORT = 8888
+
+
+# ---------------------------------------------------------------------------
+# Path discovery (shared with the app + the mitmproxy addon)
+# ---------------------------------------------------------------------------
+def _state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def log_path():
+    p = os.environ.get("HACKSOR_PROXY_LOG") or _state().get("log")
+    return p or os.path.expanduser("~/.hacksor/proxy/flows.jsonl")
+
+
+def rules_path():
+    p = os.environ.get("HACKSOR_PROXY_RULES") or _state().get("rules")
+    return p or os.path.join(os.path.dirname(log_path()), "rules.json")
+
+
+def proxy_port():
+    try:
+        return int(os.environ.get("HACKSOR_PROXY_PORT") or _state().get("port") or DEFAULT_PORT)
+    except Exception:
+        return DEFAULT_PORT
+
+
+def load_rules():
+    try:
+        with open(rules_path()) as f:
+            r = json.load(f)
+    except Exception:
+        r = {}
+    r.setdefault("scope", [])
+    r.setdefault("rules", [])
+    return r
+
+
+def save_rules(r):
+    path = rules_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(r, f, indent=2)
+
+
+def in_scope(host, rules=None):
+    rules = rules if rules is not None else load_rules()
+    scope = rules.get("scope") or []
+    if not scope:
+        return True
+    return any(s.lower() in (host or "").lower() for s in scope)
+
+
+# ===========================================================================
+# mitmproxy addon side (active only under `mitmdump -s hacksor-proxy`)
+# ===========================================================================
+def _clip(s, n=8000):
+    return (s or "")[:n]
+
+
+def _apply_rules(flow, where):
+    """where is 'request' or 'response'. Applies match/replace rules in place."""
+    try:
+        rules = load_rules()
+    except Exception:
+        return
+    for rule in rules.get("rules", []):
+        if not rule.get("enabled", True) or rule.get("in", "request") != where:
+            continue
+        part = rule.get("part", "body")
+        search = rule.get("search", "")
+        repl = rule.get("replace", "")
+        try:
+            rx = re.compile(search)
+        except re.error:
+            continue
+        msg = flow.request if where == "request" else flow.response
+        if msg is None:
+            continue
+        if part == "header":
+            for k in list(msg.headers.keys()):
+                nv = rx.sub(repl, msg.headers[k])
+                if nv != msg.headers[k]:
+                    msg.headers[k] = nv
+        elif part == "url" and where == "request":
+            flow.request.url = rx.sub(repl, flow.request.url)
+        else:  # body
+            try:
+                txt = msg.get_text(strict=False) or ""
+            except Exception:
+                continue
+            nv = rx.sub(repl, txt)
+            if nv != txt:
+                msg.set_text(nv)
+
+
+def running():  # mitmproxy lifecycle hook
+    try:
+        with open(STATE, "w") as f:
+            json.dump({"log": log_path(), "rules": rules_path(), "port": proxy_port()}, f)
+    except Exception:
+        pass
+
+
+def request(flow):  # mitmproxy hook
+    _apply_rules(flow, "request")
+
+
+def response(flow):  # mitmproxy hook
+    _apply_rules(flow, "response")
+    try:
+        if not in_scope(flow.request.pretty_host):
+            return
+        req_raw = flow.request.raw_content or b""
+        rec = {
+            "id": flow.id,
+            "method": flow.request.method,
+            "url": flow.request.pretty_url,
+            "host": flow.request.pretty_host,
+            "scheme": flow.request.scheme,
+            "http_version": flow.request.http_version,
+            "status": flow.response.status_code,
+            "req_len": len(req_raw),
+            "res_len": len(flow.response.raw_content or b""),
+            "ct": flow.response.headers.get("content-type", ""),
+            "req_headers": dict(flow.request.headers),
+            "res_headers": dict(flow.response.headers),
+            "req_body": _clip(flow.request.get_text(strict=False)),
+            "req_body_b64": base64.b64encode(req_raw).decode() if req_raw else "",
+            "res_body": _clip(flow.response.get_text(strict=False)),
+            "source": "proxy",
+            "ts": time.time(),
+        }
+        with open(log_path(), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
+# ===========================================================================
+# CLI side
+# ===========================================================================
+def read_flows():
+    try:
+        with open(log_path()) as f:
+            out = []
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except Exception:
+                        pass
+            return out
+    except Exception:
+        return []
+
+
+def append_flow(rec):
+    try:
+        os.makedirs(os.path.dirname(log_path()), exist_ok=True)
+        with open(log_path(), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
+def find_flow(flows, fid):
+    """Match by full id or a unique short prefix, else by 1-based index from the end."""
+    exact = [f for f in flows if f.get("id") == fid]
+    if exact:
+        return exact[-1]
+    pref = [f for f in flows if str(f.get("id", "")).startswith(fid)]
+    if len(pref) == 1:
+        return pref[0]
+    if fid.lstrip("-").isdigit():
+        idx = int(fid)
+        seq = list(reversed(flows))  # newest first, 1-based
+        if 1 <= abs(idx) <= len(seq):
+            return seq[idx - 1] if idx > 0 else seq[abs(idx) - 1]
+    if len(pref) > 1:
+        raise SystemExit(f"ambiguous id '{fid}' ({len(pref)} matches); use more characters")
+    raise SystemExit(f"no flow matches '{fid}' (see `hacksor-proxy history`)")
+
+
+def short(fid):
+    return (fid or "")[:8]
+
+
+# ---- HTTP send (Repeater/Intruder engine) --------------------------------
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None  # never auto-follow; show the raw 3xx like Burp
+
+
+class _PassErrors(urllib.request.HTTPErrorProcessor):
+    def http_response(self, req, resp):
+        return resp  # don't raise on 4xx/5xx
+
+    https_response = http_response
+
+
+def _opener(proxy):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    handlers = [urllib.request.HTTPSHandler(context=ctx), _NoRedirect(), _PassErrors()]
+    handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy} if proxy else {}))
+    return urllib.request.build_opener(*handlers)
+
+
+SKIP_HEADERS = {"content-length", "host", "connection", "proxy-connection",
+                "transfer-encoding", "accept-encoding"}
+
+
+def send(method, url, headers, body, proxy=None, timeout=30):
+    data = body if (body is None or isinstance(body, (bytes, bytearray))) else body.encode()
+    req = urllib.request.Request(url, data=data, method=method)
+    for k, v in (headers or {}).items():
+        if k.lower() in SKIP_HEADERS:
+            continue
+        try:
+            req.add_header(k, v)
+        except Exception:
+            pass
+    t0 = time.time()
+    resp = _opener(proxy).open(req, timeout=timeout)
+    raw = resp.read()
+    if resp.headers.get("content-encoding", "").lower() == "gzip":
+        try:
+            raw = gzip.decompress(raw)
+        except Exception:
+            pass
+    elapsed = int((time.time() - t0) * 1000)
+    status = getattr(resp, "status", None) or resp.getcode()
+    return status, dict(resp.headers.items()), raw, elapsed
+
+
+def flow_request_parts(flow):
+    """Reconstruct (method, url, headers, body_text) from a stored flow."""
+    method = flow.get("method", "GET")
+    url = flow.get("url", "")
+    headers = dict(flow.get("req_headers") or {})
+    b64 = flow.get("req_body_b64")
+    if b64:
+        try:
+            body = base64.b64decode(b64).decode("utf-8", "replace")
+        except Exception:
+            body = flow.get("req_body", "")
+    else:
+        body = flow.get("req_body", "")
+    return method, url, headers, body
+
+
+# ---- subcommands ----------------------------------------------------------
+def cmd_history(a):
+    flows = list(reversed(read_flows()))  # newest first
+    rx = re.compile(a.search, re.I) if a.search else None
+    grep = re.compile(a.grep, re.I) if a.grep else None
+    rows = []
+    for f in flows:
+        if a.host and a.host.lower() not in (f.get("host", "").lower()):
+            continue
+        if a.method and f.get("method", "").upper() != a.method.upper():
+            continue
+        if a.status and str(f.get("status", "")) != str(a.status):
+            continue
+        if a.mime and a.mime.lower() not in (f.get("ct", "").lower()):
+            continue
+        if a.in_scope and not in_scope(f.get("host", "")):
+            continue
+        hay = " ".join([f.get("url", ""), json.dumps(f.get("req_headers", {})),
+                        f.get("req_body", ""), f.get("res_body", "")])
+        if rx and not rx.search(hay):
+            continue
+        if grep and not grep.search(f.get("res_body", "") + json.dumps(f.get("res_headers", {}))):
+            continue
+        rows.append(f)
+        if len(rows) >= a.limit:
+            break
+    if a.json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("(no matching flows — is the proxy running and traffic in scope?)")
+        return
+    print(f"{'ID':8}  {'METHOD':6}  {'STAT':4}  {'LEN':>7}  URL")
+    for f in rows:
+        print(f"{short(f.get('id')):8}  {f.get('method',''):6}  {str(f.get('status','')):4}  "
+              f"{f.get('res_len',0):>7}  {f.get('url','')[:110]}")
+    print(f"\n{len(rows)} flow(s). `hacksor-proxy show <ID>` for detail, `repeat <ID>` to resend.")
+
+
+def _dump_flow(f, full):
+    method, url, headers, body = flow_request_parts(f)
+    out = [f"# {short(f.get('id'))}  {method} {url}", "",
+           "── request headers ──"]
+    out += [f"{k}: {v}" for k, v in headers.items()]
+    if body:
+        out += ["", "── request body ──", body if full else _clip(body, 4000)]
+    out += ["", f"── response {f.get('status','')} ({f.get('ct','')}, {f.get('res_len',0)} bytes) ──"]
+    out += [f"{k}: {v}" for k, v in (f.get("res_headers") or {}).items()]
+    rb = f.get("res_body", "")
+    if rb:
+        out += ["", "── response body ──", rb if full else _clip(rb, 4000)]
+    return "\n".join(out)
+
+
+def cmd_show(a):
+    f = find_flow(read_flows(), a.id)
+    print(_dump_flow(f, a.full))
+
+
+def _mod_url_params(url, sets, dels):
+    parts = urllib.parse.urlsplit(url)
+    q = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    for k in dels:
+        q = [(qk, qv) for qk, qv in q if qk != k]
+    for k, v in sets:
+        q = [(qk, qv) for qk, qv in q if qk != k] + [(k, v)]
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(q)))
+
+
+def cmd_repeat(a):
+    f = find_flow(read_flows(), a.id)
+    method, url, headers, body = flow_request_parts(f)
+    if a.method:
+        method = a.method.upper()
+    if a.url:
+        url = a.url
+    for h in a.set_header or []:
+        k, _, v = h.partition(":")
+        headers[k.strip()] = v.strip()
+    for k in a.del_header or []:
+        headers = {hk: hv for hk, hv in headers.items() if hk.lower() != k.lower()}
+    for c in a.set_cookie or []:
+        headers["Cookie"] = c
+    sets = [tuple(p.split("=", 1)) for p in (a.set_param or []) if "=" in p]
+    if sets or a.del_param:
+        url = _mod_url_params(url, sets, a.del_param or [])
+    if a.body is not None:
+        body = a.body
+    for p in a.data_param or []:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            cur = dict(urllib.parse.parse_qsl(body, keep_blank_values=True))
+            cur[k] = v
+            body = urllib.parse.urlencode(cur)
+    proxy = f"http://127.0.0.1:{proxy_port()}" if a.through_proxy else None
+    try:
+        status, rhdrs, raw, ms = send(method, url, headers, body or None, proxy)
+    except Exception as e:
+        raise SystemExit(f"send failed: {e}")
+    text = raw.decode("utf-8", "replace")
+    append_flow({
+        "id": f"repeat-{int(time.time()*1000)}", "method": method, "url": url,
+        "host": urllib.parse.urlsplit(url).hostname or "", "status": status,
+        "req_len": len(body or ""), "res_len": len(raw), "ct": rhdrs.get("Content-Type", ""),
+        "req_headers": headers, "res_headers": rhdrs,
+        "req_body": _clip(body or ""), "req_body_b64": base64.b64encode((body or "").encode()).decode(),
+        "res_body": _clip(text), "source": "repeat", "ts": time.time(),
+    })
+    print(f"{method} {url}\n-> {status}  {len(raw)} bytes  {ms} ms  {rhdrs.get('Content-Type','')}")
+    if a.headers:
+        print("\n".join(f"{k}: {v}" for k, v in rhdrs.items()))
+    print("\n" + (text if a.full else _clip(text, 4000)))
+
+
+def cmd_intruder(a):
+    f = find_flow(read_flows(), a.id)
+    method, url, headers, body = flow_request_parts(f)
+    payloads = []
+    if a.payloads:
+        with open(a.payloads) as fh:
+            payloads = [ln.rstrip("\n") for ln in fh if ln.strip()]
+    if a.list:
+        payloads += [p for p in a.list.split(",")]
+    if not payloads:
+        raise SystemExit("no payloads: pass --payloads FILE or --list a,b,c")
+    if a.max:
+        payloads = payloads[:a.max]
+    proxy = f"http://127.0.0.1:{proxy_port()}" if a.through_proxy else None
+    print(f"# intruder: {len(payloads)} payloads at "
+          f"{'param '+a.param if a.param else 'marker '+a.marker}\n")
+    print(f"{'PAYLOAD':28}  {'STAT':4}  {'LEN':>7}  {'MS':>5}  REFL")
+    for p in payloads:
+        u, b, h = url, body, dict(headers)
+        if a.param:
+            u = _mod_url_params(url, [(a.param, p)], [])
+            if body:
+                cur = dict(urllib.parse.parse_qsl(body, keep_blank_values=True))
+                if a.param in cur:
+                    cur[a.param] = p
+                    b = urllib.parse.urlencode(cur)
+        else:
+            u = url.replace(a.marker, urllib.parse.quote(p))
+            b = (body or "").replace(a.marker, p)
+            h = {hk: hv.replace(a.marker, p) for hk, hv in headers.items()}
+        try:
+            status, rhdrs, raw, ms = send(method, u, h, b or None, proxy)
+            refl = "yes" if p and p.encode() in raw else ""
+        except Exception as e:
+            status, raw, ms, refl = f"ERR", b"", 0, str(e)[:20]
+        if a.match_status and str(status) != str(a.match_status):
+            continue
+        print(f"{p[:28]:28}  {str(status):4}  {len(raw):>7}  {ms:>5}  {refl}")
+
+
+def cmd_race(a):
+    """Race-condition tester: fire N identical copies of a captured request as
+    close together as possible (all threads released by one barrier) and tabulate
+    the responses. A spread of statuses/lengths, or more 2xx than the logic should
+    allow, is the tell-tale of a TOCTOU / limit-bypass race (coupons, balance,
+    signup, like/vote, etc.)."""
+    import threading
+    f = find_flow(read_flows(), a.id)
+    method, url, headers, body = flow_request_parts(f)
+    proxy = f"http://127.0.0.1:{proxy_port()}" if a.through_proxy else None
+    n = a.count
+    results = [None] * n
+    barrier = threading.Barrier(n)
+
+    def worker(i):
+        try:
+            barrier.wait(timeout=15)
+        except Exception:
+            pass
+        try:
+            status, _rh, raw, ms = send(method, url, dict(headers), body or None, proxy, timeout=a.timeout)
+            results[i] = (status, len(raw), ms)
+        except Exception as e:
+            results[i] = ("ERR", 0, str(e)[:30])
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    print(f"# race: {n} concurrent {method} {url}\n")
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    # Group by (status, length) so identical outcomes collapse into one row.
+    groups = {}
+    for r in results:
+        if r is None:
+            continue
+        key = (r[0], r[1])
+        groups.setdefault(key, []).append(r[2])
+    print(f"{'STATUS':7}  {'LEN':>8}  {'COUNT':>5}  MS(min/max)")
+    for (status, length), mss in sorted(groups.items(), key=lambda x: -len(x[1])):
+        nums = [m for m in mss if isinstance(m, int)]
+        rng = f"{min(nums)}/{max(nums)}" if nums else "-"
+        print(f"{str(status):7}  {length:>8}  {len(mss):>5}  {rng}")
+    distinct = len(groups)
+    print(f"\n{n} sent, {distinct} distinct outcome(s)." +
+          ("  ⚠ multiple outcomes — possible race (inspect the 2xx count vs. what the logic allows)." if distinct > 1 else ""))
+
+
+def _b(s):
+    return s.encode() if isinstance(s, str) else s
+
+
+def cmd_decode(a):
+    v = a.value
+    if a.scheme == "url":
+        print(urllib.parse.unquote_plus(v))
+    elif a.scheme == "base64":
+        print(base64.b64decode(v + "=" * (-len(v) % 4)).decode("utf-8", "replace"))
+    elif a.scheme == "hex":
+        print(bytes.fromhex(v.replace(" ", "")).decode("utf-8", "replace"))
+    elif a.scheme == "html":
+        print(_html.unescape(v))
+    elif a.scheme == "gzip":
+        print(gzip.decompress(base64.b64decode(v)).decode("utf-8", "replace"))
+    elif a.scheme == "jwt":
+        parts = v.split(".")
+        for name, seg in zip(("header", "payload"), parts[:2]):
+            pad = seg + "=" * (-len(seg) % 4)
+            print(f"── {name} ──")
+            print(json.dumps(json.loads(base64.urlsafe_b64decode(pad)), indent=2))
+        if len(parts) > 2:
+            print(f"── signature ──\n{parts[2]}")
+
+
+def cmd_encode(a):
+    v = a.value
+    if a.scheme == "url":
+        print(urllib.parse.quote_plus(v))
+    elif a.scheme == "base64":
+        print(base64.b64encode(_b(v)).decode())
+    elif a.scheme == "hex":
+        print(_b(v).hex())
+    elif a.scheme == "html":
+        print(_html.escape(v))
+    elif a.scheme == "gzip":
+        print(base64.b64encode(gzip.compress(_b(v))).decode())
+    elif a.scheme == "jwt":
+        raise SystemExit("jwt encoding needs a signing key; craft it with a dedicated tool")
+
+
+def cmd_compare(a):
+    flows = read_flows()
+    f1, f2 = find_flow(flows, a.id1), find_flow(flows, a.id2)
+    key = "req_body" if a.requests else "res_body"
+    label = "request" if a.requests else "response"
+    left = (f1.get(key, "") or "").splitlines()
+    right = (f2.get(key, "") or "").splitlines()
+    diff = list(difflib.unified_diff(left, right, f"{short(f1['id'])} {label}",
+                                     f"{short(f2['id'])} {label}", lineterm=""))
+    print("\n".join(diff) if diff else "(identical)")
+
+
+def cmd_scope(a):
+    r = load_rules()
+    if a.op == "add":
+        if a.host not in r["scope"]:
+            r["scope"].append(a.host)
+        save_rules(r)
+        print(f"scope += {a.host}  (now: {', '.join(r['scope'])})")
+    elif a.op == "clear":
+        r["scope"] = []
+        save_rules(r)
+        print("scope cleared (all hosts logged)")
+    else:  # list
+        print("scope:", ", ".join(r["scope"]) if r["scope"] else "(all hosts)")
+
+
+def cmd_match_replace(a):
+    r = load_rules()
+    if a.op == "add":
+        r["rules"].append({"in": a.in_, "part": a.part, "search": a.search,
+                           "replace": a.replace, "enabled": True})
+        save_rules(r)
+        print(f"rule added: in {a.in_} {a.part}: s/{a.search}/{a.replace}/")
+    elif a.op == "clear":
+        r["rules"] = []
+        save_rules(r)
+        print("match/replace rules cleared")
+    else:  # list
+        if not r["rules"]:
+            print("(no rules)")
+        for i, rule in enumerate(r["rules"]):
+            print(f"[{i}] in {rule['in']} {rule['part']}: s/{rule['search']}/{rule['replace']}/"
+                  f"{'' if rule.get('enabled', True) else '  (disabled)'}")
+
+
+def _self_path():
+    return os.path.abspath(__file__)
+
+
+def cmd_start(a):
+    port = a.port or proxy_port()
+    if _port_open(port):
+        print(f"already running on :{port}")
+        return
+    # The port isn't accepting connections. Clear any stale/wedged mitmdump before
+    # spawning (zombies can't be killed and hold no port, so they're harmless once
+    # PID 1 reaps them). `-f` won't self-match: our own argv says "hacksor-proxy".
+    subprocess.call(["pkill", "-f", "mitmdump"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log = log_path()
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    with open(STATE, "w") as f:
+        json.dump({"log": log, "rules": rules_path(), "port": port}, f)
+    env = dict(os.environ, HACKSOR_PROXY_LOG=log, HACKSOR_PROXY_RULES=rules_path(),
+               HACKSOR_PROXY_PORT=str(port))
+    subprocess.Popen(["mitmdump", "-q", "--listen-port", str(port), "-s", _self_path()],
+                     env=env, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(30):
+        time.sleep(0.3)
+        if _port_open(port):
+            break
+    cmd_status(a)
+
+
+def _port_open(port=None):
+    """Liveness = the proxy port actually accepts a TCP connection. Immune to
+    zombie/defunct mitmdump entries and to `pgrep -f` matching our own argv."""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", int(port or proxy_port())), 1):
+            return True
+    except OSError:
+        return False
+
+
+def _running():
+    return _port_open()
+
+
+def cmd_stop(a):
+    subprocess.call(["pkill", "-f", "mitmdump"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("stopped")
+
+
+def cmd_status(a):
+    ca = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
+    print(f"proxy:   {'running' if _running() else 'stopped'} on 127.0.0.1:{proxy_port()}")
+    print(f"history: {log_path()} ({len(read_flows())} flows)")
+    print(f"rules:   {rules_path()}")
+    print(f"CA cert: {ca}")
+    print(f"route a tool through it: curl -x http://127.0.0.1:{proxy_port()} -k <url>")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="hacksor-proxy", description="Burp-style intercepting proxy toolkit (CLI).")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    h = sub.add_parser("history", help="list captured flows with filters")
+    h.add_argument("--host"); h.add_argument("--method"); h.add_argument("--status")
+    h.add_argument("--mime"); h.add_argument("--search", help="regex over url+headers+bodies")
+    h.add_argument("--grep", help="regex that must match the response")
+    h.add_argument("--in-scope", action="store_true", dest="in_scope")
+    h.add_argument("--limit", type=int, default=50); h.add_argument("--json", action="store_true")
+    h.set_defaults(fn=cmd_history)
+
+    s = sub.add_parser("show", help="full request+response for a flow")
+    s.add_argument("id"); s.add_argument("--full", action="store_true")
+    s.set_defaults(fn=cmd_show)
+
+    r = sub.add_parser("repeat", help="resend a captured request with edits (Repeater)")
+    r.add_argument("id")
+    r.add_argument("--method"); r.add_argument("--url")
+    r.add_argument("--set-header", action="append", dest="set_header", metavar="'K: V'")
+    r.add_argument("--del-header", action="append", dest="del_header", metavar="K")
+    r.add_argument("--set-cookie", action="append", dest="set_cookie", metavar="'a=b; c=d'")
+    r.add_argument("--set-param", action="append", dest="set_param", metavar="k=v", help="query param")
+    r.add_argument("--del-param", action="append", dest="del_param", metavar="k")
+    r.add_argument("--data-param", action="append", dest="data_param", metavar="k=v", help="urlencoded body param")
+    r.add_argument("--body", help="replace the whole request body")
+    r.add_argument("--through-proxy", action="store_true", dest="through_proxy",
+                   help="route the replay through the capture proxy so it lands in history")
+    r.add_argument("--headers", action="store_true", help="print response headers")
+    r.add_argument("--full", action="store_true")
+    r.set_defaults(fn=cmd_repeat)
+
+    i = sub.add_parser("intruder", help="fuzz one insertion point over payloads (Intruder)")
+    i.add_argument("id")
+    i.add_argument("--param", help="query/body param to fuzz")
+    i.add_argument("--marker", default="FUZZ", help="literal marker to replace (default FUZZ)")
+    i.add_argument("--payloads", help="wordlist file")
+    i.add_argument("--list", help="inline comma-separated payloads")
+    i.add_argument("--match-status", dest="match_status", help="only show rows with this status")
+    i.add_argument("--max", type=int, help="cap number of payloads")
+    i.add_argument("--through-proxy", action="store_true", dest="through_proxy")
+    i.set_defaults(fn=cmd_intruder)
+
+    rc = sub.add_parser("race", help="fire N identical requests at once (race-condition test)")
+    rc.add_argument("id")
+    rc.add_argument("-n", "--count", type=int, default=20, help="concurrent requests (default 20)")
+    rc.add_argument("--timeout", type=int, default=30)
+    rc.add_argument("--through-proxy", action="store_true", dest="through_proxy")
+    rc.set_defaults(fn=cmd_race)
+
+    d = sub.add_parser("decode", help="url/base64/hex/html/jwt/gzip -> plaintext")
+    d.add_argument("scheme", choices=["url", "base64", "hex", "html", "jwt", "gzip"])
+    d.add_argument("value"); d.set_defaults(fn=cmd_decode)
+    e = sub.add_parser("encode", help="plaintext -> url/base64/hex/html/gzip")
+    e.add_argument("scheme", choices=["url", "base64", "hex", "html", "gzip", "jwt"])
+    e.add_argument("value"); e.set_defaults(fn=cmd_encode)
+
+    c = sub.add_parser("compare", help="diff two flows (Comparer)")
+    c.add_argument("id1"); c.add_argument("id2")
+    c.add_argument("--requests", action="store_true", help="diff requests instead of responses")
+    c.set_defaults(fn=cmd_compare)
+
+    sc = sub.add_parser("scope", help="restrict which hosts are logged")
+    sc.add_argument("op", choices=["list", "add", "clear"]); sc.add_argument("host", nargs="?")
+    sc.set_defaults(fn=cmd_scope)
+
+    mr = sub.add_parser("match-replace", help="auto-rewrite requests/responses in flight")
+    mr.add_argument("op", choices=["list", "add", "clear"])
+    mr.add_argument("--in", dest="in_", choices=["request", "response"], default="request")
+    mr.add_argument("--part", choices=["header", "body", "url"], default="body")
+    mr.add_argument("--search"); mr.add_argument("--replace", default="")
+    mr.set_defaults(fn=cmd_match_replace)
+
+    for name, fn, help_ in (("start", cmd_start, "start the mitmdump proxy"),
+                            ("stop", cmd_stop, "stop the proxy"),
+                            ("status", cmd_status, "show proxy status + history location")):
+        sp = sub.add_parser(name, help=help_)
+        if name == "start":
+            sp.add_argument("--port", type=int)
+        sp.set_defaults(fn=fn)
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""hacksor-subagent: divide-and-conquer workers. Spins up isolated Codex agents
+(`codex exec`, non-interactive) so a big job can be split into parallel sub-tasks
+-- e.g. probing 40 subdomains at once, fuzzing several endpoints, or triaging many
+findings -- instead of one long serial loop. Each subagent runs in THIS container
+with the full toolset and its own context, and returns only its final report.
+
+The PARENT agent (Hacksor) decides when to use this; it is not user-driven.
+
+Usage:
+  # one focused worker:
+  hacksor-subagent run "Probe https://api.target.com for IDOR on /orders; report findings"
+
+  # fan out over a list, N at a time ({} is replaced by each item):
+  hacksor-subagent map --items subs.txt  --task "Recon {} : live? tech stack? obvious vulns? Report concise findings."
+  hacksor-subagent map --list a.com,b.com --task "nuclei + httpx {} and summarize" --concurrency 6
+
+Options:
+  --model M         model for the workers (default: $HACKSOR_SUBAGENT_MODEL, else the config default)
+  --concurrency N   parallel workers for `map` (default 4)
+  --timeout S       per-worker timeout seconds (default 900)
+  --cd DIR          working directory for workers (default: current)
+Notes: workers run with approvals/sandbox bypassed (already inside the container),
+so keep tasks scoped and authorized. Merge the returned reports yourself and record
+confirmed issues with `hacksor-findings`.
+"""
+
+import argparse
+import concurrent.futures
+import os
+import subprocess
+import sys
+import tempfile
+
+
+def run_worker(task, model, cd, timeout):
+    """Run one `codex exec` worker; return (ok, final_message_or_error)."""
+    out_file = tempfile.NamedTemporaryFile(prefix="hs_sub_", suffix=".txt", delete=False)
+    out_file.close()
+    cmd = [
+        "codex", "exec",
+        "--dangerously-bypass-approvals-and-sandbox",  # we are already inside the container sandbox
+        "--skip-git-repo-check",
+        "-C", cd,
+        "--output-last-message", out_file.name,
+    ]
+    m = model or os.environ.get("HACKSOR_SUBAGENT_MODEL")
+    if m:
+        cmd += ["-m", m]
+    cmd.append(task)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"(timed out after {timeout}s)"
+    try:
+        with open(out_file.name) as f:
+            msg = f.read().strip()
+    except OSError:
+        msg = ""
+    finally:
+        try:
+            os.unlink(out_file.name)
+        except OSError:
+            pass
+    if not msg:
+        # Surface why (auth/model/proxy) instead of a silent blank.
+        err = (r.stderr or r.stdout or "").strip().splitlines()
+        return (r.returncode == 0), (msg or ("\n".join(err[-6:]) if err else "(no output)"))
+    return True, msg
+
+
+def cmd_run(a):
+    ok, msg = run_worker(a.task, a.model, a.cd, a.timeout)
+    print(msg)
+    sys.exit(0 if ok else 1)
+
+
+def cmd_map(a):
+    items = []
+    if a.items:
+        try:
+            with open(a.items) as f:
+                items = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+        except OSError as e:
+            sys.exit(f"hacksor-subagent map: cannot read --items {a.items}: {e}")
+    if a.list:
+        items += [x.strip() for x in a.list.split(",") if x.strip()]
+    if not items:
+        sys.exit("hacksor-subagent map: no items (pass --items FILE and/or --list a,b,c)")
+    if "{}" not in a.task:
+        sys.exit("hacksor-subagent map: --task must contain '{}' where each item goes")
+    conc = max(1, a.concurrency)
+    print(f"# fanning out {len(items)} subagents, {conc} at a time", file=sys.stderr)
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=conc) as ex:
+        fut = {ex.submit(run_worker, a.task.replace("{}", it), a.model, a.cd, a.timeout): it for it in items}
+        for f in concurrent.futures.as_completed(fut):
+            it = fut[f]
+            try:
+                ok, msg = f.result()
+            except Exception as e:
+                ok, msg = False, f"(error: {e})"
+            results[it] = (ok, msg)
+            print(f"[done] {it}" + ("" if ok else "  (FAILED)"), file=sys.stderr)
+    # Emit in input order for stable, mergeable output.
+    for it in items:
+        ok, msg = results.get(it, (False, "(no result)"))
+        print(f"\n===== {it} {'' if ok else '(FAILED) '}=====")
+        print(msg)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="hacksor-subagent", description="Parallel divide-and-conquer Codex workers.")
+    p.add_argument("--model")
+    p.add_argument("--cd", default=os.getcwd())
+    p.add_argument("--timeout", type=int, default=900)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("run", help="one focused worker")
+    r.add_argument("task"); r.set_defaults(fn=cmd_run)
+
+    m = sub.add_parser("map", help="fan out a task over items ({} per item)")
+    m.add_argument("--task", required=True)
+    m.add_argument("--items", help="file with one item per line")
+    m.add_argument("--list", help="inline comma-separated items")
+    m.add_argument("--concurrency", type=int, default=4)
+    m.set_defaults(fn=cmd_map)
+    return p
+
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
+    args.fn(args)

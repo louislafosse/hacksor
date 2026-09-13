@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Hacksor logo: letter H in the Georgia11 FIGlet font (ASCII art), grey. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#343434"/>
+      <stop offset="1" stop-color="#1E1E1E"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="1024" height="1024" rx="180" fill="url(#bg)"/>
+  <rect x="26" y="26" width="972" height="972" rx="156" fill="none" stroke="#8A8A8A" stroke-opacity="0.18" stroke-width="6"/>
+  <text font-family="Noto Sans Mono, monospace" font-size="78.0" fill="#D2D2D2" xml:space="preserve">
+  <tspan x="184.4" y="292.0" xml:space="preserve">`7MMF'  `7MMF'</tspan>
+  <tspan x="184.4" y="371.6" xml:space="preserve">  MM      MM  </tspan>
+  <tspan x="184.4" y="451.2" xml:space="preserve">  MM      MM  </tspan>
+  <tspan x="184.4" y="530.7" xml:space="preserve">  MMmmmmmmMM  </tspan>
+  <tspan x="184.4" y="610.3" xml:space="preserve">  MM      MM  </tspan>
+  <tspan x="184.4" y="689.8" xml:space="preserve">  MM      MM  </tspan>
+  <tspan x="184.4" y="769.4" xml:space="preserve">.JMML.  .JMML.</tspan>
+  </text>
+</svg>

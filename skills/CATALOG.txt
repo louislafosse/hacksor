@@ -1,0 +1,62 @@
+analysis/counterevidence: Closure discipline for security findings — what counts as proof of safety, what does not, and how to record an unresolved candidate instead of silently dropping it
+analysis/fix_verification: How to verify a proposed code fix before shipping it — the ordered gates, what disqualifies a fix, and when to withhold the suggestion instead
+analysis/severity_calibration: Qualitative rubric for what actually deserves high/critical severity, and an acceptance checklist to apply before rating a finding
+analysis/source_aware_discovery: Enumeration discipline for reading code — which locations to keep as separate candidates, which safe siblings prove nothing, and the per-family sweeps that are routinely missed
+cloud/aws: AWS cloud security testing covering IAM misconfigurations, S3 exposure, metadata abuse, and privilege escalation paths
+cloud/azure: Microsoft Azure and Entra security testing covering RBAC, Privileged Identity Management, Conditional Access, service principals, managed identities, Storage SAS, Key Vault, workload escalation, and cross-plane privilege paths
+cloud/gcp: GCP cloud security testing covering IAM misconfigurations, public storage buckets, metadata abuse, and service account privilege escalation
+cloud/kubernetes: Kubernetes cluster security testing - RBAC, API exposure, container escapes, network policies, secrets, and supply chain
+coordination/root_agent: Orchestration layer that coordinates specialized subagents for security assessments
+coordination/source_aware_whitebox: Coordination playbook for source-aware white-box testing with static triage and dynamic validation
+custom/api_spec_testing: Spec-driven API pentesting — systematically exercise every endpoint from an ingested OpenAPI/Swagger/Postman inventory for authz, injection, and business-logic flaws
+custom/dependency_cve_scanning: Supply-chain / SCA playbook — scan repository lockfiles for known dependency CVEs and report them with create_dependency_report (no dynamic PoC required)
+custom/npx_confusion: Test package and executable identity confusion in npx, npm exec, and bunx fallback, plus explicit auto-fetch runners such as pnpm/yarn dlx and deno run npm:, with runner-specific resolution analysis, registry-state controls, reporting gates, and false-positive elimination
+custom/source_aware_sast: Practical source-aware SAST and AST playbook for semgrep, ast-grep, gitleaks, and trivy fs
+frameworks/django: Security testing playbook for Django applications covering ORM injection, middleware gaps, auth/session flaws, and template issues
+frameworks/fastapi: Security testing playbook for FastAPI applications covering ASGI, dependency injection, and API vulnerabilities
+frameworks/nestjs: Security testing playbook for NestJS applications covering guards, pipes, decorators, module boundaries, and multi-transport auth
+frameworks/nextjs: Security testing playbook for Next.js covering App Router, Server Actions, RSC, and Edge runtime vulnerabilities
+protocols/graphql: GraphQL security testing covering introspection, resolver injection, batching attacks, and authorization bypass
+protocols/oauth: OAuth 2.0 and OIDC flow security testing covering redirect manipulation, token leakage, PKCE bypass, and client misconfiguration
+reconnaissance/asset_discovery: Passive asset and attack-surface discovery via certificate transparency, TLS SAN pivoting, passive DNS, and ASN/IP enumeration to find hosts beyond subdomain brute force
+reconnaissance/infrastructure_lifecycle: Discovery and security analysis of abandoned or ownership-drifted infrastructure trusted by software, firmware, DNS, mail, update systems, packages, scripts, telemetry, and deployed agents
+scan_modes/deep: Exhaustive security assessment with maximum coverage, depth, and vulnerability chaining
+scan_modes/diff: Methodology for diff-scoped review of a pull request, commit, or branch — what counts as in scope, how far to follow a change, and what not to report
+scan_modes/quick: Time-boxed rapid assessment targeting high-impact vulnerabilities
+scan_modes/standard: Balanced security assessment with systematic methodology and full attack surface coverage
+technologies/active_directory: Active Directory / Kerberos domain testing covering roasting, delegation abuse, AD CS (ESC1-ESC17), NTLM coercion+relay, DACL abuse, and credential dumping
+technologies/auth0: Auth0 tenant security testing covering misconfigured rules/actions, scope escalation, MFA bypass, and cross-application token confusion
+technologies/electron_desktop_apps: Test Electron desktop applications across renderer, preload, IPC, main-process, navigation, custom-protocol, storage, permission, and update trust boundaries; use for packaged Electron apps, ASAR review, web-to-native capability analysis, and Electron-specific exploit chains
+technologies/firebase: Firebase security testing covering Firestore, Storage rules, Realtime Database, Auth, Functions, and client-side trust issues
+technologies/grafana_prometheus: Grafana, Prometheus, Alertmanager and exporter security testing — turning exposed observability into SSRF, credential theft, RCE, and lateral movement into the internal network
+technologies/llm_applications: End-to-end security testing for LLM, RAG, embedding, agent, and model-serving applications. Covers the OWASP Top 10 for LLM Applications 2026 (LLM01-LLM10): prompt injection, sensitive disclosure, excessive agency, supply chain, data/model poisoning, unbounded consumption, misinformation, hidden context exposure, vector weaknesses, and improper output handling. Use for architecture mapping, source review, black-box testing, and complete LLM application assessments.
+technologies/supabase: Supabase security testing covering Row Level Security, PostgREST, Edge Functions, and service key exposure
+vulnerabilities/agentic_system_security: Security testing for authorized AI agents and MCP-style tool ecosystems, covering effective authority, tool/resource/prompt inventory, confused-deputy behavior, side-effect authorization, cross-tenant isolation, executable component supply chain, shadow integrations, and repeatable safety regression
+vulnerabilities/argument_injection: Test shell-free command argument injection across argv builders and CLI parsers, including option smuggling, response/config-file parsing, argument-boundary reparsing, and Windows Unicode-to-ANSI Best-Fit transformations
+vulnerabilities/authentication_jwt: JWT and OIDC security testing covering token forgery, algorithm confusion, and claim manipulation
+vulnerabilities/broken_function_level_authorization: BFLA testing for action-level authorization failures across endpoints, admin functions, and API operations
+vulnerabilities/browser_security: Browser-internals security testing for browsing-context relationships, postMessage, client-side path traversal, XS-Leaks, service workers, Web Workers, navigation behavior, CSP interactions, caches, and cross-origin state machines
+vulnerabilities/business_logic: Business logic testing for workflow bypass, state manipulation, and domain invariant violations
+vulnerabilities/csrf: CSRF testing covering token bypass, SameSite cookies, CORS misconfigurations, and state-changing request abuse
+vulnerabilities/header_injection: HTTP header injection testing covering CRLF / response splitting, cache poisoning, Host-header confusion, cookie fixation, and proxy / forwarding header smuggling
+vulnerabilities/http_request_smuggling: HTTP request smuggling testing covering CL.TE, TE.CL, H2.CL, H2.TE, and HTTP/2 desync techniques with practical detection and exploitation methodology
+vulnerabilities/idor: IDOR/BOLA testing for object-level authorization failures and cross-account data access
+vulnerabilities/information_disclosure: Information disclosure testing covering error messages, debug endpoints, metadata leakage, and source exposure
+vulnerabilities/insecure_deserialization: Insecure deserialization testing for Java, Python, PHP, .NET, Ruby, and Node.js covering gadget chains, type confusion, and safe validation
+vulnerabilities/insecure_file_uploads: File upload security testing covering extension bypass, content-type manipulation, and path traversal
+vulnerabilities/llm_prompt_injection: Deep testing for OWASP LLM01:2026 prompt injection in LLM, RAG, multimodal, memory, and tool-using applications, including direct/indirect injection, jailbreaks, instruction smuggling, and downstream impact validation. Use llm_applications for full OWASP 2026 LLM01-LLM10 coverage.
+vulnerabilities/mass_assignment: Mass assignment testing for unauthorized field binding and privilege escalation via API parameters
+vulnerabilities/nosql_injection: NoSQL injection testing covering MongoDB operator injection, authentication bypass, blind extraction, GraphQL variable injection, and Redis/DynamoDB/Elasticsearch/Neo4j-specific attack surfaces
+vulnerabilities/open_redirect: Open redirect testing for phishing pivots, OAuth token theft, and allowlist bypass
+vulnerabilities/path_traversal_lfi_rfi: Path traversal and file inclusion testing for local/remote file access and code execution
+vulnerabilities/prototype_pollution: Client and server prototype pollution testing covering JavaScript object merge bugs, Node.js RCE chains, and filter bypasses
+vulnerabilities/race_conditions: Race condition testing for TOCTOU bugs, double-spend, and concurrent state manipulation
+vulnerabilities/rce: RCE testing covering command injection, deserialization, template injection, and code evaluation
+vulnerabilities/semantic_confusion: Cross-component semantic confusion testing for parser differentials, normalization mismatches, overloaded fields, lifecycle state drift, internal redirects, protocol translation, and validator-to-sink inconsistencies
+vulnerabilities/sql_injection: SQL injection testing covering union, blind, error-based, and ORM bypass techniques
+vulnerabilities/ssrf: SSRF testing for cloud metadata access, internal service discovery, and protocol smuggling
+vulnerabilities/ssti: Server-side template injection across Jinja / Mako / Velocity / Freemarker / Thymeleaf / Twig / Handlebars / EJS / ERB with engine fingerprinting, sandbox escape, and RCE gadget chains
+vulnerabilities/subdomain_takeover: Subdomain takeover testing for dangling DNS records and unclaimed cloud resources
+vulnerabilities/weak_password_detection: Weak password detection, credential stuffing, and brute-force testing using common passwords, system-generated credentials, and HTTP fuzzing / NSE brute-force tooling
+vulnerabilities/xss: XSS testing covering reflected, stored, and DOM-based vectors with CSP bypass techniques
+vulnerabilities/xxe: XXE testing for external entity injection, file disclosure, and SSRF via XML parsers

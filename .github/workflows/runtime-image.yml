@@ -1,0 +1,45 @@
+name: Runtime image
+
+# Validates that the bundled Kali runtime image (docker/Dockerfile) still builds
+# from scratch and that every core tool installs. The in-app build assertion
+# (`core tools present: ok`) is the gate. Runs on changes to docker/ and on
+# demand. It does NOT push: on Apple Silicon / Intel / Linux hosts the app builds
+# this image locally for the host architecture via bollard on first use, so the
+# image is always native-arch for the user.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - docker/**
+  pull_request:
+    paths:
+      - docker/**
+
+jobs:
+  build-runtime:
+    name: Build Kali runtime (amd64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          docker-images: false
+          large-packages: true
+          tool-cache: true
+      - uses: docker/setup-buildx-action@v3
+      - name: Build runtime image (validation, no push)
+        run: docker build -f docker/Dockerfile -t hacksor-runtime:ci docker/
+      - name: Smoke-test bundled CLIs
+        run: |
+          docker run --rm hacksor-runtime:ci bash -lc '
+            set -e
+            for t in nmap nuclei ffuf sqlmap semgrep trufflehog gitleaks jwt_tool \
+                     sstimap cloudfish hacksor-findings hacksor-proxy hacksor-session \
+                     hacksor-subagent tmux codex; do
+              command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }
+            done
+            echo "all bundled CLIs present"
+          '

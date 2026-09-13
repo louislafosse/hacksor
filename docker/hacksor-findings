@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""hacksor-findings: a structured vulnerability knowledge base + report generator.
+
+Record findings as you confirm them (severity, CVSS, OWASP category, affected URL,
+repro/evidence), then generate a clean Markdown pentest report. Stdlib-only.
+
+Storage: JSONL, resolved in order: --file, $HACKSOR_FINDINGS, ./findings.jsonl if a
+findings.jsonl already exists in the CWD, else ~/.hacksor/findings.jsonl.
+
+Usage:
+  hacksor-findings add -t "IDOR on /api/orders" -s high --cvss 8.1 \
+      --owasp "A01: Broken Access Control" -u https://t/api/orders/123 \
+      -d "User A reads user B's orders by changing the id" \
+      -e "GET /api/orders/124 -> 200 with B's data"
+  hacksor-findings list [--severity high] [--json]
+  hacksor-findings show <id>
+  hacksor-findings update <id> [-s critical] [--cvss 9.1] ...
+  hacksor-findings rm <id>
+  hacksor-findings report [-o report.md] [--json]
+  hacksor-findings clear
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+
+SEV = ["critical", "high", "medium", "low", "info"]
+SEV_RANK = {s: i for i, s in enumerate(SEV)}
+
+
+def store_path(explicit=None):
+    if explicit:
+        return explicit
+    env = os.environ.get("HACKSOR_FINDINGS")
+    if env:
+        return env
+    if os.path.exists("findings.jsonl"):
+        return os.path.abspath("findings.jsonl")
+    return os.path.expanduser("~/.hacksor/findings.jsonl")
+
+
+def load(path):
+    out = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except Exception:
+                        pass
+    except OSError:
+        pass
+    return out
+
+
+def save_all(path, items):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        for it in items:
+            f.write(json.dumps(it) + "\n")
+
+
+def next_id(items):
+    n = 0
+    for it in items:
+        try:
+            n = max(n, int(str(it.get("id", "F0")).lstrip("F")))
+        except Exception:
+            pass
+    return f"F{n + 1}"
+
+
+def sev_from_cvss(v):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    if v >= 9.0:
+        return "critical"
+    if v >= 7.0:
+        return "high"
+    if v >= 4.0:
+        return "medium"
+    if v > 0.0:
+        return "low"
+    return "info"
+
+
+def find(items, fid):
+    for it in items:
+        if it.get("id") == fid or it.get("id") == "F" + fid.lstrip("F"):
+            return it
+    raise SystemExit(f"hacksor-findings: no finding '{fid}'")
+
+
+def cmd_add(a):
+    path = store_path(a.file)
+    items = load(path)
+    sev = a.severity or sev_from_cvss(a.cvss) or "medium"
+    if sev not in SEV:
+        raise SystemExit(f"severity must be one of {', '.join(SEV)}")
+    rec = {
+        "id": next_id(items), "title": a.title, "severity": sev,
+        "cvss": a.cvss, "cvss_vector": a.cvss_vector, "owasp": a.owasp, "url": a.url,
+        "description": a.description, "evidence": a.evidence,
+        "remediation": a.remediation, "status": a.status or "open",
+        "ts": time.time(),
+    }
+    items.append(rec)
+    save_all(path, items)
+    print(f"{rec['id']}  [{sev}] {a.title}")
+
+
+def cmd_update(a):
+    path = store_path(a.file)
+    items = load(path)
+    it = find(items, a.id)
+    for k in ("title", "cvss", "cvss_vector", "owasp", "url", "description", "evidence", "remediation", "status"):
+        v = getattr(a, k if k != "url" else "url")
+        if v is not None:
+            it[k] = v
+    if a.severity:
+        if a.severity not in SEV:
+            raise SystemExit(f"severity must be one of {', '.join(SEV)}")
+        it["severity"] = a.severity
+    elif a.cvss is not None:
+        it["severity"] = sev_from_cvss(a.cvss) or it.get("severity")
+    save_all(path, items)
+    print(f"updated {it['id']}")
+
+
+def cmd_rm(a):
+    path = store_path(a.file)
+    items = load(path)
+    find(items, a.id)
+    items = [x for x in items if x.get("id") != ("F" + a.id.lstrip("F"))]
+    save_all(path, items)
+    print(f"removed {a.id}")
+
+
+def cmd_clear(a):
+    path = store_path(a.file)
+    save_all(path, [])
+    print("cleared")
+
+
+def sort_key(it):
+    return (SEV_RANK.get(it.get("severity", "info"), 99), it.get("id", ""))
+
+
+def cmd_list(a):
+    path = store_path(a.file)
+    items = sorted(load(path), key=sort_key)
+    if a.severity:
+        items = [x for x in items if x.get("severity") == a.severity]
+    if a.json:
+        print(json.dumps(items, indent=2))
+        return
+    if not items:
+        print("(no findings — record them with `hacksor-findings add`)")
+        return
+    print(f"{'ID':4}  {'SEVERITY':9}  {'CVSS':4}  {'OWASP':22}  TITLE")
+    for it in items:
+        print(f"{it.get('id',''):4}  {it.get('severity',''):9}  "
+              f"{str(it.get('cvss') or ''):4}  {(it.get('owasp') or '')[:22]:22}  {it.get('title','')}")
+    print(f"\n{len(items)} finding(s) at {path}")
+
+
+def cmd_show(a):
+    it = find(load(store_path(a.file)), a.id)
+    print(json.dumps(it, indent=2))
+
+
+def cmd_report(a):
+    path = store_path(a.file)
+    items = sorted(load(path), key=sort_key)
+    if a.json:
+        out = json.dumps(items, indent=2)
+    else:
+        counts = {s: sum(1 for x in items if x.get("severity") == s) for s in SEV}
+        lines = ["# Penetration Test Findings", "",
+                 f"_{len(items)} finding(s) — " +
+                 ", ".join(f"{counts[s]} {s}" for s in SEV if counts[s]) + "_", "",
+                 "## Summary", "", "| ID | Severity | CVSS | OWASP | Title |",
+                 "|----|----------|------|-------|-------|"]
+        for it in items:
+            lines.append(f"| {it.get('id','')} | {it.get('severity','')} | "
+                         f"{it.get('cvss') or ''} | {it.get('owasp') or ''} | {it.get('title','')} |")
+        lines += ["", "## Details", ""]
+        for it in items:
+            lines.append(f"### {it.get('id','')} — {it.get('title','')}")
+            lines.append("")
+            meta = [f"**Severity:** {it.get('severity','')}"]
+            if it.get("cvss"):
+                meta.append(f"**CVSS:** {it['cvss']}")
+            if it.get("cvss_vector"):
+                meta.append(f"**CVSS Vector:** {it['cvss_vector']}")
+            if it.get("owasp"):
+                meta.append(f"**OWASP:** {it['owasp']}")
+            if it.get("status"):
+                meta.append(f"**Status:** {it['status']}")
+            lines.append(" · ".join(meta))
+            lines.append("")
+            if it.get("url"):
+                lines.append(f"**Affected:** `{it['url']}`\n")
+            if it.get("description"):
+                lines.append(f"**Description**\n\n{it['description']}\n")
+            if it.get("evidence"):
+                lines.append(f"**Evidence / Reproduction**\n\n```\n{it['evidence']}\n```\n")
+            if it.get("remediation"):
+                lines.append(f"**Remediation**\n\n{it['remediation']}\n")
+            lines.append("")
+        out = "\n".join(lines)
+    if a.output:
+        with open(a.output, "w") as f:
+            f.write(out + "\n")
+        print(f"wrote {a.output} ({len(items)} finding(s))")
+    else:
+        print(out)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="hacksor-findings", description="Structured findings + report generator.")
+    p.add_argument("--file", help="findings JSONL path (overrides default)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add_common(sp):
+        sp.add_argument("-s", "--severity", choices=SEV)
+        sp.add_argument("--cvss", help="a numeric score (derives severity) or a CVSS vector string")
+        sp.add_argument("--cvss-vector", dest="cvss_vector", help="full CVSS vector string, stored + shown in the report")
+        sp.add_argument("--owasp")
+        sp.add_argument("-u", "--url")
+        sp.add_argument("-d", "--description")
+        sp.add_argument("-e", "--evidence")
+        sp.add_argument("--remediation")
+        sp.add_argument("--status")
+
+    ad = sub.add_parser("add", help="record a finding")
+    ad.add_argument("-t", "--title", required=True)
+    add_common(ad)
+    ad.set_defaults(fn=cmd_add)
+
+    up = sub.add_parser("update", help="edit a finding")
+    up.add_argument("id")
+    up.add_argument("-t", "--title")
+    add_common(up)
+    up.set_defaults(fn=cmd_update)
+
+    rm = sub.add_parser("rm", help="delete a finding")
+    rm.add_argument("id"); rm.set_defaults(fn=cmd_rm)
+
+    ls = sub.add_parser("list", help="list findings")
+    ls.add_argument("--severity", choices=SEV); ls.add_argument("--json", action="store_true")
+    ls.set_defaults(fn=cmd_list)
+
+    sh = sub.add_parser("show", help="show one finding"); sh.add_argument("id"); sh.set_defaults(fn=cmd_show)
+
+    rp = sub.add_parser("report", help="generate a Markdown/JSON report")
+    rp.add_argument("-o", "--output"); rp.add_argument("--json", action="store_true")
+    rp.set_defaults(fn=cmd_report)
+
+    cl = sub.add_parser("clear", help="delete all findings"); cl.set_defaults(fn=cmd_clear)
+    return p
+
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
+    args.fn(args)
