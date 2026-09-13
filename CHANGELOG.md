@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/louislafosse/hacksor/compare/v1.1.0...v1.2.0) (2026-09-13)
+
+
+### Features
+
+* **runtime:** implement detached spawning for CLI tools and enhance Docker connection handling ([dfbd73d](https://github.com/louislafosse/hacksor/commit/dfbd73d41510bcb1c396f3dcd508e75a56cae819))
+
 # [1.1.0](https://github.com/louislafosse/hacksor/compare/v1.0.1...v1.1.0) (2026-09-13)
 
 
