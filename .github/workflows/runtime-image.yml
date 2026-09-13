@@ -2,10 +2,12 @@ name: Runtime image
 
 # Validates that the bundled Kali runtime image (docker/Dockerfile) still builds
 # from scratch and that every core tool installs. The in-app build assertion
-# (`core tools present: ok`) is the gate. Runs on changes to docker/ and on
-# demand. It does NOT push: on Apple Silicon / Intel / Linux hosts the app builds
-# this image locally for the host architecture via bollard on first use, so the
-# image is always native-arch for the user.
+# (`core tools present: ok`) is the gate. It does NOT push: on Apple Silicon /
+# Intel / Linux hosts the app builds this image locally for the host architecture
+# via bollard on first use, so the image is always native-arch for the user.
+#
+# The image is large (~20 GB), so the build is moved onto the runner's big /mnt
+# disk (~70 GB); the small root disk overflows during the final layer commit.
 on:
   workflow_dispatch:
   push:
@@ -23,15 +25,26 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
           docker-images: false
           large-packages: true
           tool-cache: true
-      - uses: docker/setup-buildx-action@v3
+
+      - name: Move Docker storage to the large /mnt disk
+        run: |
+          sudo systemctl stop docker docker.socket || true
+          sudo mkdir -p /mnt/docker
+          echo '{"data-root":"/mnt/docker"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker
+          docker info | grep -i "docker root dir" || true
+          echo "--- disk ---"; df -h / /mnt
+
       - name: Build runtime image (validation, no push)
-        run: docker build -f docker/Dockerfile -t hacksor-runtime:ci docker/
+        run: DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile -t hacksor-runtime:ci docker/
+
       - name: Smoke-test bundled CLIs
         run: |
           docker run --rm hacksor-runtime:ci bash -lc '
