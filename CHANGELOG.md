@@ -1,3 +1,10 @@
+## [1.2.1](https://github.com/louislafosse/hacksor/compare/v1.2.0...v1.2.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* **runtime:** create/exec/remove containers via the docker CLI ([ec90f6b](https://github.com/louislafosse/hacksor/commit/ec90f6bde961ef77d34cdca13419904801c596ea))
+
 # [1.2.0](https://github.com/louislafosse/hacksor/compare/v1.1.0...v1.2.0) (2026-09-13)
 
 
