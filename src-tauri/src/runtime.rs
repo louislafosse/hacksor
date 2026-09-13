@@ -10,11 +10,9 @@
 //! pulls, builds, teardown — is bollard.)
 
 use std::path::Path;
+use std::process::Stdio;
 
-use bollard::container::{Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions};
-use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::image::{BuildImageOptions, CreateImageOptions, TagImageOptions};
-use bollard::models::{DeviceMapping, HostConfig, PortBinding};
 use bollard::Docker;
 use futures_util::StreamExt;
 
@@ -60,13 +58,10 @@ pub async fn container_running(name: &str) -> bool {
     }
 }
 
-/// Force-remove a container (ignore "not found").
+/// Force-remove a container (ignore "not found"). Via the `docker` CLI so it
+/// works on Docker Desktop for Windows like the other container ops.
 pub async fn remove_container(name: &str) {
-    if let Ok(d) = connect().await {
-        let _ = d
-            .remove_container(name, Some(RemoveContainerOptions { force: true, ..Default::default() }))
-            .await;
-    }
+    let _ = docker_cli(&["rm", "-f", name], None).await;
 }
 
 /// How the runtime container attaches to the network + host, per platform.
@@ -80,69 +75,103 @@ pub struct RunSpec {
     pub publish_ports: Vec<u16>,// ports to publish to 127.0.0.1 (Docker Desktop)
 }
 
-/// Create + start the runtime container with the platform-appropriate config.
-/// Mirrors the previous `docker run` argv exactly, expressed via the API.
+/// Create + start the runtime container via the `docker` CLI. bollard's
+/// `create_container` POST fails on Docker Desktop for Windows ("expected value
+/// at line 1 column 1") even though build/inspect (GET) succeed — a named-pipe
+/// transport quirk for that endpoint. The CLI drives the pipe reliably and is
+/// already a dependency (the harness runs `docker exec`). This builds the same
+/// container the API config described.
 pub async fn create_and_start(spec: &RunSpec) -> Result<(), String> {
-    let d = connect().await?;
-    remove_container(&spec.name).await;
+    // Clear any stale container so `--name` never conflicts.
+    let _ = docker_cli(&["rm", "-f", &spec.name], None).await;
 
-    let mut host_config = HostConfig {
-        binds: Some(vec![format!("{}:{}", spec.host_home, spec.container_home)]),
-        // Run a real init (Docker's bundled tini) as PID 1 so it reaps zombies.
-        // Our CMD is `sleep infinity`, which never reaps children — a single stale
-        // `<defunct> mitmdump` (or any spawned tool) would otherwise accumulate and,
-        // with a pgrep-based liveness check, wedge restarts. tini fixes that.
-        init: Some(true),
-        ..Default::default()
-    };
+    let binds = format!("{}:{}", spec.host_home, spec.container_home);
+    let home_env = format!("HOME={}", spec.container_home);
+    // `--init` runs Docker's bundled tini as PID 1 so it reaps zombies (our CMD
+    // `sleep infinity` never would, which otherwise wedges pgrep-based restarts).
+    let mut args: Vec<String> =
+        vec!["run".into(), "-d".into(), "--name".into(), spec.name.clone(), "--init".into()];
     if spec.linux {
-        host_config.network_mode = Some("host".into());
-        host_config.extra_hosts = Some(vec!["host.docker.internal:host-gateway".into()]);
-        host_config.cap_add = Some(vec!["SYS_ADMIN".into(), "NET_ADMIN".into(), "NET_RAW".into()]);
-        host_config.security_opt = Some(vec!["seccomp=unconfined".into(), "apparmor=unconfined".into()]);
+        args.push("--network".into());
+        args.push("host".into());
+        args.push("--add-host".into());
+        args.push("host.docker.internal:host-gateway".into());
+        for c in ["SYS_ADMIN", "NET_ADMIN", "NET_RAW"] {
+            args.push("--cap-add".into());
+            args.push(c.into());
+        }
+        args.push("--security-opt".into());
+        args.push("seccomp=unconfined".into());
+        args.push("--security-opt".into());
+        args.push("apparmor=unconfined".into());
         if spec.tun {
-            host_config.devices = Some(vec![DeviceMapping {
-                path_on_host: Some("/dev/net/tun".into()),
-                path_in_container: Some("/dev/net/tun".into()),
-                cgroup_permissions: Some("rwm".into()),
-            }]);
+            args.push("--device".into());
+            args.push("/dev/net/tun:/dev/net/tun".into());
         }
     } else {
-        // Docker Desktop VM: no host networking. Keep the caps Desktop allows and
-        // publish the requested ports to the host loopback.
-        host_config.cap_add = Some(vec!["NET_ADMIN".into(), "NET_RAW".into()]);
-        host_config.security_opt = Some(vec!["seccomp=unconfined".into()]);
-        let mut pb = std::collections::HashMap::new();
-        for p in &spec.publish_ports {
-            pb.insert(
-                format!("{p}/tcp"),
-                Some(vec![PortBinding {
-                    host_ip: Some("127.0.0.1".into()),
-                    host_port: Some(p.to_string()),
-                }]),
-            );
+        // Docker Desktop VM: no host networking; keep the allowed caps and publish
+        // the requested ports to the host loopback.
+        for c in ["NET_ADMIN", "NET_RAW"] {
+            args.push("--cap-add".into());
+            args.push(c.into());
         }
-        if !pb.is_empty() {
-            host_config.port_bindings = Some(pb);
+        args.push("--security-opt".into());
+        args.push("seccomp=unconfined".into());
+        for p in &spec.publish_ports {
+            args.push("-p".into());
+            args.push(format!("127.0.0.1:{p}:{p}/tcp"));
         }
     }
+    args.push("-v".into());
+    args.push(binds);
+    args.push("-e".into());
+    args.push(home_env);
+    args.push("-w".into());
+    args.push(spec.container_home.clone());
+    args.push(spec.image.clone());
+    args.push("sleep".into());
+    args.push("infinity".into());
 
-    let config = Config {
-        image: Some(spec.image.clone()),
-        cmd: Some(vec!["sleep".into(), "infinity".into()]),
-        env: Some(vec![format!("HOME={}", spec.container_home)]),
-        working_dir: Some(spec.container_home.clone()),
-        host_config: Some(host_config),
-        ..Default::default()
-    };
-
-    d.create_container(Some(CreateContainerOptions { name: spec.name.clone(), platform: None }), config)
-        .await
-        .map_err(|e| format!("create container: {e}"))?;
-    d.start_container(&spec.name, None::<StartContainerOptions<String>>)
-        .await
-        .map_err(|e| format!("start container: {e}"))?;
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (out, code) = docker_cli(&argv, None).await?;
+    if code != 0 {
+        return Err(format!("create container: docker run failed: {}", out.trim()));
+    }
     Ok(())
+}
+
+/// Run the `docker` CLI with args, capturing combined stdout+stderr and the exit
+/// code. This is the reliable cross-platform path against Docker Desktop (the
+/// Windows named pipe in particular); `docker` must be on PATH — the harness
+/// relies on it too. On Windows a hidden console avoids a flashing window.
+async fn docker_cli(args: &[&str], stdin: Option<&str>) -> Result<(String, i64), String> {
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.args(args)
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to run docker (is Docker Desktop running and on PATH?): {e}"))?;
+    if let Some(data) = stdin {
+        if let Some(mut si) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = si.write_all(data.as_bytes()).await;
+            let _ = si.shutdown().await;
+        }
+    }
+    let out = child.wait_with_output().await.map_err(|e| e.to_string())?;
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !err.trim().is_empty() {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(&err);
+    }
+    Ok((s, out.status.code().map(|c| c as i64).unwrap_or(-1)))
 }
 
 /// Run a command in the container and return `(combined stdout+stderr, exit
@@ -154,63 +183,36 @@ pub async fn exec_output(
     user: Option<String>,
     stdin: Option<&str>,
 ) -> Result<(String, i64), String> {
-    let d = connect().await?;
-    let exec = d
-        .create_exec(
-            container,
-            CreateExecOptions {
-                cmd: Some(cmd),
-                user,
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                attach_stdin: stdin.map(|_| true),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?
-        .id;
-    let out = match d.start_exec(&exec, None).await.map_err(|e| e.to_string())? {
-        StartExecResults::Attached { mut output, mut input } => {
-            if let Some(data) = stdin {
-                use tokio::io::AsyncWriteExt;
-                let _ = input.write_all(data.as_bytes()).await;
-                let _ = input.shutdown().await;
-            }
-            let mut out = String::new();
-            while let Some(chunk) = output.next().await {
-                if let Ok(msg) = chunk {
-                    out.push_str(&msg.to_string());
-                }
-            }
-            out
-        }
-        StartExecResults::Detached => String::new(),
-    };
-    let code = d.inspect_exec(&exec).await.ok().and_then(|r| r.exit_code).unwrap_or(-1);
-    Ok((out, code))
+    // Via the `docker` CLI (see docker_cli): bollard's create_exec POST hits the
+    // same Docker Desktop / Windows named-pipe failure as create_container.
+    let mut args: Vec<String> = vec!["exec".into()];
+    if stdin.is_some() {
+        args.push("-i".into());
+    }
+    if let Some(u) = &user {
+        args.push("-u".into());
+        args.push(u.clone());
+    }
+    args.push(container.to_string());
+    args.extend(cmd);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    docker_cli(&argv, stdin).await
 }
 
 /// Start a command in the container detached (fire-and-forget), as `user`.
 pub async fn exec_detached(container: &str, cmd: Vec<String>, user: Option<String>) -> Result<(), String> {
-    let d = connect().await?;
-    let exec = d
-        .create_exec(
-            container,
-            CreateExecOptions::<String> {
-                cmd: Some(cmd),
-                user,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?
-        .id;
-    // detach:true makes start_exec return immediately without attaching streams.
-    let _ = d
-        .start_exec(&exec, Some(StartExecOptions { detach: true, ..Default::default() }))
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut args: Vec<String> = vec!["exec".into(), "-d".into()];
+    if let Some(u) = &user {
+        args.push("-u".into());
+        args.push(u.clone());
+    }
+    args.push(container.to_string());
+    args.extend(cmd);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (out, code) = docker_cli(&argv, None).await?;
+    if code != 0 {
+        return Err(format!("docker exec -d failed: {}", out.trim()));
+    }
     Ok(())
 }
 
