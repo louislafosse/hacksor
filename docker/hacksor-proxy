@@ -605,9 +605,16 @@ def cmd_start(a):
         json.dump({"log": log, "rules": rules_path(), "port": port}, f)
     env = dict(os.environ, HACKSOR_PROXY_LOG=log, HACKSOR_PROXY_RULES=rules_path(),
                HACKSOR_PROXY_PORT=str(port))
+    # start_new_session=True (setsid) detaches mitmdump into its own session, so
+    # it survives after this `hacksor-proxy start` process exits — without it,
+    # the child stays in the same process group as this one-shot CLI invocation
+    # and gets reaped along with it the moment the agent's exec tool call that
+    # ran `hacksor-proxy start` returns (even without a trailing `&`, and even
+    # more reliably so plain `&` alone is never required or sufficient).
     subprocess.Popen(["mitmdump", "-q", "--listen-port", str(port), "-s", _self_path()],
                      env=env, stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
     for _ in range(30):
         time.sleep(0.3)
         if _port_open(port):
