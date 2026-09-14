@@ -1,3 +1,13 @@
+## [1.0.3](https://github.com/louislafosse/hacksor/compare/v1.0.2...v1.0.3) (2026-09-14)
+
+
+### Bug Fixes
+
+* **harness:** enable the update_plan tool ([a030008](https://github.com/louislafosse/hacksor/commit/a030008d1102ed75377b82512bf30ba777a0e6ce))
+* **proxy:** detach mitmdump so it survives the starting shell ([958cc69](https://github.com/louislafosse/hacksor/commit/958cc6998d5a2102cc3d171804ee09cdb891e1f2))
+* **runtime:** fix Windows Docker bind mount and improve status detection ([4699546](https://github.com/louislafosse/hacksor/commit/4699546005bf626ba47de688fbf402eb2f527fbe))
+* **subagent:** retry transient config races and fix flag ordering ([e2e45c6](https://github.com/louislafosse/hacksor/commit/e2e45c675f6beb8e265406e8073089bcefcc44e6))
+
 ## [1.0.2](https://github.com/louislafosse/hacksor/compare/v1.0.1...v1.0.2) (2026-09-13)
 
 
