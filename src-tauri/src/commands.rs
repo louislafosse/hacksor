@@ -371,7 +371,7 @@ pub async fn verify_turn(state: State<'_, AppState>, args: VerifyArgs) -> Result
     Ok(parse_verdict(content))
 }
 
-fn truncate(s: &str, n: usize) -> String {
+pub(crate) fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
@@ -1564,8 +1564,8 @@ fn effective_dockerfile(codex_home: &std::path::Path) -> String {
 /// Build the runtime image from the effective Dockerfile via the Engine API,
 /// streaming build log lines to the UI. Honors a user-customized Dockerfile.
 async fn build_runtime_image(app: &AppHandle, codex_home: &std::path::Path) -> Result<(), String> {
-    if !docker_present().await {
-        return Err("Docker is not installed or not running.".into());
+    if let Some(reason) = runtime::docker_unavailable_reason().await {
+        return Err(reason);
     }
     let dockerfile = effective_dockerfile(codex_home);
     let app2 = app.clone();
@@ -1693,8 +1693,8 @@ async fn ensure_runtime_ready(state: &State<'_, AppState>, app: &AppHandle) -> R
     if !docker_runtime(state).await {
         return ensure_opencodex(state).await;
     }
-    if !docker_present().await {
-        return Err("Docker mode is selected but Docker isn't installed or running. Install/start Docker (docker.com/get-started), or switch Runtime to Host in Settings.".into());
+    if let Some(reason) = runtime::docker_unavailable_reason().await {
+        return Err(reason);
     }
     if !runtime_image_exists().await {
         provision_runtime_image(state, app).await?;
@@ -1729,17 +1729,14 @@ pub async fn prepare_runtime(state: State<'_, AppState>, app: AppHandle) -> Resu
 /// The OpenCodex proxy always runs on the HOST (managed cross-platform by the
 /// app), so it is NOT started inside the container.
 async fn start_runtime(codex_home: &std::path::Path, services_always_on: bool) -> Result<(), String> {
-    if !docker_present().await {
-        return Err("Docker is not installed.".into());
+    if let Some(reason) = runtime::docker_unavailable_reason().await {
+        return Err(reason);
     }
     if !runtime_image_exists().await {
         return Err("Runtime image not available yet — it downloads/builds on first use.".into());
     }
     if !runtime_container_running().await {
-        let (host_home, container_home) = {
-            let (mount, home_env) = platform::home_mount();
-            (mount.split_once(':').map(|(h, _)| h.to_string()).unwrap_or(home_env.clone()), home_env)
-        };
+        let (host_home, container_home) = platform::home_mount();
         let spec = runtime::RunSpec {
             image: RUNTIME_IMAGE.to_string(),
             name: RUNTIME_CONTAINER.to_string(),
@@ -1767,6 +1764,28 @@ async fn start_runtime(codex_home: &std::path::Path, services_always_on: bool) -
             );
             let _ = runtime::exec_output(RUNTIME_CONTAINER, vec!["bash".into(), "-lc".into(), setup], Some("0".into()), None).await;
         }
+        // The image pre-fetches the ~1.3 GB Camoufox engine at BUILD time
+        // (`camofox-browser fetch` in the Dockerfile), which runs as root and
+        // lands in `/root/.cache/camoufox`. At RUNTIME, `$HOME` is the
+        // bind-mounted user home (identity on Linux/macOS, `/hacksorhome` on
+        // Windows) — never `/root` — so that cache is invisible to the running
+        // container and every fresh install fails Camoufox's own version check
+        // ("installed Camoufox version could not be determined") instead of
+        // silently downloading. Seed the runtime cache from the build-time one
+        // once per fresh container so the prefetch is actually used. Detached
+        // and best-effort: if it's still copying (or missing) when the agent
+        // first opens a browser tab, camofox-browser falls back to its normal
+        // on-demand download — same as before this seed step existed.
+        let _ = runtime::exec_detached(
+            RUNTIME_CONTAINER,
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "[ -f \"$HOME/.cache/camoufox/version.json\" ] || { mkdir -p \"$HOME/.cache\" && cp -r /root/.cache/camoufox \"$HOME/.cache/camoufox\" 2>/dev/null; }".into(),
+            ],
+            platform::docker_exec_user(),
+        )
+        .await;
     }
     let _ = codex_home; // the home mount already covers codex-home + working dirs
     // Refresh vuln intel in the background so each session has fresh CVE data.
@@ -2109,8 +2128,8 @@ pub async fn kali_status() -> KaliStatus {
 /// the same path, so the agent can exec tools against local files.
 #[tauri::command]
 pub async fn start_kali(working_dir: String) -> Result<String, String> {
-    if !docker_present().await {
-        return Err("Docker is not installed or not running.".into());
+    if let Some(reason) = runtime::docker_unavailable_reason().await {
+        return Err(reason);
     }
     if runtime::container_running(KALI_CONTAINER).await {
         return Ok("already running".into());

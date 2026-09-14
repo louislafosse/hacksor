@@ -1331,11 +1331,14 @@ function prepareRuntime() {
     (banner.querySelector(".rt-bar") as HTMLElement).hidden = true;
     (banner.querySelector(".rt-pct") as HTMLElement).textContent = "";
     const msgEl = banner.querySelector(".rt-msg") as HTMLElement;
-    const dockerMissing = /docker/i.test(msg) && /(install|not installed|isn't installed|not running)/i.test(msg);
-    if (dockerMissing) {
-      // Clear guidance: install Docker, or switch to Host mode.
+    // The backend already distinguishes "not installed" from "installed but the
+    // daemon isn't running" (see runtime::docker_unavailable_reason) — surface
+    // its own wording rather than collapsing both cases into one message, and
+    // only offer the Docker Desktop download link when it's actually missing.
+    const notInstalled = /docker/i.test(msg) && /not installed/i.test(msg);
+    if (notInstalled) {
       msgEl.innerHTML =
-        `⚠ Docker isn't installed or running. Install <a class="rt-link" href="https://www.docker.com/products/docker-desktop/" target="_blank" rel="noreferrer">Docker Desktop</a> (docker.com) to use the runtime, or switch Runtime to Host in Settings.`;
+        `⚠ Docker is not installed. Install <a class="rt-link" href="https://www.docker.com/products/docker-desktop/" target="_blank" rel="noreferrer">Docker Desktop</a> (docker.com) to use the runtime, or switch Runtime to Host in Settings.`;
     } else {
       msgEl.textContent = "⚠ " + msg;
     }

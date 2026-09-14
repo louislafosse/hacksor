@@ -142,11 +142,14 @@ pub fn container_home_env() -> String {
     }
 }
 
-/// The `-v host:container` bind mount for the user home, and the `HOME` value.
+/// The host home path and the container `HOME` value, for the bind mount.
+/// Returned as separate strings (not a joined `"host:container"`) because a
+/// Windows host path already contains a `:` (the drive letter, e.g.
+/// `C:\Users\louis`) which would collide with a naive split on `:`.
 pub fn home_mount() -> (String, String) {
     let host = home_dir().to_string_lossy().into_owned();
     let container = container_home_env();
-    (format!("{host}:{container}"), container)
+    (host, container)
 }
 
 fn join_unix(base: &str, rel: &Path) -> String {

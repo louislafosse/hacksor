@@ -41,6 +41,32 @@ pub async fn docker_present() -> bool {
     }
 }
 
+/// Is the `docker` CLI present on PATH? Distinct from `docker_present`, which
+/// checks whether the daemon is actually reachable: Docker Desktop puts
+/// `docker` on PATH as soon as it's installed, even before the app/VM has
+/// been started, so this alone tells "not installed" apart from "installed
+/// but the daemon isn't running yet".
+pub fn docker_installed() -> bool {
+    crate::platform::which("docker").is_some()
+}
+
+/// Human-readable reason the Docker runtime can't be used right now, or
+/// `None` if it's ready. Never claims Docker is "not installed" when the CLI
+/// is present but the daemon just hasn't been started.
+pub async fn docker_unavailable_reason() -> Option<String> {
+    if !docker_installed() {
+        return Some(
+            "Docker is not installed. Install Docker Desktop (docker.com/products/docker-desktop), or switch Runtime to Host in Settings.".into(),
+        );
+    }
+    if !docker_present().await {
+        return Some(
+            "Docker is installed, but the Docker daemon isn't running. Start Docker Desktop, or switch Runtime to Host in Settings.".into(),
+        );
+    }
+    None
+}
+
 /// Does a local image with this name exist?
 pub async fn image_exists(name: &str) -> bool {
     match connect().await {

@@ -197,6 +197,7 @@ pub fn infer_effort(slug: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::truncate;
 
     #[test]
     fn provider_parse_roundtrips_ids() {
