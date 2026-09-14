@@ -12,6 +12,14 @@ on:
 
 permissions:
   contents: write
+  # @semantic-release/github's post-publish "success"/"fail" steps comment on
+  # any issues/PRs referenced by the released commits. Without these, that
+  # step throws "Resource not accessible by integration" AFTER the release/tag
+  # are already published, which fails the whole job — and since the build
+  # matrix depends on this job's `published` output, which never gets set on
+  # a failed run, every release silently shipped with zero installer assets.
+  issues: write
+  pull-requests: write
 
 concurrency:
   group: release
