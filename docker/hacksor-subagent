@@ -31,10 +31,22 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
+
+# Seen intermittently when many `codex exec` workers cold-start against the
+# same CODEX_HOME at once (e.g. a fresh container's first `map` fan-out):
+# "failed to load configuration: Model provider `opencodex` not found". It
+# self-heals on retry once the shared config/catalog state has settled, so
+# treat it as transient rather than a real usage error.
+_TRANSIENT_MARKERS = ("failed to load configuration", "model provider")
 
 
-def run_worker(task, model, cd, timeout):
-    """Run one `codex exec` worker; return (ok, final_message_or_error)."""
+def _is_transient_config_error(msg):
+    low = (msg or "").lower()
+    return any(m in low for m in _TRANSIENT_MARKERS) and "not found" in low
+
+
+def _run_worker_once(task, model, cd, timeout):
     out_file = tempfile.NamedTemporaryFile(prefix="hs_sub_", suffix=".txt", delete=False)
     out_file.close()
     cmd = [
@@ -67,6 +79,20 @@ def run_worker(task, model, cd, timeout):
         err = (r.stderr or r.stdout or "").strip().splitlines()
         return (r.returncode == 0), (msg or ("\n".join(err[-6:]) if err else "(no output)"))
     return True, msg
+
+
+def run_worker(task, model, cd, timeout):
+    """Run one `codex exec` worker; return (ok, final_message_or_error).
+
+    Retries once on the transient cold-start config-load race above — real
+    failures (bad task, timeout, target unreachable, etc.) are returned as-is
+    on the first try.
+    """
+    ok, msg = _run_worker_once(task, model, cd, timeout)
+    if not ok and _is_transient_config_error(msg):
+        time.sleep(1.5)
+        ok, msg = _run_worker_once(task, model, cd, timeout)
+    return ok, msg
 
 
 def cmd_run(a):
@@ -110,16 +136,28 @@ def cmd_map(a):
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="hacksor-subagent", description="Parallel divide-and-conquer Codex workers.")
-    p.add_argument("--model")
-    p.add_argument("--cd", default=os.getcwd())
-    p.add_argument("--timeout", type=int, default=900)
+    # --model/--cd/--timeout are defined on BOTH the top-level parser and each
+    # subcommand (via `parents=`) so they work whether passed before or after
+    # `run`/`map` — argparse only lets a parser's own optionals appear in the
+    # argv slice it consumes, so a flag defined solely on the top level (the
+    # old behavior) errors with "unrecognized arguments" if given after the
+    # subcommand instead. Matching dest + default on both means an explicit
+    # value set on either side sticks and an unset one keeps the other side's
+    # value (argparse skips re-applying a default once the dest is already
+    # set), so there's no clobbering either way.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--model")
+    common.add_argument("--cd", default=os.getcwd())
+    common.add_argument("--timeout", type=int, default=900)
+
+    p = argparse.ArgumentParser(prog="hacksor-subagent", description="Parallel divide-and-conquer Codex workers.",
+                                 parents=[common])
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    r = sub.add_parser("run", help="one focused worker")
+    r = sub.add_parser("run", help="one focused worker", parents=[common])
     r.add_argument("task"); r.set_defaults(fn=cmd_run)
 
-    m = sub.add_parser("map", help="fan out a task over items ({} per item)")
+    m = sub.add_parser("map", help="fan out a task over items ({} per item)", parents=[common])
     m.add_argument("--task", required=True)
     m.add_argument("--items", help="file with one item per line")
     m.add_argument("--list", help="inline comma-separated items")
