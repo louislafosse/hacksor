@@ -621,7 +621,13 @@ fn write_provider_config(codex_home: &PathBuf, is_docker: bool) -> Result<()> {
 model_provider = \"opencodex\"\n\
 # Do not load a target directory's AGENTS.md/CLAUDE.md: it pollutes the Hacksor\n\
 # persona and is a prompt-injection vector when auditing untrusted repos.\n\
-project_doc_max_bytes = 0\n",
+project_doc_max_bytes = 0\n\
+# codex 0.152+ ships update_plan disabled by default (it must be opted back in\n\
+# per-session); without this the model has no plan/todo tool and any attempt\n\
+# to call update_plan fails with \"unsupported call\". The persona explicitly\n\
+# uses plan tracking for multi-step engagements, so turn it back on.\n\
+[tools.update_plan]\n\
+enabled = true\n",
     );
     if is_docker {
         // The Docker container is the isolation boundary; disable codex's own
