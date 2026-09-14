@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/louislafosse/hacksor/compare/v1.0.0...v1.1.0) (2026-09-14)
+
+
+### Features
+
+* **runtime:** download the prebuilt image from GHCR on first run ([5e28e65](https://github.com/louislafosse/hacksor/commit/5e28e657bd922e7d1711bcfa259fbda06af195d2))
+
 # 1.0.0 (2026-09-14)
 
 
