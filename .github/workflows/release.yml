@@ -116,6 +116,12 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Baked in at compile time (option_env!): pull the prebuilt runtime
+          # image from GHCR on first run instead of building ~21 GB locally. Left
+          # empty for Apple Silicon (arm64) — the published image is amd64 only,
+          # and an amd64 pull would emulate, so arm64 Macs local-build a native
+          # image instead. The local build stays the automatic fallback for all.
+          HACKSOR_RUNTIME_IMAGE: ${{ matrix.target == 'aarch64-apple-darwin' && '' || 'ghcr.io/louislafosse/hacksor-runtime:latest' }}
         # macOS/Windows builds are UNSIGNED by default (first-run warning on the
         # user's machine). To enable Apple signing + notarization, add a separate
         # step that sets APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
