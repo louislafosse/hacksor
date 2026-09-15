@@ -65,7 +65,10 @@ RUN go install -v github.com/hahwul/dalfox/v2@latest 2>/dev/null; \
     go install -v github.com/projectdiscovery/uncover/cmd/uncover@latest 2>/dev/null; \
     go install -v github.com/tomnomnom/assetfinder@latest 2>/dev/null; \
     go install -v github.com/tomnomnom/gf@latest 2>/dev/null; \
-    go install -v github.com/sensepost/gowitness@latest 2>/dev/null; \
+    # gowitness: its go.mod carries replace directives, which `go install` refuses;
+    # build it from a clone (as the main module those directives are honored).
+    (rm -rf /tmp/gowitness && git clone --depth 1 https://github.com/sensepost/gowitness /tmp/gowitness \
+      && cd /tmp/gowitness && go build -o /usr/local/gopath/bin/gowitness . && cd / && rm -rf /tmp/gowitness) 2>/dev/null; \
     # secrets scanning, cloud enum, API route discovery
     go install -v github.com/gitleaks/gitleaks/v8@latest 2>/dev/null; \
     go install -v github.com/BishopFox/cloudfox@latest 2>/dev/null; \
