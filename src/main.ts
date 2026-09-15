@@ -1464,7 +1464,11 @@ async function loadModels() {
     updateChips();
     updateHint();
   } catch (err) {
-    addError(activeSession(), "Could not load models: " + String(err));
+    const s = String(err);
+    // If the runtime is still provisioning, tag the error so it can be cleared
+    // and retried automatically once the runtime is ready.
+    const provisioning = /not available yet|downloads\/builds|become ready|isn.t ready|not ready yet|still starting|starting the runtime/i.test(s);
+    addError(activeSession(), "Could not load models: " + s, provisioning ? "errbar-models" : undefined);
   }
 }
 
@@ -2109,8 +2113,8 @@ async function escalateContinue(session: Session, reason: string) {
     addError(session, String(e));
   }
 }
-function addError(session: Session | undefined, msg: string) {
-  (session?.turnsEl ?? turnsHost).appendChild(el("div", "errbar", escapeHtml(msg)));
+function addError(session: Session | undefined, msg: string, cls?: string) {
+  (session?.turnsEl ?? turnsHost).appendChild(el("div", "errbar" + (cls ? " " + cls : ""), escapeHtml(msg)));
   scrollToBottom();
 }
 // Auto-scroll only while the user is parked at the bottom (see stickToBottom,
@@ -2458,6 +2462,10 @@ listen<{ phase: string; message: string; percent?: number }>("hacksor://runtime"
     pctEl.textContent = "";
   }
   if (phase === "ready") {
+    // The runtime finished downloading/building: drop any "runtime not ready"
+    // model errors and reload the catalog so the stale message disappears.
+    document.querySelectorAll(".errbar-models").forEach((e) => e.remove());
+    loadModels();
     setTimeout(() => { rtBanner?.remove(); rtBanner = null; }, 1800);
   }
 });
