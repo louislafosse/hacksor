@@ -1,11 +1,11 @@
 name: Publish runtime image
 
-# Builds the bundled Kali runtime image and pushes it to GHCR so the app can
-# DOWNLOAD it on first run (see HACKSOR_RUNTIME_IMAGE) instead of building ~21 GB
-# locally. `buildx --push` streams each layer straight to the registry, so the
-# full image is never assembled on the runner's disk — which also avoids the disk
-# exhaustion a plain `docker build` hits here. amd64 only for now; Apple Silicon
-# local-builds a native image (an amd64 pull would emulate).
+# Builds the bundled Kali runtime image for amd64 + arm64 and pushes a multi-arch
+# manifest to GHCR, so the app DOWNLOADS the image for its native architecture on
+# first run (see HACKSOR_RUNTIME_IMAGE) instead of building ~21 GB locally. Each
+# arch builds on its own NATIVE runner (no slow emulation) and `buildx` pushes by
+# digest (streams layers straight to the registry, so the full image is never
+# assembled on the runner's disk); a final job stitches the digests into one tag.
 on:
   workflow_dispatch:
   push:
@@ -19,10 +19,21 @@ permissions:
   contents: read
   packages: write
 
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/hacksor-runtime
+
 jobs:
-  publish:
-    name: Build & push (amd64)
-    runs-on: ubuntu-22.04
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-22.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -33,6 +44,11 @@ jobs:
           large-packages: true
           tool-cache: true
 
+      - name: Prepare platform tag
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+        env:
+          PLATFORM: ${{ matrix.platform }}
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
@@ -42,13 +58,53 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: docker
           file: docker/Dockerfile
-          platforms: linux/amd64
-          push: true
+          platforms: ${{ matrix.platform }}
           provenance: false
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/hacksor-runtime:latest
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          echo -n "${{ steps.build.outputs.digest }}" > "/tmp/digests/${PLATFORM_PAIR}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Push multi-arch manifest
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest
+        run: |
+          refs=""
+          for f in /tmp/digests/*; do refs="$refs ${IMAGE}@$(cat "$f")"; done
+          docker buildx imagetools create -t "${IMAGE}:latest" $refs
+
+      - name: Inspect
+        run: docker buildx imagetools inspect "${IMAGE}:latest"
