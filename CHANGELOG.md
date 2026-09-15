@@ -1,3 +1,10 @@
+## [1.1.1](https://github.com/louislafosse/hacksor/compare/v1.1.0...v1.1.1) (2026-09-15)
+
+
+### Bug Fixes
+
+* **ui:** clear the "runtime not ready" model error once the runtime is up ([6caf260](https://github.com/louislafosse/hacksor/commit/6caf260ba61ffb90d6168c2151a168f73598166b))
+
 # [1.1.0](https://github.com/louislafosse/hacksor/compare/v1.0.0...v1.1.0) (2026-09-14)
 
 
