@@ -586,12 +586,34 @@ async fn ocx_status(docker: bool) -> String {
 /// So: poll while ocx says `pending`, and on a terminal `failed` restart the
 /// proxy once to retry discovery. Falling through with an empty list lets the
 /// caller's diagnostic explain a genuinely bad key.
+///
+/// `ready` is NOT a terminal answer either: it is the proxy's own readiness and
+/// flips as soon as ocx answers, while each upstream's catalog discovery is
+/// still in flight. Switching provider right after startup asks for an upstream
+/// that has not landed yet — measured on the bundled ocx, `vercel-ai-gateway`
+/// went from 0 to 341 models with the status sitting at `ready` throughout. So
+/// a ready-but-empty read is retried a bounded number of rounds before it is
+/// believed.
+/// The model count out of an `ocx provider test` line, e.g. "connected — 391
+/// models available." → `Some(391)`. `None` when the line carries no count.
+fn models_available_in(diag: &str) -> Option<u32> {
+    let idx = diag.find("models available")?;
+    diag[..idx]
+        .split_whitespace()
+        .next_back()
+        .and_then(|w| w.parse().ok())
+}
+
 async fn read_live_catalog(
     state: &State<'_, AppState>,
     p: Provider,
     docker: bool,
 ) -> Result<Vec<ModelInfo>, String> {
+    // Rounds to keep polling a `ready` proxy that has nothing for this upstream
+    // (~1.2s each) before accepting the empty catalog as the real answer.
+    const READY_EMPTY_ROUNDS: u32 = 8;
     let mut restarted = false;
+    let mut ready_empty = 0u32;
     for attempt in 0..16 {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
@@ -621,8 +643,14 @@ async fn read_live_catalog(
             // about model discovery — restarting on it kills the in-flight
             // discovery and empties the catalog for every provider.
             "pending" | "failed" | "unreachable" | "" => {}
-            // Ready with nothing for this upstream: no amount of waiting helps.
-            _ => break,
+            // Ready, but this upstream's discovery may simply not have landed
+            // yet (see the note above) — give it a few more rounds, then stop.
+            _ => {
+                ready_empty += 1;
+                if ready_empty >= READY_EMPTY_ROUNDS {
+                    break;
+                }
+            }
         }
     }
     Ok(Vec::new())
@@ -667,7 +695,19 @@ pub async fn list_models(
             } else if diag.contains("not running") {
                 "the proxy isn't ready yet. Try again in a moment."
             } else if diag.contains("connected") || diag.contains(": ok") || diag.contains("success") {
-                "the key works, but no models are exposed for it — make sure models are enabled in your provider dashboard."
+                // `provider test` does its own live call and prints the real
+                // count ("Connected — 391 models available."). A non-zero count
+                // here means the upstream is fine and it is the proxy's catalog
+                // that is behind, so don't send the user to their dashboard.
+                match models_available_in(&diag) {
+                    Some(n) if n > 0 => {
+                        return Err(format!(
+                            "No {} models yet — the upstream reports {n} models, but the proxy's catalog hasn't picked them up. Reopen this menu in a few seconds.",
+                            p.display()
+                        ))
+                    }
+                    _ => "the key works, but no models are exposed for it — make sure models are enabled in your provider dashboard.",
+                }
             } else {
                 "the key may be invalid, or the proxy is still starting — reopen this menu in a moment."
             };
@@ -2601,6 +2641,19 @@ fn personality_section(personality: Option<&str>) -> String {
 #[cfg(test)]
 mod transcript_tests {
     use super::*;
+
+    #[test]
+    fn models_available_parses_the_provider_test_count() {
+        // The real shape, lowercased the way the caller passes it.
+        assert_eq!(
+            models_available_in("vercel-ai-gateway: connected\nconnected — 391 models available.\nlatency: 1233 ms"),
+            Some(391)
+        );
+        assert_eq!(models_available_in("connected — 0 models available."), Some(0));
+        // No count, or a non-numeric one: fall back to the generic message.
+        assert_eq!(models_available_in("vercel-ai-gateway: connected"), None);
+        assert_eq!(models_available_in("connected — no models available."), None);
+    }
 
     #[test]
     fn spec_key_matches_only_the_two_pipeline_models() {
