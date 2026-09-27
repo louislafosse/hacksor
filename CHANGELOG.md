@@ -1,3 +1,15 @@
+# [1.2.0](https://github.com/louislafosse/hacksor/compare/v1.1.1...v1.2.0) (2026-09-27)
+
+
+### Bug Fixes
+
+* **models:** stop reporting "no models" while upstream discovery is in flight ([c4a13f0](https://github.com/louislafosse/hacksor/commit/c4a13f07ffc3554b9ec7f38eeb5f9627f50d748e))
+
+
+### Features
+
+* per-model operating specs and a Cheaper Inference provider ([5ae0dc1](https://github.com/louislafosse/hacksor/commit/5ae0dc109ca164bd67f9e90bf58cb0132b348df9))
+
 ## [1.1.1](https://github.com/louislafosse/hacksor/compare/v1.1.0...v1.1.1) (2026-09-15)
 
 
