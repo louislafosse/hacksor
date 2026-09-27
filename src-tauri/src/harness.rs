@@ -690,11 +690,15 @@ mod tests {
 
         // Anti prompt-injection: never load a target repo's AGENTS.md/CLAUDE.md.
         assert!(toml.contains("project_doc_max_bytes = 0"));
-        // Everything routes through the OpenCodex proxy; all three blocks present.
+        // Everything routes through the OpenCodex proxy; one block per provider.
         assert!(toml.contains("model_provider = \"opencodex\""));
-        assert!(toml.contains("[model_providers.openrouter]"));
-        assert!(toml.contains("[model_providers.vercel]"));
-        assert!(toml.contains("[model_providers.opencodex]"));
+        for p in crate::models::Provider::ALL {
+            assert!(
+                toml.contains(&format!("[model_providers.{}]", p.id())),
+                "missing block for {}",
+                p.id()
+            );
+        }
         // Codex only speaks the Responses wire API.
         assert!(toml.contains("wire_api = \"responses\""));
         assert!(!toml.contains("wire_api = \"chat\""));
@@ -702,13 +706,14 @@ mod tests {
         // OpenRouter/Vercel endpoints, and all reached via the proxy header.
         assert!(!toml.contains("openrouter.ai"));
         assert!(!toml.contains("ai-gateway.vercel.sh"));
-        // All three blocks point at the in-container/host loopback proxy port.
-        assert_eq!(toml.matches("127.0.0.1:10100/v1").count(), 3);
-        assert_eq!(toml.matches("x-opencodex-api-key").count(), 3);
+        // Every block points at the in-container/host loopback proxy port.
+        let n = crate::models::Provider::ALL.len();
+        assert_eq!(toml.matches("127.0.0.1:10100/v1").count(), n);
+        assert_eq!(toml.matches("x-opencodex-api-key").count(), n);
         assert!(!toml.contains("env_key"));
-        // Playwright MCP browser server is registered.
-        assert!(toml.contains("[mcp_servers.playwright]"));
-        assert!(toml.contains("@playwright/mcp"));
+        // Camoufox stealth-browser MCP server is registered.
+        assert!(toml.contains("[mcp_servers.camofox]"));
+        assert!(toml.contains("CAMOFOX_URL = \"http://127.0.0.1:9377\""));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

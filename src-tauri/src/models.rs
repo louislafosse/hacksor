@@ -11,6 +11,8 @@ pub const OPENCODEX_PORT: u16 = 10100;
 pub enum Provider {
     OpenRouter,
     Vercel,
+    /// Cheaper Inference — OpenAI-compatible Responses API gateway.
+    CheaperInference,
     /// OpenCodex proxy — routes to 40+ upstream providers (Ollama, Anthropic,
     /// Gemini, Groq, Together, …) by `provider/model` id.
     OpenCodex,
@@ -20,12 +22,20 @@ impl Provider {
     pub fn parse(s: &str) -> Self {
         match s {
             "vercel" | "vercel_gateway" | "ai_gateway" => Provider::Vercel,
+            "cheaper_inference" | "cheaper-inference" | "cheaperinference" => {
+                Provider::CheaperInference
+            }
             "opencodex" | "ocx" => Provider::OpenCodex,
             _ => Provider::OpenRouter,
         }
     }
 
-    pub const ALL: [Provider; 3] = [Provider::OpenRouter, Provider::Vercel, Provider::OpenCodex];
+    pub const ALL: [Provider; 4] = [
+        Provider::OpenRouter,
+        Provider::Vercel,
+        Provider::CheaperInference,
+        Provider::OpenCodex,
+    ];
 
     /// UI identity of the composer selection (persisted in settings, used to
     /// filter the model catalog). NOT the Codex `model_provider` — every provider
@@ -34,6 +44,7 @@ impl Provider {
         match self {
             Provider::OpenRouter => "openrouter",
             Provider::Vercel => "vercel",
+            Provider::CheaperInference => "cheaper_inference",
             Provider::OpenCodex => "opencodex",
         }
     }
@@ -53,7 +64,23 @@ impl Provider {
         match self {
             Provider::OpenRouter => Some("openrouter"),
             Provider::Vercel => Some("vercel-ai-gateway"),
+            Provider::CheaperInference => Some("cheaper-inference"),
             Provider::OpenCodex => None,
+        }
+    }
+
+    /// Extra `ocx provider add` flags for upstreams that are not in OpenCodex's
+    /// built-in registry. Registry providers (openrouter, vercel-ai-gateway) are
+    /// auto-configured by name; a custom one must declare its adapter and base URL.
+    pub fn ocx_custom_args(self) -> &'static [&'static str] {
+        match self {
+            Provider::CheaperInference => &[
+                "--adapter",
+                "openai-responses",
+                "--base-url",
+                "https://api.cheaperinference.com/v1",
+            ],
+            _ => &[],
         }
     }
 
@@ -70,6 +97,7 @@ impl Provider {
         match self {
             Provider::OpenRouter => "OPENROUTER_API_KEY",
             Provider::Vercel => "AI_GATEWAY_API_KEY",
+            Provider::CheaperInference => "CHEAPER_INFERENCE_API_KEY",
             Provider::OpenCodex => "OPENCODEX_API_AUTH_TOKEN",
         }
     }
@@ -88,6 +116,7 @@ impl Provider {
         match self {
             Provider::OpenRouter => "OpenRouter",
             Provider::Vercel => "Vercel AI Gateway",
+            Provider::CheaperInference => "Cheaper Inference",
             Provider::OpenCodex => "OpenCodex (any provider)",
         }
     }
@@ -223,8 +252,21 @@ mod tests {
         // Upstream mapping / catalog prefixes.
         assert_eq!(Provider::OpenRouter.ocx_upstream(), Some("openrouter"));
         assert_eq!(Provider::Vercel.ocx_upstream(), Some("vercel-ai-gateway"));
+        assert_eq!(Provider::CheaperInference.ocx_upstream(), Some("cheaper-inference"));
         assert_eq!(Provider::OpenCodex.ocx_upstream(), None);
         assert_eq!(Provider::OpenRouter.env_key(), "OPENROUTER_API_KEY");
+    }
+
+    #[test]
+    fn only_non_registry_upstreams_carry_custom_args() {
+        // Cheaper Inference is not in ocx's provider registry, so `provider add`
+        // must pass its adapter + base URL; registry providers take neither.
+        let args = Provider::CheaperInference.ocx_custom_args();
+        assert!(args.contains(&"--adapter") && args.contains(&"openai-responses"));
+        assert!(args.contains(&"https://api.cheaperinference.com/v1"));
+        assert!(Provider::OpenRouter.ocx_custom_args().is_empty());
+        assert!(Provider::Vercel.ocx_custom_args().is_empty());
+        assert!(Provider::OpenCodex.ocx_custom_args().is_empty());
     }
 
     #[test]

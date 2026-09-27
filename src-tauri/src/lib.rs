@@ -106,6 +106,8 @@ pub fn run() {
             commands::save_dockerfile,
             commands::get_persona,
             commands::save_persona,
+            commands::get_model_spec,
+            commands::save_model_spec,
             commands::stop_runtime,
             commands::refresh_intel,
             commands::services_status,

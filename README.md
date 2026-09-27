@@ -51,8 +51,8 @@ locally.
 
 **Providers and models**
 - Every request routes through a local **OpenCodex** proxy that fronts 40+
-  upstream providers. Add an OpenRouter and/or Vercel AI Gateway key and switch
-  per chat.
+  upstream providers. Add an OpenRouter, Vercel AI Gateway or Cheaper Inference
+  key and switch per chat.
 - The model list is fetched live from the provider catalog and is searchable in
   the header. Reasoning effort and vision support are inferred per model, with
   auto-routing to a vision-capable model when you attach an image.
@@ -120,8 +120,8 @@ developer instructions, so the tool contract stays intact.
 Every model request goes through the local OpenCodex proxy on `127.0.0.1:10100`.
 OpenCodex serves one merged catalog where each model id is prefixed by its
 upstream (`openrouter/...`, `vercel-ai-gateway/...`, `anthropic/...`), and the
-proxy picks the upstream from that prefix. The OpenRouter and Vercel choices in
-the UI are filtered views over that catalog, so switching provider needs no
+proxy picks the upstream from that prefix. The OpenRouter, Vercel and Cheaper
+Inference choices in the UI are filtered views over that catalog, so switching provider needs no
 translation shim.
 
 ## Tech stack
@@ -206,7 +206,7 @@ signing secrets are configured (see [Releases and versioning](#releases-and-vers
   your architecture; this takes a while and needs disk space, then is cached.
 - The **`codex` CLI** on your PATH for host mode (Docker mode ships it inside the
   container). Install from https://github.com/openai/codex.
-- An **OpenRouter** and/or **Vercel AI Gateway** API key.
+- An **OpenRouter**, **Vercel AI Gateway** or **Cheaper Inference** API key.
 
 ## Build from source
 
@@ -225,7 +225,8 @@ pnpm tauri build      # produce installers for the current platform
 
 ## First run
 
-1. Open **Settings**, paste your OpenRouter (and/or Vercel AI Gateway) key.
+1. Open **Settings**, paste your OpenRouter, Vercel AI Gateway or Cheaper
+   Inference key.
 2. Choose a working directory: where the agent's tools run and where output
    lands.
 3. Pick the runtime (Docker recommended) and, in Docker mode, build the runtime
@@ -272,6 +273,7 @@ Windows signing setup to produce signed, notarized builds.
 | `src-tauri/src/models.rs` | Providers and the OpenCodex-fronted model catalog |
 | `src-tauri/src/settings.rs` | Local settings and secrets |
 | `prompts/hacksor-developer.md` | Security persona, authorization policy, methodology |
+| `prompts/agents-*.md` | Per-model operating specs layered on the persona (DeepSeek V4.1 Flash, MiMo v2.6 Pro), editable in Settings > Agent |
 | `skills/` | Methodology skill docs bundled into the binary |
 | `docker/Dockerfile` | The bundled Kali runtime image |
 | `docker/hacksor-*` | The bundled CLIs (proxy, findings, session, subagent) and cloudfish |

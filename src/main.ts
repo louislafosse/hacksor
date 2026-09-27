@@ -79,6 +79,7 @@ type SettingsView = {
   provider: string;
   has_openrouter_key: boolean;
   has_vercel_key: boolean;
+  has_cheaper_inference_key: boolean;
   personality: string | null;
   custom_instructions: string | null;
   working_dir: string;
@@ -168,6 +169,9 @@ interface Session {
   lastAnswerEl?: HTMLElement;
   // Last model Auto used in this chat, so we only note a switch when it changes.
   autoModel?: string;
+  // Which half of the Auto pipeline this chat is in: recon (investigate and
+  // confirm) or exploit. Sticky across turns; see autoPhase.
+  phase?: AutoPhase;
   thinkingEl?: HTMLElement;
   thinkTimer?: number;
   lastText?: string;
@@ -188,7 +192,7 @@ const state = {
   auto: false,
   effort: "high",
   permission: "full_access" as "full_access" | "ask_approval" | "auto_review" | "read_only",
-  keys: { openrouter: false, vercel: false },
+  keys: { openrouter: false, vercel: false, cheaperInference: false },
   personality: null as string | null,
   customInstructions: "",
   workingDir: "",
@@ -676,6 +680,7 @@ function openPermMenu() {
 const PROVIDER_SUB: Record<string, string> = {
   openrouter: "400+ models · one key",
   vercel: "Vercel's model gateway",
+  cheaper_inference: "Low-cost OpenAI-compatible gateway",
   opencodex: "Route to any provider via OpenCodex",
 };
 function openModelMenu() {
@@ -683,22 +688,38 @@ function openModelMenu() {
   // Provider chooser — a vertical list (long names never fit a pill row).
   panel.appendChild(el("div", "menu-heading", "Provider"));
   const seg = el("div", "prov-seg");
+  const provBtns: { id: string; btn: HTMLElement; display: string }[] = [];
   for (const p of state.providers) {
-    const active = p.id === state.provider;
-    const b = el("button", "prov-opt" + (active ? " active" : ""));
-    b.innerHTML =
-      `<span class="po-radio">${active ? "●" : "○"}</span>` +
-      `<span class="po-text"><span class="po-name">${escapeHtml(p.display)}</span>` +
-      `<span class="po-sub">${escapeHtml(PROVIDER_SUB[p.id] ?? "")}</span></span>`;
+    const b = el("button", "prov-opt");
     b.onclick = async () => {
-      if (active) return;
+      if (p.id === state.provider) return;
       state.provider = p.id;
+      syncProviderMarks();
+      // Switching upstream invalidates the rows on screen. Show a placeholder so
+      // no model from the PREVIOUS provider can be clicked while the new catalog
+      // loads — its id would route ocx back to the old upstream.
+      list.innerHTML = "";
+      list.appendChild(el("div", "menu-empty", `Loading ${p.display} models…`));
       await invoke("save_settings", { args: { provider: state.provider } });
       await loadModels();
-      openModelMenu();
+      // Re-render in place rather than rebuilding the panel: a rebuild would
+      // discard whatever the user has typed into the search box meanwhile.
+      renderList(search.value);
     };
     seg.appendChild(b);
+    provBtns.push({ id: p.id, btn: b, display: p.display });
   }
+  const syncProviderMarks = () => {
+    for (const { id, btn, display } of provBtns) {
+      const active = id === state.provider;
+      btn.classList.toggle("active", active);
+      btn.innerHTML =
+        `<span class="po-radio">${active ? "●" : "○"}</span>` +
+        `<span class="po-text"><span class="po-name">${escapeHtml(display)}</span>` +
+        `<span class="po-sub">${escapeHtml(PROVIDER_SUB[id] ?? "")}</span></span>`;
+    }
+  };
+  syncProviderMarks();
   panel.appendChild(seg);
 
   // auto row
@@ -817,7 +838,7 @@ function makeSession(): Session {
     // New chats inherit the current selection as their starting point.
     provider: state.provider, model: state.model, effort: state.effort,
     mode: state.mode, permission: state.permission, auto: state.auto, draft: "",
-    role: "default", escalation: 0, recency: Date.now(), queue: [], sentHistory: [],
+    role: "default", escalation: 0, phase: "recon", recency: Date.now(), queue: [], sentHistory: [],
   };
 }
 
@@ -1252,7 +1273,7 @@ async function boot() {
   state.workingDir = s.working_dir;
   state.kaliMode = s.kali_mode;
   state.runtime = s.runtime;
-  state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key };
+  state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key, cheaperInference: s.has_cheaper_inference_key };
 
   // Restore saved composer preferences.
   const prefs = loadPrefs();
@@ -1407,10 +1428,82 @@ function autoCandidates(text: string): { models: string[]; baseEffort: number } 
   return { models: ordered, baseEffort: complex ? 2 : 0 }; // high vs low
 }
 
-// Compute-optimal escalation: raise effort first, then step up the model.
-function autoPlan(text: string, escalation: number): { model: string; effort: string } {
+// ---------------------------------------------------------------------------
+// Auto = a two-model engagement pipeline.
+//
+// RECON  (MiMo v2.6 Pro)      — enumeration, investigation, and CONFIRMING a
+//                               finding is real. All the thinking lives here.
+// EXPLOIT (DeepSeek V4.1 Flash) — entered only once the vulnerability is
+//                               understood and the context is gathered; it does
+//                               the exploitation work and nothing else.
+//
+// The phase is sticky, so a multi-turn exploitation stays on DeepSeek. But any
+// sign of NEW surface (another endpoint, a fresh host) or a request to dig
+// deeper hands control straight back to MiMo — deep investigation must never
+// run on the exploitation model.
+type AutoPhase = "recon" | "exploit";
+
+const RECON_MATCH = (id: string) => /mimo/.test(id) && /2[.\-_]?6/.test(id) && /pro/.test(id);
+const EXPLOIT_MATCH = (id: string) => /deepseek/.test(id) && /v?4[.\-_]?1/.test(id) && /flash/.test(id);
+// Looser siblings, for a provider that carries the family but not that exact
+// build (e.g. mimo-v2.6-flash, or a different DeepSeek point release).
+const RECON_FALLBACK = (id: string) => /mimo/.test(id);
+const EXPLOIT_FALLBACK = (id: string) => /deepseek/.test(id);
+
+// NEW ATTACK SURFACE always wins, even mid-exploitation: a fresh endpoint has
+// to be understood before it can be attacked.
+const NEW_SURFACE_RE =
+  /\b(?:new|another|additional|fresh)\s+(?:endpoint|route|host|subdomain|parameter|param|target|service|port|page)\b|\bdiscovered\s+(?:a|an|another|new|some)\b/i;
+// Explicit exploitation intent.
+const EXPLOIT_RE =
+  /\b(?:exploit|exploitation|weaponi[sz]e|payload|reverse\s*shell|pop\s+a\s+shell|rce|remote\s+code|priv(?:ilege)?[\s-]?esc\w*|escalate\s+privileges|pwn|dump\s+(?:the\s+)?(?:db|database)|exfiltrat\w*|proof[\s-]of[\s-]concept|poc|chain\s+(?:it|them|the))\b/i;
+// A need to investigate or to CONFIRM a finding — recon work, but weaker than
+// explicit exploitation intent so "exploit the SQLi you confirmed" still hands
+// over rather than being pinned by the word "confirmed".
+const INVESTIGATE_RE =
+  /\b(?:enumerat\w*|recon(?:naissance)?|scan\w*|crawl\w*|fuzz\w*|investigat\w*|map\s+(?:the\s+)?(?:app|api|surface)|what\s+else|look\s+(?:deeper|again|closer)|dig\s+deeper|confirm\w*|verif\w*|validate)\b/i;
+
+/// Which phase this turn belongs to, in precedence order: new surface → recon,
+/// explicit exploitation → exploit, investigation/confirmation → recon, else
+/// stay where we were.
+function autoPhase(session: Session, text: string): AutoPhase {
+  if (NEW_SURFACE_RE.test(text)) return "recon";
+  if (EXPLOIT_RE.test(text)) return "exploit";
+  if (INVESTIGATE_RE.test(text)) return "recon";
+  return session.phase ?? "recon"; // sticky; engagements start in recon
+}
+
+/// The pipeline model for a phase, from the SELECTED provider's catalog.
+/// Null when this provider carries neither the model nor a sibling.
+function pipelineModel(phase: AutoPhase): string | null {
+  const ids = state.models.map((m) => m.id);
+  const pick = (f: (id: string) => boolean) => ids.find((id) => f(id.toLowerCase())) ?? null;
+  return phase === "exploit"
+    ? pick(EXPLOIT_MATCH) ?? pick(EXPLOIT_FALLBACK)
+    : pick(RECON_MATCH) ?? pick(RECON_FALLBACK);
+}
+
+// Compute-optimal escalation. In the pipeline there are only two models by
+// design, so escalation raises EFFORT and never swaps the model out; the phase
+// alone decides which of the two runs.
+function autoPlan(
+  text: string,
+  escalation: number,
+  session?: Session,
+): { model: string; effort: string; phase: AutoPhase } {
+  const phase: AutoPhase = session ? autoPhase(session, text) : "recon";
+  const pipeline = pipelineModel(phase);
+  if (pipeline) {
+    // Recon thinks hard by default; exploitation runs a fast model, so it starts
+    // a rung lower and climbs only if the attempt falls short.
+    const base = phase === "recon" ? 2 : 1;
+    const idx = Math.min(base + escalation, EFFORT_LADDER.length - 1);
+    return { model: pipeline, effort: EFFORT_LADDER[idx], phase };
+  }
+  // This provider has neither model: fall back to the generic family router so
+  // Auto still works on a catalog that carries neither MiMo nor DeepSeek.
   const { models, baseEffort } = autoCandidates(text);
-  if (!models.length) return { model: state.model, effort: "high" };
+  if (!models.length) return { model: state.model, effort: "high", phase };
   const maxEff = EFFORT_LADDER.length - 1;
   let effortIdx = baseEffort + escalation;
   let modelIdx = 0;
@@ -1419,7 +1512,7 @@ function autoPlan(text: string, escalation: number): { model: string; effort: st
     effortIdx = maxEff;
   }
   modelIdx = Math.min(modelIdx, models.length - 1);
-  return { model: models[modelIdx], effort: EFFORT_LADDER[effortIdx] };
+  return { model: models[modelIdx], effort: EFFORT_LADDER[effortIdx], phase };
 }
 
 // A cheap/fast model from the selected provider's catalog to gate Smart Auto.
@@ -1448,9 +1541,11 @@ function pickDefaultModel(models: Model[]): string {
 }
 
 async function loadModels() {
-  // OpenRouter/Vercel need their key configured in the proxy before their
-  // upstream has any models; the OpenCodex selection uses ocx's own upstreams.
+  // A keyed provider has no models in the proxy until its key is configured, and
+  // asking anyway makes the backend wait out its discovery poll for nothing; the
+  // OpenCodex selection uses ocx's own upstreams, so it needs no key here.
   if ((state.provider === "vercel" && !state.keys.vercel) ||
+      (state.provider === "cheaper_inference" && !state.keys.cheaperInference) ||
       (state.provider === "openrouter" && !state.keys.openrouter)) {
     state.models = [];
     updateChips();
@@ -1465,10 +1560,22 @@ async function loadModels() {
     updateHint();
   } catch (err) {
     const s = String(err);
-    // If the runtime is still provisioning, tag the error so it can be cleared
-    // and retried automatically once the runtime is ready.
-    const provisioning = /not available yet|downloads\/builds|become ready|isn.t ready|not ready yet|still starting|starting the runtime/i.test(s);
-    addError(activeSession(), "Could not load models: " + s, provisioning ? "errbar-models" : undefined);
+    // An empty catalog is EXPECTED while the Docker runtime is still coming up
+    // (the image downloads/builds, then the container and proxy start) — the
+    // startup catalog read races ahead of prepare_runtime by design, so it is
+    // not a failure. The runtime banner already reports that progress, and the
+    // `ready` event reloads the catalog, so stay quiet instead of stacking a
+    // duplicate error bar the user has to read and dismiss.
+    const provisioning = /not available yet|downloads\/builds|become ready|isn.t ready|not ready yet|still starting|starting the runtime|container is not running/i.test(s);
+    // Never keep the PREVIOUS provider's catalog on screen: the model id decides
+    // which upstream ocx routes to, so picking a leftover row would silently run
+    // on the old provider (e.g. an openrouter/… id while Cheaper Inference is
+    // selected). An empty list is honest; the menu says to check the key.
+    state.models = [];
+    state.model = "";
+    updateChips();
+    if (provisioning) return;
+    addError(activeSession(), "Could not load models: " + s);
   }
 }
 
@@ -1525,7 +1632,8 @@ async function onSend() {
   let model: string, effort: string;
   if (state.auto) {
     session.escalation = 0;
-    const plan = autoPlan(text, 0);
+    const plan = autoPlan(text, 0, session);
+    session.phase = plan.phase;
     model = plan.model;
     effort = plan.effort;
   } else {
@@ -1576,7 +1684,7 @@ async function onSend() {
   session.recency = Date.now(); // new activity floats this chat to the top
   stickToBottom = true; // sending always jumps to the latest
   addUserMessage(session, text, atts);
-  if (state.auto) addAutoNote(session, model);
+  if (state.auto) addAutoNote(session, model, session.phase);
   // Instant feedback: flip to running and show the thinking indicator *before*
   // the (possibly multi-second) harness spawn + turn round-trip, so the UI never
   // looks frozen after send.
@@ -1688,8 +1796,10 @@ async function steerNow(session: Session, text: string) {
   session.recency = Date.now();
   addUserMessage(session, text, [], true);
   session.lastText = text;
-  const model = state.auto ? autoPlan(text, session.escalation).model : state.model;
-  const effort = state.auto ? autoPlan(text, session.escalation).effort : state.effort;
+  const steerPlan = state.auto ? autoPlan(text, session.escalation, session) : null;
+  if (steerPlan) session.phase = steerPlan.phase;
+  const model = steerPlan?.model ?? state.model;
+  const effort = steerPlan?.effort ?? state.effort;
   try {
     await invoke("send_message", {
       args: {
@@ -1918,7 +2028,8 @@ function editResend(session: Session, msgEl: HTMLElement, text: string) {
   session.blocks.clear();
   session.lastText = text;
   session.escalation = 0;
-  const plan = state.auto ? autoPlan(text, 0) : null;
+  const plan = state.auto ? autoPlan(text, 0, session) : null;
+  if (plan) session.phase = plan.phase;
   addUserMessage(session, text);
   setSessionRunning(session, true);
   invoke("regenerate", {
@@ -1968,7 +2079,8 @@ async function regenerate(session: Session) {
     if (k.classList.contains("msg") && k.classList.contains("assistant")) break;
   }
   session.escalation = 0;
-  const plan = state.auto ? autoPlan(session.lastText, 0) : null;
+  const plan = state.auto ? autoPlan(session.lastText, 0, session) : null;
+  if (plan) session.phase = plan.phase;
   const model = plan?.model ?? state.model;
   const effort = plan?.effort ?? state.effort;
   setSessionRunning(session, true);
@@ -2017,12 +2129,17 @@ async function branchSession(session: Session) {
 // Show which model Auto is using. Only prints when it actually CHANGES from the
 // previous turn (so it reads as a switch, not repeated noise). Memory is kept —
 // switching is a per-turn model override on the same thread.
-function addAutoNote(session: Session, model: string) {
+function addAutoNote(session: Session, model: string, phase?: AutoPhase) {
   if (session.autoModel === model) return; // unchanged — no note
   const first = !session.autoModel;
+  // Name the phase so the recon → exploit handover (and the hand-back on new
+  // surface) is legible instead of looking like an arbitrary model swap.
+  const tag = phase === "exploit" ? " <span class=\"am-keep\">· exploitation</span>"
+            : phase === "recon" ? " <span class=\"am-keep\">· recon &amp; confirm</span>"
+            : "";
   const html = first
-    ? `✦ Auto selected <b>${escapeHtml(model)}</b>`
-    : `✦ Auto switched <span class="am-from">${escapeHtml(session.autoModel!)}</span> → <b>${escapeHtml(model)}</b> <span class="am-keep">· context kept</span>`;
+    ? `✦ Auto selected <b>${escapeHtml(model)}</b>${tag}`
+    : `✦ Auto switched <span class="am-from">${escapeHtml(session.autoModel!)}</span> → <b>${escapeHtml(model)}</b>${tag} <span class="am-keep">· context kept</span>`;
   session.autoModel = model;
   const note = el("div", "auto-note auto-switch");
   note.innerHTML = html;
@@ -2083,7 +2200,7 @@ async function maybeEscalate(session: Session, answer: string | undefined | null
 
 async function escalateContinue(session: Session, reason: string) {
   if (!session.threadId) return;
-  const plan = autoPlan(session.lastText || "", session.escalation);
+  const plan = autoPlan(session.lastText || "", session.escalation, session);
   session.autoModel = plan.model; // keep the switch tracker in sync
   const note = el("div", "auto-note escalate");
   note.innerHTML = `↑ Escalating → <b>${escapeHtml(plan.model)}</b> · ${escapeHtml(plan.effort)} <span class="am-keep">· continuing same task, context kept</span>`;
@@ -2113,8 +2230,8 @@ async function escalateContinue(session: Session, reason: string) {
     addError(session, String(e));
   }
 }
-function addError(session: Session | undefined, msg: string, cls?: string) {
-  (session?.turnsEl ?? turnsHost).appendChild(el("div", "errbar" + (cls ? " " + cls : ""), escapeHtml(msg)));
+function addError(session: Session | undefined, msg: string) {
+  (session?.turnsEl ?? turnsHost).appendChild(el("div", "errbar", escapeHtml(msg)));
   scrollToBottom();
 }
 // Auto-scroll only while the user is parked at the bottom (see stickToBottom,
@@ -2462,9 +2579,8 @@ listen<{ phase: string; message: string; percent?: number }>("hacksor://runtime"
     pctEl.textContent = "";
   }
   if (phase === "ready") {
-    // The runtime finished downloading/building: drop any "runtime not ready"
-    // model errors and reload the catalog so the stale message disappears.
-    document.querySelectorAll(".errbar-models").forEach((e) => e.remove());
+    // The runtime finished downloading/building: the catalog is reachable now,
+    // so fill the model picker that the startup read came up empty on.
     loadModels();
     setTimeout(() => { rtBanner?.remove(); rtBanner = null; }, 1800);
   }
@@ -2756,7 +2872,7 @@ function openSettings(force = false) {
       </div>
 
       <div class="tab-pane" data-pane="providers">
-        <p style="margin:0 0 12px;opacity:.75">Every provider runs through the local OpenCodex proxy. The composer's <b>OpenRouter</b> and <b>Vercel</b> selections are just filtered views over the upstreams you configure here — set their keys below, or add any of 40+ other upstreams via OpenCodex. Saving a key restarts the proxy so it takes effect.</p>
+        <p style="margin:0 0 12px;opacity:.75">Every provider runs through the local OpenCodex proxy. The composer's <b>OpenRouter</b>, <b>Vercel</b> and <b>Cheaper Inference</b> selections are just filtered views over the upstreams you configure here — set their keys below, or add any of 40+ other upstreams via OpenCodex. Saving a key restarts the proxy so it takes effect.</p>
         <div class="field">
           <label>OpenRouter API key ${keyBadge(state.keys.openrouter)}</label>
           <div class="key-row">
@@ -2769,6 +2885,13 @@ function openSettings(force = false) {
           <div class="key-row">
             <input id="s-vc" class="${state.keys.vercel ? "saved" : ""}" type="password" placeholder="${state.keys.vercel ? "•••••••••••••• — leave blank to keep" : "vck_..."}" />
             ${state.keys.vercel ? '<button class="key-clear" id="s-vc-clear" title="Remove key">Remove</button>' : ""}
+          </div>
+        </div>
+        <div class="field">
+          <label>Cheaper Inference API key ${keyBadge(state.keys.cheaperInference)}</label>
+          <div class="key-row">
+            <input id="s-ci" class="${state.keys.cheaperInference ? "saved" : ""}" type="password" placeholder="${state.keys.cheaperInference ? "•••••••••••••• — leave blank to keep" : "ci_..."}" />
+            ${state.keys.cheaperInference ? '<button class="key-clear" id="s-ci-clear" title="Remove key">Remove</button>' : ""}
           </div>
         </div>
         <div class="field">
@@ -2818,6 +2941,19 @@ function openSettings(force = false) {
             <button id="s-persona-reset" class="ghost">Reset to default</button>
           </div>
         </div>
+        <div class="field">
+          <label>Model operating spec <span id="s-spec-badge" class="unset-badge"></span></label>
+          <p style="margin:0 0 8px">An extra spec layered <b>on top of</b> the system prompt, but only when that model is running — the two Auto pipeline models get one, since they otherwise drift back into hedging on offensive work. The system prompt still wins on security conduct. Applies to the next message. <b>Reset</b> restores the built-in default.</p>
+          <select id="s-spec-model" style="margin-bottom:8px">
+            <option value="deepseek-v4.1-flash">DeepSeek V4.1 Flash (exploit)</option>
+            <option value="mimo-v2.6-pro">MiMo v2.6 Pro (recon)</option>
+          </select>
+          <textarea id="s-spec" class="mono-edit" rows="14" spellcheck="false" placeholder="Loading…"></textarea>
+          <div class="row" style="margin-top:8px">
+            <button id="s-spec-save" class="ghost">Save spec</button>
+            <button id="s-spec-reset" class="ghost">Reset to default</button>
+          </div>
+        </div>
       </div>
 
       <div class="tab-pane" data-pane="advanced">
@@ -2850,16 +2986,17 @@ function openSettings(force = false) {
   app.appendChild(bg);
   const orInput = bg.querySelector("#s-or") as HTMLInputElement;
   const vcInput = bg.querySelector("#s-vc") as HTMLInputElement;
+  const ciInput = bg.querySelector("#s-ci") as HTMLInputElement;
   const persSel = bg.querySelector("#s-pers") as HTMLSelectElement;
   const dirInput = bg.querySelector("#s-dir") as HTMLInputElement;
   bg.querySelector("#s-pick")!.addEventListener("click", async () => {
     const d = await invoke<string | null>("pick_directory");
     if (d) dirInput.value = d;
   });
-  const clearKey = async (which: "openrouter_api_key" | "vercel_api_key") => {
+  const clearKey = async (which: "openrouter_api_key" | "vercel_api_key" | "cheaper_inference_api_key") => {
     await invoke("save_settings", { args: { [which]: "" } });
     const s = await invoke<SettingsView>("get_settings");
-    state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key };
+    state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key, cheaperInference: s.has_cheaper_inference_key };
     bg.remove();
     document.removeEventListener("keydown", onEsc);
     openSettings(force);
@@ -2867,16 +3004,17 @@ function openSettings(force = false) {
   };
   bg.querySelector("#s-or-clear")?.addEventListener("click", () => clearKey("openrouter_api_key"));
   bg.querySelector("#s-vc-clear")?.addEventListener("click", () => clearKey("vercel_api_key"));
+  bg.querySelector("#s-ci-clear")?.addEventListener("click", () => clearKey("cheaper_inference_api_key"));
   // Enter in a key field saves just that key and shows it as set (badge → Saved,
   // masked placeholder), without discarding other unsaved fields in the modal.
-  const saveKeyInline = async (which: "openrouter_api_key" | "vercel_api_key", inputEl: HTMLInputElement) => {
+  const saveKeyInline = async (which: "openrouter_api_key" | "vercel_api_key" | "cheaper_inference_api_key", inputEl: HTMLInputElement) => {
     const val = inputEl.value.trim();
     if (!val) return;
     inputEl.disabled = true;
     try {
       await invoke("save_settings", { args: { [which]: val } });
       const s = await invoke<SettingsView>("get_settings");
-      state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key };
+      state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key, cheaperInference: s.has_cheaper_inference_key };
       inputEl.value = "";
       inputEl.classList.add("saved");
       inputEl.placeholder = "•••••••••••••• — leave blank to keep";
@@ -2891,6 +3029,7 @@ function openSettings(force = false) {
   };
   orInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveKeyInline("openrouter_api_key", orInput); } });
   vcInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveKeyInline("vercel_api_key", vcInput); } });
+  ciInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveKeyInline("cheaper_inference_api_key", ciInput); } });
   // Cloudflare creds (for cloudfish): populate current state from get_settings.
   const cfKey = bg.querySelector("#s-cf-key") as HTMLInputElement;
   const cfEmail = bg.querySelector("#s-cf-email") as HTMLInputElement;
@@ -2968,25 +3107,32 @@ function openSettings(force = false) {
   // Editable Dockerfile + system prompt. Load current content, and wire
   // Save/Reset. Empty content on save reverts to the built-in default.
   type Editable = { text: string; is_custom: boolean };
-  const wireEditor = (cmd: string, saveCmd: string, ta: HTMLTextAreaElement, badge: HTMLElement, saveBtn: HTMLElement, resetBtn: HTMLElement, lang?: string) => {
+  // `argsFn` supplies extra command args (e.g. which model spec is selected);
+  // the returned `reload` re-reads the editor when those args change.
+  const wireEditor = (cmd: string, saveCmd: string, ta: HTMLTextAreaElement, badge: HTMLElement, saveBtn: HTMLElement, resetBtn: HTMLElement, lang?: string, argsFn?: () => Record<string, unknown>) => {
     const setBadge = (custom: boolean) => {
       badge.textContent = custom ? "· customized" : "· default";
       badge.className = custom ? "saved-badge" : "unset-badge";
     };
     const hl = lang ? attachHighlight(ta, lang) : null;
-    invoke<Editable>(cmd).then((v) => { ta.value = v.text; setBadge(v.is_custom); hl?.(); }).catch(() => { ta.placeholder = "(failed to load)"; });
+    const args = () => argsFn?.() ?? {};
+    const load = () =>
+      invoke<Editable>(cmd, args())
+        .then((v) => { ta.value = v.text; setBadge(v.is_custom); hl?.(); })
+        .catch(() => { ta.value = ""; ta.placeholder = "(failed to load)"; });
+    load();
     saveBtn.addEventListener("click", async () => {
       const t = saveBtn.textContent;
       saveBtn.textContent = "Saved ✓";
-      try { await invoke(saveCmd, { content: ta.value }); setBadge(!!ta.value.trim()); }
+      try { await invoke(saveCmd, { ...args(), content: ta.value }); setBadge(!!ta.value.trim()); }
       catch (err) { saveBtn.textContent = "Save failed"; console.error(err); }
       setTimeout(() => (saveBtn.textContent = t), 1200);
     });
     resetBtn.addEventListener("click", async () => {
-      await invoke(saveCmd, { content: "" }).catch(() => {});
-      const v = await invoke<Editable>(cmd).catch(() => ({ text: "", is_custom: false }));
-      ta.value = v.text; setBadge(v.is_custom); hl?.();
+      await invoke(saveCmd, { ...args(), content: "" }).catch(() => {});
+      await load();
     });
+    return { reload: load };
   };
   wireEditor("get_dockerfile", "save_dockerfile",
     bg.querySelector("#s-dockerfile") as HTMLTextAreaElement,
@@ -2999,6 +3145,15 @@ function openSettings(force = false) {
     bg.querySelector("#s-persona-badge") as HTMLElement,
     bg.querySelector("#s-persona-save") as HTMLElement,
     bg.querySelector("#s-persona-reset") as HTMLElement);
+  // Per-model operating spec: one editor, the picker chooses which spec it edits.
+  const specSel = bg.querySelector("#s-spec-model") as HTMLSelectElement;
+  const specEditor = wireEditor("get_model_spec", "save_model_spec",
+    bg.querySelector("#s-spec") as HTMLTextAreaElement,
+    bg.querySelector("#s-spec-badge") as HTMLElement,
+    bg.querySelector("#s-spec-save") as HTMLElement,
+    bg.querySelector("#s-spec-reset") as HTMLElement,
+    undefined, () => ({ key: specSel.value }));
+  specSel.addEventListener("change", () => specEditor.reload());
   const ocxStatusEl = bg.querySelector("#s-ocx-status") as HTMLElement;
   const refreshOcx = async () => {
     const st = await invoke<{ installed: boolean; running: boolean }>("opencodex_status").catch(() => ({ installed: false, running: false }));
@@ -3070,6 +3225,7 @@ function openSettings(force = false) {
       args: {
         openrouter_api_key: orInput.value ? orInput.value : null,
         vercel_api_key: vcInput.value ? vcInput.value : null,
+        cheaper_inference_api_key: ciInput.value ? ciInput.value : null,
         personality: persSel.value,
         custom_instructions: (bg.querySelector("#s-custom") as HTMLTextAreaElement).value,
         working_dir: dirInput.value || null,
@@ -3083,7 +3239,7 @@ function openSettings(force = false) {
       },
     });
     const s = await invoke<SettingsView>("get_settings");
-    state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key };
+    state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key, cheaperInference: s.has_cheaper_inference_key };
     state.personality = s.personality;
     state.customInstructions = s.custom_instructions ?? "";
     state.workingDir = s.working_dir;

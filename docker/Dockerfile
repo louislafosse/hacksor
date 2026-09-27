@@ -149,6 +149,22 @@ RUN npm config set fetch-retries 6 \
  && (PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/playwright npx -y playwright install chromium 2>/dev/null || true) \
  && npm cache clean --force
 
+# Raise OpenCodex's provider model-discovery timeout. ocx hard-codes an 8s abort
+# on the upstream /models fetch, which these catalogs routinely exceed (measured
+# from this image: OpenRouter ~11s for 449 models, Cheaper Inference 5-13s for
+# its ~480 KB catalog). On a timeout ocx logs "discovery ... threw Error
+# [fallback=configured]", serves only the configured models, and never retries
+# until the proxy restarts — so the model picker comes up empty or with a
+# handful of rows. 45s covers the slow cases; a fetch that misses that is a real
+# outage, not a slow catalog.
+#
+# The final grep makes the build FAIL if the constant ever moves, so a future ocx
+# release cannot silently drop this and quietly bring the empty picker back.
+RUN OCX_FETCH=/usr/local/lib/node_modules/@bitkyc08/opencodex/src/codex/catalog/provider-fetch.ts \
+ && grep -q 'AbortSignal\.timeout(8000)' "$OCX_FETCH" \
+ && sed -i 's/AbortSignal\.timeout(8000)/AbortSignal.timeout(45000)/g' "$OCX_FETCH" \
+ && grep -q 'AbortSignal\.timeout(45000)' "$OCX_FETCH"
+
 # Patch the installed camofox-browser + camofox-mcp so the MCP browser can solve
 # Cloudflare Turnstile, work behind the loopback intercept proxy, and lazy-start
 # the heavy Firefox only when actually used. The patch script (3 files) is

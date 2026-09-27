@@ -52,24 +52,28 @@ async fn docker_runtime(state: &AppState) -> bool {
     state.settings.lock().await.runtime == "docker"
 }
 
-/// Push the stored OpenRouter/Vercel keys into OpenCodex as upstream providers
-/// (both route through the proxy). Idempotent `provider add --force`; a removed
+/// Push every stored provider key into OpenCodex as an upstream provider (they
+/// all route through the proxy). Idempotent `provider add --force`; a removed
 /// key removes the upstream. Runs against host ocx or the container's ocx per
 /// mode. Returns true if anything was (re)configured.
 async fn configure_ocx_upstreams(state: &AppState) -> bool {
     let docker = docker_runtime(state).await;
-    let keys: Vec<(&'static str, Option<String>)> = {
+    let keys: Vec<(crate::models::Provider, &'static str, Option<String>)> = {
         let s = state.settings.lock().await;
         crate::models::Provider::ALL
             .iter()
-            .filter_map(|p| p.ocx_upstream().map(|u| (u, s.key_for(*p).map(String::from))))
+            .filter_map(|p| p.ocx_upstream().map(|u| (*p, u, s.key_for(*p).map(String::from))))
             .collect()
     };
     let mut changed = false;
-    for (upstream, key) in keys {
+    for (provider, upstream, key) in keys {
         match key {
             Some(k) if !k.is_empty() => {
-                if run_ocx(&["provider", "add", upstream, "--api-key", &k, "--force"], None, docker).await.is_ok() {
+                let mut args = vec!["provider", "add", upstream];
+                // Custom (non-registry) upstreams need their adapter + base URL.
+                args.extend_from_slice(provider.ocx_custom_args());
+                args.extend_from_slice(&["--api-key", &k, "--force"]);
+                if run_ocx(&args, None, docker).await.is_ok() {
                     changed = true;
                 }
             }
@@ -85,23 +89,60 @@ async fn configure_ocx_upstreams(state: &AppState) -> bool {
 
 /// Restart the OpenCodex proxy so it re-reads its provider config (ocx only
 /// loads providers at startup), then bring it back up.
+/// Is `pid` an OpenCodex process on THIS machine? Linux-only: host networking —
+/// the thing that lets a host proxy own the container's port — is Linux-only
+/// here, so that is the only place we need to tell the two apart.
+fn pid_is_opencodex(pid: i64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|b| String::from_utf8_lossy(&b).contains("opencodex"))
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Stop an OpenCodex proxy running on the HOST, via the pid ocx records in
+/// `~/.opencodex/ocx.pid`. Needed in Docker mode too: under host networking the
+/// container shares the host's loopback, so the port can be held by a host `ocx`
+/// that an in-container `pkill` will never see.
+///
+/// `verify` guards that Docker path. The container bind-mounts $HOME, so the pid
+/// file may hold a CONTAINER pid (namespaced, typically a low number); signalling
+/// that number on the host would hit an unrelated process. So there we kill only
+/// what /proc confirms is really an opencodex process here.
+fn kill_host_opencodex(verify: bool) {
+    let Some(home) = dirs::home_dir() else { return };
+    let Ok(raw) = std::fs::read_to_string(home.join(".opencodex/ocx.pid")) else { return };
+    let Ok(pid) = raw.trim().parse::<i64>() else { return };
+    if verify && !pid_is_opencodex(pid) {
+        return;
+    }
+    platform::kill_pid(pid);
+}
+
 async fn restart_opencodex(state: &AppState) {
     if docker_runtime(state).await {
         // In-container ocx: kill it; ensure_opencodex restarts it after config.
         if runtime_container_running().await {
             let _ = runtime::exec_output(RUNTIME_CONTAINER, vec!["pkill".into(), "-f".into(), "opencodex".into()], None, None).await;
         }
+        // The container has its own PID namespace, so the pkill above cannot
+        // reach a proxy running on the host — and under host networking that
+        // proxy is the one holding the port. Without this, a stale host ocx
+        // keeps serving its startup-time provider config and every key change
+        // is silently ignored (ocx only reads providers at startup).
+        kill_host_opencodex(true);
     } else {
         if let Some(mut child) = state.opencodex.lock().await.take() {
             let _ = child.start_kill();
         }
-        if let Some(home) = dirs::home_dir() {
-            if let Ok(pid) = std::fs::read_to_string(home.join(".opencodex/ocx.pid")) {
-                if let Ok(pid) = pid.trim().parse::<i64>() {
-                    platform::kill_pid(pid);
-                }
-            }
-        }
+        // Host mode: the pid file is written by a host process, so it is ours.
+        kill_host_opencodex(false);
     }
     for _ in 0..15 {
         if !opencodex_up().await {
@@ -127,21 +168,31 @@ async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
         // the container up for ocx, so don't force the browser/proxy to start.
         start_runtime(&state.codex_home, false).await?;
         configure_ocx_upstreams(state).await;
-        // Start ocx detached as the exec's own process (no shell wrapper — a
-        // backgrounded `&` under a shell that exits would SIGHUP the proxy).
+        // Start ocx detached, keeping its output so a crash can be reported
+        // instead of surfacing only as "didn't become ready" (ocx exits with a
+        // stack trace for things like an unreadable ~/.codex/config.toml). `exec`
+        // replaces the shell, so this is still the exec's own single process —
+        // a backgrounded `&` under a shell that exits would SIGHUP the proxy.
         let _ = runtime::exec_detached(
             RUNTIME_CONTAINER,
-            vec!["ocx".into(), "start".into(), "--port".into(), models::OPENCODEX_PORT.to_string()],
-            platform::docker_exec_user(),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "exec ocx start --port {} > {OCX_START_LOG} 2>&1",
+                    models::OPENCODEX_PORT
+                ),
+            ],
+            exec_user(),
         )
         .await;
-        // Docker Desktop (macOS/Windows): ocx binds only to 127.0.0.1 inside the
-        // container, so the published host port (which forwards to the container's
-        // external interface) can't reach it and the proxy never looks "ready".
-        // Bridge the container's own IP to ocx's loopback with socat so both the
-        // published port and in-container clients reach it. On Linux the container
-        // shares the host's 127.0.0.1 (host networking), so no bridge is needed.
-        if !platform::IS_LINUX {
+        // Without host networking (Docker Desktop VM, or rootless Docker): ocx binds
+        // only to 127.0.0.1 inside the container, so the published host port (which
+        // forwards to the container's external interface) can't reach it and the
+        // proxy never looks "ready". Bridge the container's own IP to ocx's loopback
+        // with socat so both the published port and in-container clients reach it.
+        // With host networking the container shares the host's 127.0.0.1 already.
+        if !rootful_linux() {
             let port = models::OPENCODEX_PORT;
             let _ = runtime::exec_detached(
                 RUNTIME_CONTAINER,
@@ -152,7 +203,7 @@ async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
                         "socat TCP-LISTEN:{port},fork,reuseaddr,bind=$(hostname -i | awk '{{print $1}}') TCP:127.0.0.1:{port}"
                     ),
                 ],
-                platform::docker_exec_user(),
+                exec_user(),
             )
             .await;
         }
@@ -162,7 +213,25 @@ async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-        return Err("OpenCodex proxy in the runtime container didn't become ready.".into());
+        // Include what ocx actually printed: a bare "didn't become ready" hides
+        // real, fixable causes (e.g. EACCES on a root-owned ~/.codex/config.toml).
+        let log = runtime::exec_output(
+            RUNTIME_CONTAINER,
+            vec!["tail".into(), "-n".into(), "25".into(), OCX_START_LOG.into()],
+            exec_user(),
+            None,
+        )
+        .await
+        .map(|(out, _)| out)
+        .unwrap_or_default();
+        let detail = log.trim();
+        if detail.is_empty() {
+            return Err("OpenCodex proxy in the runtime container didn't become ready.".into());
+        }
+        return Err(format!(
+            "OpenCodex proxy in the runtime container didn't become ready:\n{}",
+            truncate(detail, 1200)
+        ));
     }
 
     // Host mode: configure + spawn the host ocx.
@@ -239,7 +308,7 @@ async fn run_ocx(args: &[&str], stdin_data: Option<&str>, docker: bool) -> Resul
         }
         let mut cmd: Vec<String> = vec!["ocx".into()];
         cmd.extend(args.iter().map(|s| s.to_string()));
-        let (out, code) = runtime::exec_output(RUNTIME_CONTAINER, cmd, platform::docker_exec_user(), stdin_data).await?;
+        let (out, code) = runtime::exec_output(RUNTIME_CONTAINER, cmd, exec_user(), stdin_data).await?;
         if code == 0 {
             Ok(out)
         } else {
@@ -488,6 +557,77 @@ fn parse_verdict(content: &str) -> Verdict {
     Verdict { verdict: "unknown".into(), reason: String::new() }
 }
 
+/// ocx's readiness status (`ocx ready --json` → `ready|pending|failed|…`). The
+/// proxy answers HTTP on `/v1/models` about a second after launch, but it
+/// discovers each upstream's catalog asynchronously AFTER that, so "the port is
+/// open" does not mean "the catalog is populated".
+async fn ocx_status(docker: bool) -> String {
+    match run_ocx(&["ready", "--json"], None, docker).await {
+        // A non-ready status exits 1, which run_ocx reports as Err — the JSON we
+        // want is in the output either way.
+        Ok(o) | Err(o) => serde_json::from_str::<serde_json::Value>(o.trim())
+            .ok()
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
+            .unwrap_or_default(),
+    }
+}
+
+/// Read a provider's slice of ocx's live catalog, waiting for upstream discovery
+/// to finish.
+///
+/// Two behaviours of ocx make a single read unreliable:
+///   * discovery runs in the background after the proxy starts answering, and a
+///     slow gateway takes seconds (Cheaper Inference's ~480 KB catalog measured
+///     3–13s), so the first read is normally empty — ocx reports `pending`;
+///   * when a discovery fetch throws (it times out on a slow upstream), ocx
+///     reports `failed`, falls back to configured models only, and NEVER retries
+///     — the catalog stays empty until the proxy restarts.
+///
+/// So: poll while ocx says `pending`, and on a terminal `failed` restart the
+/// proxy once to retry discovery. Falling through with an empty list lets the
+/// caller's diagnostic explain a genuinely bad key.
+async fn read_live_catalog(
+    state: &State<'_, AppState>,
+    p: Provider,
+    docker: bool,
+) -> Result<Vec<ModelInfo>, String> {
+    let mut restarted = false;
+    for attempt in 0..16 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        }
+        let json = run_ocx(&["models", "live", "--json"], None, docker)
+            .await
+            .map_err(|e| format!("Could not read the model catalog from OpenCodex: {e}"))?;
+        let models = models::parse_live_models(&json, p.ocx_upstream());
+        if !models.is_empty() {
+            return Ok(models);
+        }
+        // Empty: decide whether waiting can still help.
+        match ocx_status(docker).await.as_str() {
+            // The port answers (ensure_opencodex checked) yet ocx reports no
+            // /readyz identity — this proxy predates the bundled ocx, so it is a
+            // STALE process still serving the provider config it loaded at its
+            // own startup and it will never learn about a newly added upstream.
+            // Only a restart helps. Give it a few rounds first: a proxy that is
+            // merely still booting can report this briefly.
+            "unreachable" if !restarted && attempt >= 3 => {
+                restarted = true;
+                restart_opencodex(state).await;
+                ensure_opencodex(state).await?;
+            }
+            // Keep waiting. "failed" is deliberately NOT a restart trigger: ocx
+            // also reports it when its Codex *sync* fails, which says nothing
+            // about model discovery — restarting on it kills the in-flight
+            // discovery and empties the catalog for every provider.
+            "pending" | "failed" | "unreachable" | "" => {}
+            // Ready with nothing for this upstream: no amount of waiting helps.
+            _ => break,
+        }
+    }
+    Ok(Vec::new())
+}
+
 /// Fetch the live model catalog for a provider from its `/models` endpoint.
 #[tauri::command]
 pub async fn list_models(
@@ -512,10 +652,7 @@ pub async fn list_models(
     // ocx exposes provider catalogs ONLY through `models live` — /v1/models
     // carries just its own native models. Read the live catalog (JSON) and keep
     // this provider's upstream.
-    let json = run_ocx(&["models", "live", "--json"], None, docker)
-        .await
-        .map_err(|e| format!("Could not read the model catalog from OpenCodex: {e}"))?;
-    let models = models::parse_live_models(&json, p.ocx_upstream());
+    let models = read_live_catalog(&state, p, docker).await?;
     // A keyed upstream (OpenRouter/Vercel) with a key but zero models: explain why
     // instead of showing a silent empty list.
     if models.is_empty() {
@@ -545,6 +682,7 @@ pub struct SettingsView {
     pub provider: String,
     pub has_openrouter_key: bool,
     pub has_vercel_key: bool,
+    pub has_cheaper_inference_key: bool,
     pub personality: Option<String>,
     pub custom_instructions: Option<String>,
     pub working_dir: String,
@@ -563,6 +701,7 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<SettingsView, St
         provider: s.provider.clone(),
         has_openrouter_key: s.key_for(Provider::OpenRouter).is_some(),
         has_vercel_key: s.key_for(Provider::Vercel).is_some(),
+        has_cheaper_inference_key: s.key_for(Provider::CheaperInference).is_some(),
         personality: s.personality.clone(),
         custom_instructions: s.custom_instructions.clone(),
         working_dir: s.working_dir.clone(),
@@ -580,6 +719,7 @@ pub struct SaveSettingsArgs {
     pub provider: Option<String>,
     pub openrouter_api_key: Option<String>,
     pub vercel_api_key: Option<String>,
+    pub cheaper_inference_api_key: Option<String>,
     pub personality: Option<String>,
     pub custom_instructions: Option<String>,
     pub working_dir: Option<String>,
@@ -623,6 +763,14 @@ pub async fn save_settings(
         keys_changed |= changed;
         s.vercel_api_key = v;
     }
+    if let Some(k) = args.cheaper_inference_api_key {
+        let t = k.trim().to_string();
+        let v = if t.is_empty() { None } else { Some(t) };
+        let changed = v != s.cheaper_inference_api_key;
+        needs_restart |= changed;
+        keys_changed |= changed;
+        s.cheaper_inference_api_key = v;
+    }
     if let Some(p) = args.personality {
         s.personality = if p.trim().is_empty() { None } else { Some(p) };
     }
@@ -657,8 +805,8 @@ pub async fn save_settings(
     s.export_env();
     drop(s);
 
-    // A changed OpenRouter/Vercel key now configures the OpenCodex upstream those
-    // providers route through, then restarts ocx so it picks up the change
+    // A changed provider key configures the OpenCodex upstream it routes through,
+    // then restarts ocx so it picks up the change
     // (ocx only reads provider config at startup).
     if keys_changed {
         configure_ocx_upstreams(&state).await;
@@ -757,6 +905,7 @@ pub async fn start_chat(
         args.role.as_deref().unwrap_or("default"),
         if kali_mode { Some(working_dir.as_str()) } else { None },
         custom.as_deref(),
+        effective_model_spec(&state, &args.model).as_deref(),
     );
 
     harness
@@ -807,6 +956,7 @@ fn turn_overrides_from(state: &AppState, args: &SendArgs, personality: Option<&s
             args.role.as_deref().unwrap_or("default"),
             if kali_mode { args.working_dir.as_deref() } else { None },
             custom,
+            effective_model_spec(state, model).as_deref(),
         )
     });
     // In Docker mode the per-turn cwd is the container path (identity off-Windows).
@@ -1458,6 +1608,9 @@ pub async fn pick_directory(app: AppHandle) -> Result<Option<String>, String> {
 
 const RUNTIME_IMAGE: &str = "hacksor-runtime:latest";
 const RUNTIME_CONTAINER: &str = "hacksor-runtime";
+/// Where the in-container ocx writes its startup output, so a failure to come up
+/// can report ocx's own error instead of a bare timeout.
+const OCX_START_LOG: &str = "/tmp/hacksor-ocx-start.log";
 const RUNTIME_DOCKERFILE: &str = include_str!("../../docker/Dockerfile");
 /// Prebuilt image published to a public registry. When set (and reachable), the
 /// runtime is PULLED (fast, streamed progress) instead of built locally. Kept in
@@ -1650,6 +1803,32 @@ pub fn save_persona(state: State<'_, AppState>, content: String) -> Result<(), S
     Ok(())
 }
 
+/// The operating spec for one model (customized copy or the embedded default).
+/// `key` is one of `MODEL_SPEC_KEYS`; anything else is rejected.
+#[tauri::command]
+pub fn get_model_spec(state: State<'_, AppState>, key: String) -> Result<EditableText, String> {
+    let p = model_spec_file(&state.codex_home, &key).ok_or("Unknown model spec")?;
+    let custom = std::fs::read_to_string(p).ok().filter(|t| !t.trim().is_empty());
+    Ok(EditableText {
+        is_custom: custom.is_some(),
+        text: custom.unwrap_or_else(|| embedded_model_spec(&key).unwrap_or_default().to_string()),
+    })
+}
+
+/// Save a customized operating spec (empty ⇒ revert to the embedded default).
+/// Applies to the next turn (the spec is read per turn).
+#[tauri::command]
+pub fn save_model_spec(state: State<'_, AppState>, key: String, content: String) -> Result<(), String> {
+    let p = model_spec_file(&state.codex_home, &key).ok_or("Unknown model spec")?;
+    std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
+    if content.trim().is_empty() {
+        let _ = std::fs::remove_file(&p);
+    } else {
+        std::fs::write(&p, content).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Rebuild the runtime image from the (possibly customized) Dockerfile, then
 /// restart the container so the new image is used. Progress on `hacksor://runtime`.
 #[tauri::command]
@@ -1722,12 +1901,37 @@ pub async fn prepare_runtime(state: State<'_, AppState>, app: AppHandle) -> Resu
     ensure_runtime_ready(&state, &app).await
 }
 
-/// Start (or reuse) the runtime container. On Linux it shares the host network
-/// and runs as the host uid:gid (mounting $HOME at its real path). On macOS /
-/// Windows (Docker Desktop VM) it mounts the user home and runs as root; the
-/// container reaches the host-side OpenCodex proxy via `host.docker.internal`.
-/// The OpenCodex proxy always runs on the HOST (managed cross-platform by the
-/// app), so it is NOT started inside the container.
+/// True only on REAL rootful Linux — not Docker Desktop, not rootless Docker.
+///
+/// Two capabilities hinge on exactly this: sharing the host network namespace,
+/// and running the container as the host uid:gid. Docker Desktop runs a VM (no
+/// host networking; ownership already mapped). Rootless Docker's "host" namespace
+/// is RootlessKit's rather than the machine's — a port bound inside is invisible
+/// at the host's 127.0.0.1 — and container-root is already mapped to the host
+/// user. Both of those cases publish ports and bridge them instead (see the socat
+/// bridge in `ensure_opencodex`) and run as container root.
+fn rootful_linux() -> bool {
+    platform::IS_LINUX && !runtime::docker_rootless()
+}
+
+/// The `-u uid:gid` for `docker exec`/`run`, or `None` to run as container root.
+///
+/// Only rootful Linux needs it (there container-root would write root-owned files
+/// into the bind-mounted home). Under rootless Docker passing a uid is actively
+/// wrong: container-root already maps to the host user, while an explicit uid
+/// lands files under an unrelated subuid.
+fn exec_user() -> Option<String> {
+    if rootful_linux() {
+        platform::docker_exec_user()
+    } else {
+        None
+    }
+}
+
+/// Start (or reuse) the runtime container. On rootful Linux it shares the host
+/// network and runs as the host uid:gid (mounting $HOME at its real path). On
+/// macOS / Windows (Docker Desktop VM) and under rootless Docker it publishes
+/// ports instead and runs as root (ownership is mapped for us).
 async fn start_runtime(codex_home: &std::path::Path, services_always_on: bool) -> Result<(), String> {
     if let Some(reason) = runtime::docker_unavailable_reason().await {
         return Err(reason);
@@ -1742,18 +1946,19 @@ async fn start_runtime(codex_home: &std::path::Path, services_always_on: bool) -
             name: RUNTIME_CONTAINER.to_string(),
             host_home,
             container_home,
-            linux: platform::IS_LINUX,
+            host_net: rootful_linux(),
             tun: runtime::tun_present(),
-            // Docker Desktop VM: publish the in-container ocx + intercepting-proxy
+            // Without host networking (Docker Desktop VM, or rootless Docker's
+            // isolated namespace) publish the in-container ocx + intercepting-proxy
             // ports so the host app reaches them at 127.0.0.1.
-            publish_ports: if platform::IS_LINUX { vec![] } else { vec![models::OPENCODEX_PORT, PROXY_PORT] },
+            publish_ports: if rootful_linux() { vec![] } else { vec![models::OPENCODEX_PORT, PROXY_PORT] },
         };
         runtime::create_and_start(&spec).await?;
         // Linux only: register the host uid/gid in the container passwd + grant
         // passwordless sudo, so codex/ocx run as the host user (no root-owned
         // files) yet can still sudo. On macOS/Windows we run as root (Docker
         // Desktop maps ownership), so this is unnecessary.
-        if let Some(user) = platform::docker_exec_user() {
+        if let Some(user) = exec_user() {
             let (uid, gid) = user.split_once(':').unwrap_or(("1000", "1000"));
             let setup = format!(
                 "getent group {gid} >/dev/null || groupadd -g {gid} hacksor; \
@@ -1783,7 +1988,7 @@ async fn start_runtime(codex_home: &std::path::Path, services_always_on: bool) -
                 "-c".into(),
                 "[ -f \"$HOME/.cache/camoufox/version.json\" ] || { mkdir -p \"$HOME/.cache\" && cp -r /root/.cache/camoufox \"$HOME/.cache/camoufox\" 2>/dev/null; }".into(),
             ],
-            platform::docker_exec_user(),
+            exec_user(),
         )
         .await;
     }
@@ -1792,7 +1997,7 @@ async fn start_runtime(codex_home: &std::path::Path, services_always_on: bool) -
     let _ = runtime::exec_detached(
         RUNTIME_CONTAINER,
         vec!["sh".into(), "-c".into(), "nuclei -update-templates -silent >/dev/null 2>&1; searchsploit -u >/dev/null 2>&1".into()],
-        platform::docker_exec_user(),
+        exec_user(),
     )
     .await;
     // Start the Camoufox stealth-browser server (the camofox MCP connects to it
@@ -1829,7 +2034,7 @@ async fn start_runtime(codex_home: &std::path::Path, services_always_on: bool) -
                  camofox-browser server start --port 9377 --background >>/tmp/hacksor-camofox.log 2>&1"
                     .into(),
             ],
-            platform::docker_exec_user(),
+            exec_user(),
         )
         .await;
     }
@@ -1849,7 +2054,7 @@ pub async fn refresh_intel(state: State<'_, AppState>) -> Result<String, String>
         let (out, _) = runtime::exec_output(
             RUNTIME_CONTAINER,
             vec!["sh".into(), "-c".into(), script.into()],
-            platform::docker_exec_user(),
+            exec_user(),
             None,
         )
         .await?;
@@ -1965,7 +2170,7 @@ async fn autostart_proxy_docker(codex_home: &std::path::Path) {
         None,
     )
     .await;
-    let _ = runtime::exec_detached(RUNTIME_CONTAINER, proxy_start_cmd(&script, &log, &rules), platform::docker_exec_user()).await;
+    let _ = runtime::exec_detached(RUNTIME_CONTAINER, proxy_start_cmd(&script, &log, &rules), exec_user()).await;
     // Trust the mitmproxy CA in the container's system store (best-effort) so
     // tools routed through the proxy don't choke on the intercept cert. mitmdump
     // writes the CA to $HOME/.mitmproxy on first start; give it a moment.
@@ -2140,7 +2345,7 @@ pub async fn start_kali(working_dir: String) -> Result<String, String> {
         name: KALI_CONTAINER.into(),
         host_home: wd.clone(),
         container_home: wd,
-        linux: platform::IS_LINUX,
+        host_net: rootful_linux(),
         tun: runtime::tun_present(),
         publish_ports: vec![],
     };
@@ -2251,7 +2456,7 @@ async fn ensure_harness(state: &State<'_, AppState>, app: &AppHandle) -> Result<
         *guard = None;
     }
     let launch = if docker_mode {
-        crate::harness::LaunchMode::Docker { container: RUNTIME_CONTAINER.to_string(), user: platform::docker_exec_user() }
+        crate::harness::LaunchMode::Docker { container: RUNTIME_CONTAINER.to_string(), user: exec_user() }
     } else {
         crate::harness::LaunchMode::Host
     };
@@ -2262,8 +2467,64 @@ async fn ensure_harness(state: &State<'_, AppState>, app: &AppHandle) -> Result<
     Ok(harness)
 }
 
+/// Per-model operating specs ("AGENTS.md") layered on top of the persona for
+/// the two Auto-pipeline models. Both are general-conduct specs that keep those
+/// models from drifting back into refusal/hedging on authorized offensive work.
+const AGENTS_DEEPSEEK_V41_FLASH: &str = include_str!("../../prompts/agents-deepseek-v4.1-flash.md");
+const AGENTS_MIMO_V26_PRO: &str = include_str!("../../prompts/agents-mimo-v2.6-pro.md");
+
+/// The spec keys, in the order the Settings picker lists them. Also the
+/// override filenames (`<codex_home>/specs/<key>.md`) and the embedded prompt
+/// filenames, so the three never drift apart.
+pub const MODEL_SPEC_KEYS: [&str; 2] = ["deepseek-v4.1-flash", "mimo-v2.6-pro"];
+
+/// The embedded default spec for a key. `None` for an unknown key — this is
+/// what keeps a key coming from the frontend off the filesystem as a path.
+fn embedded_model_spec(key: &str) -> Option<&'static str> {
+    match key {
+        "deepseek-v4.1-flash" => Some(AGENTS_DEEPSEEK_V41_FLASH),
+        "mimo-v2.6-pro" => Some(AGENTS_MIMO_V26_PRO),
+        _ => None,
+    }
+}
+
+/// Which spec key a model slug maps to, or `None` when the model has none.
+/// Mirrors the frontend pipeline matchers (`EXPLOIT_MATCH` / `RECON_MATCH` in
+/// `src/main.ts`) so the overlay follows the same models Auto routes to, across
+/// provider-namespaced ids (`openrouter/~deepseek/deepseek-v4.1-flash`, …).
+fn model_spec_key(model_slug: &str) -> Option<&'static str> {
+    let s = model_slug.to_lowercase();
+    let has_version = |variants: [&str; 3]| variants.iter().any(|v| s.contains(v));
+    if s.contains("deepseek") && has_version(["4.1", "4-1", "4_1"]) && s.contains("flash") {
+        return Some(MODEL_SPEC_KEYS[0]);
+    }
+    if s.contains("mimo") && has_version(["2.6", "2-6", "2_6"]) && s.contains("pro") {
+        return Some(MODEL_SPEC_KEYS[1]);
+    }
+    None
+}
+
+/// Path of a user-customized spec (absent ⇒ use the embedded one). `None` for
+/// an unknown key, so an arbitrary string can never become a path.
+fn model_spec_file(codex_home: &std::path::Path, key: &str) -> Option<std::path::PathBuf> {
+    embedded_model_spec(key)?;
+    Some(codex_home.join("specs").join(format!("{key}.md")))
+}
+
+/// The effective operating spec for a model: the user's customized copy if
+/// present and non-empty, else the embedded default, else `None` when the model
+/// has no spec. Read per turn so edits apply without an app restart.
+fn effective_model_spec(state: &AppState, model_slug: &str) -> Option<String> {
+    let key = model_spec_key(model_slug)?;
+    let custom = model_spec_file(&state.codex_home, key)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .filter(|t| !t.trim().is_empty());
+    custom.or_else(|| embedded_model_spec(key).map(str::to_string))
+}
+
 /// Assemble developer instructions: a runtime header (date, model, mode,
-/// personality) plus the ported HackerAI persona.
+/// personality) plus the ported HackerAI persona, and — for the models that
+/// ship one — that model's operating spec.
 fn build_developer_prompt(
     base: &str,
     env_note: &str,
@@ -2273,6 +2534,7 @@ fn build_developer_prompt(
     role: &str,
     kali_cwd: Option<&str>,
     custom: Option<&str>,
+    agents_spec: Option<&str>,
 ) -> String {
     let date = chrono::Local::now().format("%A, %B %-d, %Y");
     let mode_line = if mode == "ask" {
@@ -2293,6 +2555,16 @@ fn build_developer_prompt(
         None => String::new(),
     };
     let role_prefixed = if role_section.is_empty() { String::new() } else { format!("\n\n{}", role_section.trim_end()) };
+    // Model-specific operating spec. Sits next to the volatile runtime line
+    // rather than in the stable prefix: it changes with the model, so keeping it
+    // late leaves the persona prefix byte-identical for the models without one.
+    let agents_section = match agents_spec.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(spec) => format!(
+            "\n\n<agent_operating_spec>\nThis operating specification applies to you for the whole session, alongside the Hacksor security mandate above. The mandate governs the security engagement; this spec governs general conduct, calibration, and output quality. Where they differ on security work, the mandate wins.\n\n{}\n</agent_operating_spec>",
+            spec.trim()
+        ),
+        None => String::new(),
+    };
     // Put ALL the stable content (persona, personality, custom, role, kali, env)
     // FIRST as a byte-identical prefix, and the VOLATILE runtime line (date +
     // model + mode) LAST. The volatile bits used to lead the prompt, which
@@ -2300,7 +2572,7 @@ fn build_developer_prompt(
     // full re-bill. Keeping them at the end lets providers cache the big persona
     // prefix across turns (Anthropic/DeepSeek/OpenAI prompt caching).
     format!(
-        "{base}{persona}{custom_section}{role_prefixed}{kali_section}\n\n{env_note}\n\n<runtime_context>\nThe current date is {date}. You are running on the model {model_slug}. {mode_line}\n</runtime_context>"
+        "{base}{persona}{custom_section}{role_prefixed}{kali_section}\n\n{env_note}{agents_section}\n\n<runtime_context>\nThe current date is {date}. You are running on the model {model_slug}. {mode_line}\n</runtime_context>"
     )
 }
 
@@ -2329,6 +2601,66 @@ fn personality_section(personality: Option<&str>) -> String {
 #[cfg(test)]
 mod transcript_tests {
     use super::*;
+
+    #[test]
+    fn spec_key_matches_only_the_two_pipeline_models() {
+        // Provider-namespaced ids and punctuation variants all resolve.
+        for id in [
+            "openrouter/~deepseek/deepseek-v4.1-flash",
+            "deepseek/deepseek-4-1-flash",
+            "vercel-ai-gateway/DeepSeek-V4_1-Flash",
+        ] {
+            assert_eq!(model_spec_key(id), Some("deepseek-v4.1-flash"), "{id}");
+        }
+        for id in ["openrouter/~xiaomi/mimo-v2.6-pro", "xiaomi/mimo-2-6-pro"] {
+            assert_eq!(model_spec_key(id), Some("mimo-v2.6-pro"), "{id}");
+        }
+        // Siblings and unrelated models get no overlay.
+        for id in [
+            "deepseek/deepseek-v4.1",          // not the flash build
+            "xiaomi/mimo-v2.6-flash",          // not the pro build
+            "anthropic/claude-opus-5",
+            "openai/gpt-5",
+        ] {
+            assert!(model_spec_key(id).is_none(), "{id}");
+        }
+        // Every key the picker offers has an embedded default and a file path.
+        for key in MODEL_SPEC_KEYS {
+            assert!(embedded_model_spec(key).is_some(), "{key}");
+            assert!(model_spec_file(std::path::Path::new("/home"), key).is_some(), "{key}");
+        }
+    }
+
+    #[test]
+    fn unknown_spec_key_never_becomes_a_path() {
+        for key in ["", "persona", "../../persona", "/etc/passwd"] {
+            assert!(embedded_model_spec(key).is_none(), "{key}");
+            assert!(model_spec_file(std::path::Path::new("/home"), key).is_none(), "{key}");
+        }
+    }
+
+    #[test]
+    fn developer_prompt_injects_the_spec_after_the_persona() {
+        let with = build_developer_prompt(
+            "PERSONA", "ENVNOTE", "agent", "openrouter/~deepseek/deepseek-v4.1-flash",
+            None, "default", None, None, Some("SPEC BODY"),
+        );
+        assert!(with.starts_with("PERSONA"), "persona stays the cache prefix");
+        assert!(with.contains("SPEC BODY"));
+        // Spec sits between the env note and the volatile runtime line.
+        let spec = with.find("<agent_operating_spec>").unwrap();
+        assert!(with.find("ENVNOTE").unwrap() < spec);
+        assert!(spec < with.find("<runtime_context>").unwrap());
+
+        // No spec, or a blank customized one, leaves the prompt untouched.
+        for empty in [None, Some(""), Some("  \n ")] {
+            let without = build_developer_prompt(
+                "PERSONA", "ENVNOTE", "agent", "anthropic/claude-opus-5",
+                None, "default", None, None, empty,
+            );
+            assert!(!without.contains("<agent_operating_spec>"));
+        }
+    }
 
     #[test]
     fn parse_exec_output_extracts_stdout_and_code() {

@@ -1,20 +1,93 @@
-//! All Docker operations go through the Docker Engine API via `bollard` — a
-//! single, multiplatform path (Unix socket on Linux/macOS, named pipe on
-//! Windows) with no dependency on the `docker` CLI being on PATH. This module is
-//! the one place that talks to Docker for image/container lifecycle, exec, pull
-//! and build.
+//! The one place that talks to Docker: image/container lifecycle, exec, pull and
+//! build. Two paths are used, deliberately:
 //!
-//! (The persistent app-server connection in `harness.rs` still uses `docker exec
-//! -i` for its long-lived bidirectional stdio stream; the CLI it uses is itself
-//! multiplatform. Everything else — provisioning, one-shot execs, inspects,
-//! pulls, builds, teardown — is bollard.)
+//! - **`bollard`** (Engine API) for images — pull with progress, tag, inspect,
+//!   build.
+//! - **The `docker` CLI** for container lifecycle and exec (create/start/exec/
+//!   remove), because bollard's JSON-body POSTs fail over Docker Desktop's
+//!   Windows named pipe. `harness.rs` likewise runs the app-server over
+//!   `docker exec -i`.
+//!
+//! Both paths MUST reach the same daemon, which `sync_docker_host` guarantees —
+//! otherwise rootless Docker breaks (see that function).
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 use bollard::image::{BuildImageOptions, CreateImageOptions, TagImageOptions};
 use bollard::Docker;
 use futures_util::StreamExt;
+
+/// Make bollard talk to the SAME daemon as the `docker` CLI.
+///
+/// bollard's `connect_with_local_defaults()` honors only `DOCKER_HOST` and then
+/// falls back to the rootful socket (`/var/run/docker.sock`). The CLI also honors
+/// `docker context`, which is how ROOTLESS Docker exposes its own socket
+/// (`/run/user/<uid>/docker.sock`) — and Docker Desktop on macOS likewise uses a
+/// per-user socket. Launched from a GUI the app inherits no shell environment, so
+/// without this the two paths hit DIFFERENT daemons: the image is pulled/tagged on
+/// one while `docker run` looks for it on the other, which surfaces as
+/// "Unable to find image 'hacksor-runtime:latest' locally" followed by a bogus
+/// Docker Hub pull. Ask the CLI for its endpoint once and export it so both agree.
+///
+/// Only unix-socket endpoints are adopted: Windows named pipes already work and
+/// are left untouched.
+fn sync_docker_host() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        // An explicit DOCKER_HOST already applies to bollard AND the CLI.
+        if std::env::var_os("DOCKER_HOST").is_some() {
+            return;
+        }
+        let mut cmd = std::process::Command::new("docker");
+        cmd.args(["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        if let Ok(out) = cmd.output() {
+            let host = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if out.status.success() && host.starts_with("unix://") {
+                std::env::set_var("DOCKER_HOST", host);
+            }
+        }
+    });
+}
+
+/// Is the daemon running in ROOTLESS mode?
+///
+/// This changes what the container can do, so it must be known before we build
+/// the run spec. In rootless Docker `--network host` does NOT join the real host
+/// network namespace — it joins RootlessKit's isolated one — so a service bound
+/// to `127.0.0.1` inside is unreachable from the host, and `SYS_ADMIN`/
+/// `/dev/net/tun` aren't grantable either. Rootless therefore needs the same
+/// treatment as Docker Desktop: bridge networking with published ports.
+/// Cached; probed via the CLI so it reflects the daemon the CLI actually uses.
+pub fn docker_rootless() -> bool {
+    static ROOTLESS: OnceLock<bool> = OnceLock::new();
+    *ROOTLESS.get_or_init(|| {
+        sync_docker_host();
+        let mut cmd = std::process::Command::new("docker");
+        cmd.args(["info", "--format", "{{.SecurityOptions}}"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        match cmd.output() {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).contains("rootless")
+            }
+            _ => false,
+        }
+    })
+}
 
 /// Connect to the local Docker engine (socket/pipe per platform) and negotiate
 /// the API version with the daemon. The negotiation matters on Docker Desktop
@@ -24,6 +97,7 @@ use futures_util::StreamExt;
 /// even though GET calls (ping/inspect/build) succeed. If negotiation itself
 /// fails we fall back to the default client so nothing regresses.
 pub async fn connect() -> Result<Docker, String> {
+    sync_docker_host();
     let d = Docker::connect_with_local_defaults()
         .map_err(|e| format!("cannot reach the Docker engine: {e}"))?;
     match d.negotiate_version().await {
@@ -35,6 +109,7 @@ pub async fn connect() -> Result<Docker, String> {
 
 /// Is the Docker engine reachable? (Replaces the old `docker --version` probe.)
 pub async fn docker_present() -> bool {
+    sync_docker_host();
     match Docker::connect_with_local_defaults() {
         Ok(d) => d.ping().await.is_ok(),
         Err(_) => false,
@@ -96,7 +171,10 @@ pub struct RunSpec {
     pub name: String,
     pub host_home: String,      // bind mount source (host path)
     pub container_home: String, // bind mount target + HOME + workdir
-    pub linux: bool,            // Linux => --network host + full caps + tun
+    /// Use host networking + full caps + tun. True only on REAL rootful Linux:
+    /// Docker Desktop has no host networking, and rootless Docker's "host" is
+    /// RootlessKit's namespace (not the real host) and can't grant SYS_ADMIN/tun.
+    pub host_net: bool,
     pub tun: bool,              // /dev/net/tun present (Linux)
     pub publish_ports: Vec<u16>,// ports to publish to 127.0.0.1 (Docker Desktop)
 }
@@ -117,7 +195,7 @@ pub async fn create_and_start(spec: &RunSpec) -> Result<(), String> {
     // `sleep infinity` never would, which otherwise wedges pgrep-based restarts).
     let mut args: Vec<String> =
         vec!["run".into(), "-d".into(), "--name".into(), spec.name.clone(), "--init".into()];
-    if spec.linux {
+    if spec.host_net {
         args.push("--network".into());
         args.push("host".into());
         args.push("--add-host".into());
@@ -161,7 +239,19 @@ pub async fn create_and_start(spec: &RunSpec) -> Result<(), String> {
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let (out, code) = docker_cli(&argv, None).await?;
     if code != 0 {
-        return Err(format!("create container: docker run failed: {}", out.trim()));
+        let msg = out.trim();
+        // `docker run` falls back to pulling an absent image from Docker Hub,
+        // where this local-only tag doesn't exist — the resulting "pull access
+        // denied" hides the real problem (the image isn't on THIS daemon).
+        if msg.contains("Unable to find image") || msg.contains("pull access denied") {
+            return Err(format!(
+                "create container: the runtime image '{}' is not on this Docker daemon. \
+                 If you use rootless Docker, make sure the app and the `docker` CLI target \
+                 the same daemon (set DOCKER_HOST to your rootless socket), then retry.",
+                spec.image
+            ));
+        }
+        return Err(format!("create container: docker run failed: {msg}"));
     }
     Ok(())
 }
@@ -171,6 +261,8 @@ pub async fn create_and_start(spec: &RunSpec) -> Result<(), String> {
 /// Windows named pipe in particular); `docker` must be on PATH — the harness
 /// relies on it too. On Windows a hidden console avoids a flashing window.
 async fn docker_cli(args: &[&str], stdin: Option<&str>) -> Result<(String, i64), String> {
+    // Same daemon as bollard (matters for rootless Docker) — see sync_docker_host.
+    sync_docker_host();
     let mut cmd = tokio::process::Command::new("docker");
     cmd.args(args)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -344,7 +436,7 @@ mod tests {
             name: "hacksor-runtime-test".into(),
             host_home: home.clone(),
             container_home: home.clone(),
-            linux: cfg!(target_os = "linux"),
+            host_net: cfg!(target_os = "linux"),
             tun: tun_present(),
             publish_ports: vec![],
         };
