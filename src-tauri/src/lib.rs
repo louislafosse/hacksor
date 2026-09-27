@@ -65,6 +65,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_providers,
             commands::verify_turn,
+            commands::judge_phase,
             commands::review_action,
             commands::list_models,
             commands::get_settings,

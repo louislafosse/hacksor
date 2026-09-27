@@ -1437,10 +1437,22 @@ function autoCandidates(text: string): { models: string[]; baseEffort: number } 
 //                               understood and the context is gathered; it does
 //                               the exploitation work and nothing else.
 //
-// The phase is sticky, so a multi-turn exploitation stays on DeepSeek. But any
-// sign of NEW surface (another endpoint, a fresh host) or a request to dig
-// deeper hands control straight back to MiMo — deep investigation must never
-// run on the exploitation model.
+// WHO DECIDES THE HANDOVER: a cheap judge model, after each turn, from what the
+// engagement has actually established — never from keywords in the user's
+// message. Wording is a terrible proxy: "pentest X and exploit what you find"
+// states a GOAL, and routing it to the exploitation model on turn 1 left
+// DeepSeek rediscovering from nothing, which is precisely what the split exists
+// to avoid. The judge promotes to exploit only once a specific vulnerability is
+// confirmed and the attack target is known, and hands back to recon the moment
+// something is unknown again (new surface, a failed attempt, a lead to verify).
+//
+// Both phases share ONE codex thread, so whatever recon established is already
+// in DeepSeek's context when it takes over — the handover moment is the only
+// thing that needs deciding.
+//
+// The phase is sticky between judgements: an engagement starts in recon, and
+// only the judge moves it. If the judge is unavailable (no key for the
+// provider, or it errors) the phase simply stays put.
 type AutoPhase = "recon" | "exploit";
 
 const RECON_MATCH = (id: string) => /mimo/.test(id) && /2[.\-_]?6/.test(id) && /pro/.test(id);
@@ -1450,27 +1462,10 @@ const EXPLOIT_MATCH = (id: string) => /deepseek/.test(id) && /v?4[.\-_]?1/.test(
 const RECON_FALLBACK = (id: string) => /mimo/.test(id);
 const EXPLOIT_FALLBACK = (id: string) => /deepseek/.test(id);
 
-// NEW ATTACK SURFACE always wins, even mid-exploitation: a fresh endpoint has
-// to be understood before it can be attacked.
-const NEW_SURFACE_RE =
-  /\b(?:new|another|additional|fresh)\s+(?:endpoint|route|host|subdomain|parameter|param|target|service|port|page)\b|\bdiscovered\s+(?:a|an|another|new|some)\b/i;
-// Explicit exploitation intent.
-const EXPLOIT_RE =
-  /\b(?:exploit|exploitation|weaponi[sz]e|payload|reverse\s*shell|pop\s+a\s+shell|rce|remote\s+code|priv(?:ilege)?[\s-]?esc\w*|escalate\s+privileges|pwn|dump\s+(?:the\s+)?(?:db|database)|exfiltrat\w*|proof[\s-]of[\s-]concept|poc|chain\s+(?:it|them|the))\b/i;
-// A need to investigate or to CONFIRM a finding — recon work, but weaker than
-// explicit exploitation intent so "exploit the SQLi you confirmed" still hands
-// over rather than being pinned by the word "confirmed".
-const INVESTIGATE_RE =
-  /\b(?:enumerat\w*|recon(?:naissance)?|scan\w*|crawl\w*|fuzz\w*|investigat\w*|map\s+(?:the\s+)?(?:app|api|surface)|what\s+else|look\s+(?:deeper|again|closer)|dig\s+deeper|confirm\w*|verif\w*|validate)\b/i;
-
-/// Which phase this turn belongs to, in precedence order: new surface → recon,
-/// explicit exploitation → exploit, investigation/confirmation → recon, else
-/// stay where we were.
-function autoPhase(session: Session, text: string): AutoPhase {
-  if (NEW_SURFACE_RE.test(text)) return "recon";
-  if (EXPLOIT_RE.test(text)) return "exploit";
-  if (INVESTIGATE_RE.test(text)) return "recon";
-  return session.phase ?? "recon"; // sticky; engagements start in recon
+/// The phase this turn runs in. Engagements start in recon; from there the
+/// post-turn judge (`maybePhaseHandover`) is the only thing that moves it.
+function autoPhase(session: Session): AutoPhase {
+  return session.phase ?? "recon";
 }
 
 /// The pipeline model for a phase, from the SELECTED provider's catalog.
@@ -1491,7 +1486,7 @@ function autoPlan(
   escalation: number,
   session?: Session,
 ): { model: string; effort: string; phase: AutoPhase } {
-  const phase: AutoPhase = session ? autoPhase(session, text) : "recon";
+  const phase: AutoPhase = session ? autoPhase(session) : "recon";
   const pipeline = pipelineModel(phase);
   if (pipeline) {
     // Recon thinks hard by default; exploitation runs a fast model, so it starts
@@ -1513,6 +1508,19 @@ function autoPlan(
   }
   modelIdx = Math.min(modelIdx, models.length - 1);
   return { model: models[modelIdx], effort: EFFORT_LADDER[effortIdx], phase };
+}
+
+// A cheap model to judge the recon → exploit handover with. Deliberately NOT
+// one of the two pipeline models: the router shouldn't be graded by a model it
+// routes to. Falls back to the plain verifier when the catalog offers nothing else.
+function judgeModel(): string {
+  const light = /flash|mini|fast|lite|nano|haiku|air|small/i;
+  const ids = state.models.map((m) => m.id);
+  const neutral = (id: string) => {
+    const l = id.toLowerCase();
+    return !RECON_MATCH(l) && !EXPLOIT_MATCH(l);
+  };
+  return ids.find((id) => light.test(id) && neutral(id)) ?? ids.find(neutral) ?? verifierModel();
 }
 
 // A cheap/fast model from the selected provider's catalog to gate Smart Auto.
@@ -2180,22 +2188,71 @@ function addVerdictBadge(session: Session, v: { verdict: string; reason: string 
 // Smart Auto loop: after a turn, a lightweight verifier judges the outcome; on
 // fail/partial (and under the cap) escalate effort-then-model and continue the
 // SAME thread with the failure reason (no destructive re-run). Auto-only.
-async function maybeEscalate(session: Session, answer: string | undefined | null) {
-  if (!session.auto || !session.lastText || !answer) return;
-  if (session.escalation >= ESCALATE_CAP) return;
+/// Returns true if it escalated (and therefore already sent another turn).
+async function maybeEscalate(session: Session, answer: string | undefined | null): Promise<boolean> {
+  if (!session.auto || !session.lastText || !answer) return false;
+  if (session.escalation >= ESCALATE_CAP) return false;
   let v: { verdict: string; reason: string };
   try {
     v = await invoke("verify_turn", {
       args: { provider: session.provider, model: verifierModel(), task: session.lastText, answer },
     });
   } catch {
-    return;
+    return false;
   }
   addVerdictBadge(session, v);
   if ((v.verdict === "fail" || v.verdict === "partial") && session.escalation < ESCALATE_CAP) {
     session.escalation++;
     await escalateContinue(session, v.reason || v.verdict);
+    return true;
   }
+  return false;
+}
+
+// Decide which half of the pipeline runs NEXT, from what the engagement has
+// established rather than from how the user phrased anything. Runs after the
+// turn, so it costs no send latency, and only moves the phase on a clear
+// verdict — "unknown" (no key, error, junk reply) leaves it exactly where it is.
+async function maybePhaseHandover(session: Session, answer: string | undefined | null) {
+  if (!session.auto || !session.lastText || !answer) return;
+  // Only meaningful when this provider actually carries both halves; otherwise
+  // Auto is on the generic family router and the phase decides nothing.
+  if (!pipelineModel("recon") || !pipelineModel("exploit")) return;
+  const current = autoPhase(session);
+  let v: { phase: string; reason: string };
+  try {
+    v = await invoke("judge_phase", {
+      args: {
+        provider: session.provider,
+        model: judgeModel(),
+        phase: current,
+        task: session.lastText,
+        answer,
+      },
+    });
+  } catch {
+    return;
+  }
+  if (v.phase !== "recon" && v.phase !== "exploit") return; // unknown ⇒ keep
+  if (v.phase === current) return;
+  session.phase = v.phase as AutoPhase;
+  const next = pipelineModel(session.phase);
+  const label = session.phase === "exploit" ? "exploitation" : "recon &amp; confirm";
+  const arrow = session.phase === "exploit" ? "⇒" : "⇐";
+  const why = v.reason ? ` <span class="am-keep">· ${escapeHtml(v.reason)}</span>` : "";
+  const note = el("div", "auto-note auto-switch");
+  note.innerHTML =
+    `${arrow} Handover → <b>${label}</b>${next ? ` (${escapeHtml(next)})` : ""} on the next message${why}`;
+  session.turnsEl.appendChild(note);
+  scrollToBottom();
+}
+
+// Post-turn Auto housekeeping. The phase judge is skipped when the turn already
+// escalated: that sends a follow-up on the SAME task, so re-routing mid-retry
+// would swap the model out from under an attempt still in progress.
+async function afterTurn(session: Session, answer: string | undefined | null) {
+  const escalated = await maybeEscalate(session, answer);
+  if (!escalated) await maybePhaseHandover(session, answer);
 }
 
 async function escalateContinue(session: Session, reason: string) {
@@ -2620,7 +2677,7 @@ listen<Notif>("hacksor://event", (evt) => {
       if (session.sawOutputThisTurn === false && !(params.lastAgentMessage || "").trim()) {
         noteEmptyResponse(session, session.turnStartMs || Date.now(), session.turnModel);
       }
-      maybeEscalate(session, params.lastAgentMessage);
+      afterTurn(session, params.lastAgentMessage);
       break;
     case "turn/aborted":
       removeThinking(session);

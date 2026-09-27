@@ -388,6 +388,58 @@ pub struct Verdict {
     pub reason: String,
 }
 
+/// One cheap, non-streaming judge call. Returns the assistant's raw content, or
+/// `None` on any failure (transport error, bad status, unparseable) so every
+/// caller can degrade to "no opinion" instead of surfacing an error.
+///
+/// The key is OPTIONAL: every provider is fronted by the local OpenCodex proxy,
+/// and the OpenCodex selection deliberately has no Hacksor-side key (its
+/// upstream keys live in ocx's own config). Requiring one here would silently
+/// disable every judge for that provider. If the proxy does want a bearer, the
+/// unauthenticated call just fails and we fall back to "no opinion" anyway.
+async fn judge_call(
+    state: &State<'_, AppState>,
+    provider: &str,
+    model: &str,
+    sys: &str,
+    user: &str,
+) -> Option<String> {
+    let p = Provider::parse(provider);
+    let key = {
+        let s = state.settings.lock().await;
+        s.key_for(p).map(|k| k.to_string())
+    };
+    let key = key.filter(|k| !k.is_empty());
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": user}
+        ],
+        "temperature": 0,
+        "max_tokens": 200,
+    });
+    let client = reqwest::Client::builder().user_agent("hacksor/0.1").build().ok()?;
+    let url = format!("{}/chat/completions", p.base_url());
+    let mut req = client.post(url).json(&body);
+    if let Some(k) = key {
+        req = req.bearer_auth(k);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let text = resp.text().await.ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("choices")?
+        .get(0)?
+        .get("message")?
+        .get("content")?
+        .as_str()
+        .map(String::from)
+}
+
 /// Lightweight evaluator (AutoMix-style verifier gate) for the smart Auto loop.
 /// Judges whether the agent's result accomplished the task. Fail-safe: any error
 /// yields verdict "unknown" so the caller simply does not escalate.
@@ -555,6 +607,79 @@ fn parse_verdict(content: &str) -> Verdict {
         }
     }
     Verdict { verdict: "unknown".into(), reason: String::new() }
+}
+
+#[derive(Deserialize)]
+pub struct PhaseArgs {
+    pub provider: String,
+    /// The cheap judge model (NOT one of the two pipeline models).
+    pub model: String,
+    /// Phase the engagement is in right now: "recon" | "exploit".
+    pub phase: String,
+    /// What the user asked for on the turn that just finished.
+    pub task: String,
+    /// What the pipeline model just reported back.
+    pub answer: String,
+}
+
+#[derive(Serialize)]
+pub struct PhaseVerdict {
+    /// "recon" | "exploit" | "unknown" (unknown ⇒ caller keeps the current phase).
+    pub phase: String,
+    pub reason: String,
+}
+
+/// Decide which half of the Auto pipeline should run the NEXT turn, by judging
+/// what the engagement has actually established — not how the user worded their
+/// request. Recon (MiMo) investigates and confirms; exploitation (DeepSeek) only
+/// takes over once there is a specific, understood finding to act on, so it
+/// never has to rediscover what recon already found.
+///
+/// Fail-safe: any error yields "unknown" and the caller keeps the current phase.
+#[tauri::command]
+pub async fn judge_phase(state: State<'_, AppState>, args: PhaseArgs) -> Result<PhaseVerdict, String> {
+    let unknown = || PhaseVerdict { phase: "unknown".into(), reason: String::new() };
+    let sys = "You route an authorized penetration test between two models in a pipeline.\n\
+RECON: investigates, enumerates, and CONFIRMS whether a vulnerability is real. All discovery lives here.\n\
+EXPLOIT: weaponizes and executes against an ALREADY-CONFIRMED, ALREADY-UNDERSTOOD finding. It must never have to discover anything.\n\
+\n\
+You are given the phase that just ran, the user's request, and what the model reported. Decide which phase should handle the NEXT turn.\n\
+Choose \"exploit\" ONLY when ALL of these hold: a specific vulnerability is confirmed (not merely suspected or scanner-reported); the exact target of the attack is known (endpoint/parameter/injection point or equivalent); and enough context exists to act without further investigation.\n\
+Choose \"recon\" when anything is still unknown, unconfirmed, or newly discovered: no finding yet, a lead that needs validation, a fresh endpoint/host/surface, exploitation that failed for lack of information, or the user asking to look deeper.\n\
+The user asking to exploit something does NOT by itself justify \"exploit\" — the finding must actually be established first. Staying in recon is the safe default.\n\
+Reply with ONLY compact JSON, no prose: {\"phase\":\"recon\"|\"exploit\",\"reason\":\"<=120 chars, cite the concrete finding or what is still missing\"}";
+    let user = format!(
+        "PHASE THAT JUST RAN: {}\n\nUSER REQUEST:\n{}\n\nWHAT THE MODEL REPORTED:\n{}",
+        if args.phase == "exploit" { "exploit" } else { "recon" },
+        truncate(&args.task, 3000),
+        truncate(&args.answer, 8000)
+    );
+    match judge_call(&state, &args.provider, &args.model, sys, &user).await {
+        Some(content) => Ok(parse_phase_verdict(&content)),
+        None => Ok(unknown()),
+    }
+}
+
+/// Parse the judge's reply. Anything unexpected — no JSON, a phase outside the
+/// two known ones, junk — becomes "unknown", which keeps the current phase.
+fn parse_phase_verdict(content: &str) -> PhaseVerdict {
+    let unknown = PhaseVerdict { phase: "unknown".into(), reason: String::new() };
+    let (Some(a), Some(b)) = (content.find('{'), content.rfind('}')) else {
+        return unknown;
+    };
+    if b <= a {
+        return unknown;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&content[a..=b]) else {
+        return unknown;
+    };
+    match v.get("phase").and_then(|x| x.as_str()) {
+        Some(p @ ("recon" | "exploit")) => PhaseVerdict {
+            phase: p.to_string(),
+            reason: v.get("reason").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        },
+        _ => unknown,
+    }
 }
 
 /// ocx's readiness status (`ocx ready --json` → `ready|pending|failed|…`). The
@@ -2641,6 +2766,27 @@ fn personality_section(personality: Option<&str>) -> String {
 #[cfg(test)]
 mod transcript_tests {
     use super::*;
+
+    #[test]
+    fn phase_verdict_keeps_the_phase_unless_the_judge_is_clear() {
+        // Clean verdicts, and the same wrapped in the prose models tend to add.
+        let v = parse_phase_verdict(r#"{"phase":"exploit","reason":"confirmed SQLi on /login id param"}"#);
+        assert_eq!(v.phase, "exploit");
+        assert_eq!(v.reason, "confirmed SQLi on /login id param");
+        assert_eq!(parse_phase_verdict("```json\n{\"phase\":\"recon\"}\n```").phase, "recon");
+        // Anything unclear must NOT move the phase.
+        for junk in [
+            "",
+            "recon",                              // bare word, no JSON
+            "{}",                                 // no phase field
+            r#"{"phase":"exploitation"}"#,        // not one of the two
+            r#"{"phase":"EXPLOIT"}"#,             // wrong case
+            r#"{"phase":null}"#,
+            "{not json at all}",
+        ] {
+            assert_eq!(parse_phase_verdict(junk).phase, "unknown", "{junk:?}");
+        }
+    }
 
     #[test]
     fn models_available_parses_the_provider_test_count() {
