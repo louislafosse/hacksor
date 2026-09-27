@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { marked } from "marked";
+import { marked, Marked } from "marked";
 import { markedHighlight } from "marked-highlight";
 import hljs from "highlight.js";
 import markedKatex from "marked-katex-extension";
@@ -9,22 +9,34 @@ import mermaid from "mermaid";
 import "katex/dist/katex.min.css";
 
 marked.setOptions({ breaks: true, gfm: true });
+// hljs.highlightAuto() tries every registered language, which is by far the most
+// expensive thing we do per render — measured on a realistic pentest answer it
+// is 244-441x the cost of the rest of the markdown pipeline (an 11 KB answer:
+// 270ms with highlighting, 0.6ms without). Auto-detecting a huge log is
+// pathological and useless, so cap it.
+const HL_AUTO_MAX = 20_000;
+const highlightCode = (code: string, lang: string) => {
+  if (lang === "mermaid") return code;
+  if (lang && hljs.getLanguage(lang)) {
+    try { return hljs.highlight(code, { language: lang }).value; } catch { /* fall through */ }
+  }
+  if (code.length > HL_AUTO_MAX) return escapeHtml(code);
+  try { return hljs.highlightAuto(code).value; } catch { return code; }
+};
 // Syntax highlighting (highlight.js) — skip fenced ```mermaid so those survive
 // as raw text for the diagram renderer below.
-marked.use(
-  markedHighlight({
-    langPrefix: "hljs language-",
-    highlight(code, lang) {
-      if (lang === "mermaid") return code;
-      if (lang && hljs.getLanguage(lang)) {
-        try { return hljs.highlight(code, { language: lang }).value; } catch { /* fall through */ }
-      }
-      try { return hljs.highlightAuto(code).value; } catch { return code; }
-    },
-  }),
-);
+marked.use(markedHighlight({ langPrefix: "hljs language-", highlight: highlightCode }));
 // KaTeX math ($…$ and $$…$$).
 marked.use(markedKatex({ throwOnError: false, nonStandard: true }));
+
+// A second, HIGHLIGHT-FREE renderer used for every intermediate repaint while a
+// message streams. Streaming re-renders the whole answer each repaint, so
+// paying for syntax highlighting on text that is about to be replaced is pure
+// waste — it was what pinned the main thread during an engagement. The message
+// is re-rendered once through the full pipeline when it finalizes.
+const markedFast = new Marked();
+markedFast.setOptions({ breaks: true, gfm: true });
+markedFast.use(markedKatex({ throwOnError: false, nonStandard: true }));
 mermaid.initialize({ startOnLoad: false, securityLevel: "strict" });
 
 // Render any ```mermaid blocks inside a finalized message container to SVG.
@@ -436,14 +448,34 @@ const turnsHost = document.getElementById("turnshost") as HTMLDivElement;
 const scrollEl = document.getElementById("scroll") as HTMLDivElement;
 const jumpBtn = document.getElementById("jumplatest") as HTMLButtonElement;
 let stickToBottom = true;
-let programmaticScroll = false; // set while WE scroll, so our own scroll isn't read as user intent
+// WHERE our own scrollToBottom() last landed. Position beats a one-shot boolean:
+// a bare flag is consumed by whichever scroll event arrives first, so a user
+// scrolling up during streaming had their event swallowed as "ours" — follow
+// mode stayed on and the next auto-scroll yanked them back down, which felt
+// like being unable to scroll up at all.
+let programmaticTop = -1;
 let lastScrollTop = 0;
 jumpBtn.addEventListener("click", () => { stickToBottom = true; scrollToBottom(true); });
+// A real gesture is unambiguous, so it never has to win a race with our own
+// scrolling: any upward wheel / touch drag stops following immediately.
+const releaseFollow = () => {
+  if (!stickToBottom) return;
+  stickToBottom = false;
+  jumpBtn.hidden = false;
+};
+scrollEl.addEventListener("wheel", (e) => { if (e.deltaY < 0) releaseFollow(); }, { passive: true });
+scrollEl.addEventListener("touchmove", releaseFollow, { passive: true });
 scrollEl.addEventListener("scroll", () => {
   // Ignore the scroll event caused by our own scrollToBottom() — otherwise the
-  // per-frame auto-scroll during streaming would keep re-asserting "at bottom"
-  // and fight the user trying to scroll up.
-  if (programmaticScroll) { programmaticScroll = false; lastScrollTop = scrollEl.scrollTop; return; }
+  // auto-scroll during streaming would keep re-asserting "at bottom" and fight
+  // the user trying to scroll up. Matched by POSITION, so a user scroll that
+  // happens to interleave with ours is still recognised as theirs.
+  if (programmaticTop >= 0 && Math.abs(scrollEl.scrollTop - programmaticTop) <= 1) {
+    programmaticTop = -1;
+    lastScrollTop = scrollEl.scrollTop;
+    return;
+  }
+  programmaticTop = -1;
   const goingUp = scrollEl.scrollTop < lastScrollTop - 1;
   lastScrollTop = scrollEl.scrollTop;
   const atBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 40;
@@ -2309,8 +2341,8 @@ function scrollToBottom(force = false) {
   // no scroll event, which would otherwise leave the flag set and swallow the
   // user's next real scroll.
   if (Math.abs(scrollEl.scrollTop - target) > 1) {
-    programmaticScroll = true;
     scrollEl.scrollTop = scrollEl.scrollHeight;
+    programmaticTop = scrollEl.scrollTop; // where WE put it (see the handler)
   }
   lastScrollTop = scrollEl.scrollTop;
   jumpBtn.hidden = true;
@@ -2408,6 +2440,11 @@ function ensureBlock(session: Session, id: string, kind: string): ItemBlock {
   return b;
 }
 
+// Full, untrimmed text for a tool card whose <pre> is capped for performance.
+// The inline view is bounded so the DOM stays fast; "Open full output" and the
+// drawer still get everything.
+const fullOutput = new WeakMap<HTMLElement, string>();
+
 function toolCard(icon: string, label: string, extraCls = "") {
   const card = el("div", `card ${extraCls}`.trim());
   const head = el("div", "head",
@@ -2423,7 +2460,7 @@ function toolCard(icon: string, label: string, extraCls = "") {
   });
   head.querySelector(".card-expand")!.addEventListener("click", (e) => {
     e.stopPropagation();
-    openToolDrawer(icon, labelEl.textContent || label, pre.textContent || "");
+    openToolDrawer(icon, labelEl.textContent || label, fullOutput.get(pre) ?? pre.textContent ?? "");
   });
   return { card, pre, label: labelEl, status: head.querySelector(".status") as HTMLElement };
 }
@@ -2457,17 +2494,26 @@ function makeSmoothReveal(paint: (text: string) => void, scroll = true, onDone?:
   let received = "";
   let shown = 0;
   let raf = 0;
-  const frame = () => {
+  let lastPaint = 0;
+  // `paint` re-renders the WHOLE text every call — for a message that means
+  // marked + highlight.js + KaTeX over the entire answer, then a full innerHTML
+  // swap. Running that once per frame costs O(length) at 60fps and saturates
+  // the main thread as the answer grows, which is what made scrolling, chat
+  // switching and the rest of the UI unresponsive mid-engagement. ~11 repaints
+  // a second still reads as live typing and costs a fraction as much.
+  const PAINT_MS = 90;
+  // Reveal enough per paint to drain whatever is buffered in about this long,
+  // instead of a fixed chars-per-frame rate. The old 22 char/frame ceiling meant
+  // a 30 KB answer needed ~23s to finish appearing — long enough to look stuck,
+  // then to dump in one go when it finally caught up.
+  const DRAIN_MS = 600;
+  const frame = (now: number) => {
     raf = 0;
     const backlog = received.length - shown;
-    if (backlog > 0) {
-      // GPT-style CONSTANT-RATE typing: reveal a small slice each frame so long
-      // replies take proportionally longer (never pop). ~2 chars/frame baseline
-      // (~120 chars/s) eases at the tail; when we've fallen behind a fast stream
-      // or a big buffered reply, accelerate (backlog/8) up to a 22 char/frame cap
-      // (~1300 chars/s) so it stays snappy without dumping everything at once.
-      const step = Math.min(backlog, Math.max(2, Math.min(22, Math.ceil(backlog / 8))));
+    if (backlog > 0 && now - lastPaint >= PAINT_MS) {
+      const step = Math.max(3, Math.ceil(backlog * (PAINT_MS / DRAIN_MS)));
       shown = Math.min(received.length, shown + step);
+      lastPaint = now;
       paint(received.slice(0, shown));
       if (scroll) scrollToBottom();
     }
@@ -2495,12 +2541,31 @@ function makeSmoothReveal(paint: (text: string) => void, scroll = true, onDone?:
   };
 }
 
+// How much streamed command output the DOM keeps (chars), and how much is kept
+// when it overflows. Generous enough that ordinary runs never trim.
+const CMD_OUTPUT_DOM_MAX = 240_000;
+const CMD_OUTPUT_DOM_KEEP = 160_000;
+
 function createBlock(kind: string): ItemBlock {
   if (kind === "agentMessage") {
     const m = el("div", "msg assistant");
     const bubble = el("div", "bubble");
     m.appendChild(bubble);
-    const reveal = makeSmoothReveal((t) => { bubble.innerHTML = renderMd(t); }, true, () => { enhanceMermaid(bubble); enhanceCodeBlocks(bubble); });
+    // Stream unhighlighted (cheap); once the message is final and fully
+    // revealed, re-render it once through the full pipeline so the finished
+    // answer still gets syntax highlighting, mermaid and code-block actions.
+    let finalized = false;
+    const reveal = makeSmoothReveal(
+      // Always cheap: the full-pipeline render happens exactly once, in onDone.
+      (t) => { bubble.innerHTML = renderMd(t, true); },
+      true,
+      () => {
+        if (!finalized) return;
+        bubble.innerHTML = renderMd(b.buffer);
+        enhanceMermaid(bubble);
+        enhanceCodeBlocks(bubble);
+      },
+    );
     const b: ItemBlock = {
       root: m, buffer: "",
       appendDelta: (s) => { b.buffer = reveal.push(s); bubble.dataset.copy = b.buffer; },
@@ -2508,6 +2573,7 @@ function createBlock(kind: string): ItemBlock {
         const full = item.text ?? b.buffer;
         b.buffer = full;
         bubble.dataset.copy = full;
+        finalized = true;
         reveal.finish(full);
       },
     };
@@ -2537,12 +2603,50 @@ function createBlock(kind: string): ItemBlock {
     // Click the (truncated) command label to reveal it in full; hover shows a tooltip.
     label.classList.add("cmd-label");
     label.addEventListener("click", (e) => { e.stopPropagation(); label.classList.toggle("expanded"); });
+    // Tool output arrives as a flood — a nuclei/feroxbuster run emits thousands
+    // of chunks. Repainting the whole buffer per chunk was O(n²) and forced a
+    // layout each time; append only what's new, batched to one paint per frame.
+    let pending = "";
+    let raf = 0;
+    let domLen = 0;
+    // Bound what the DOM holds: megabytes of scan output in one text node makes
+    // scrolling and switching chats crawl. The untrimmed text stays available
+    // through "Open full output" (fullOutput).
+    const setPre = (text: string) => {
+      fullOutput.set(pre, text);
+      if (text.length <= CMD_OUTPUT_DOM_MAX) {
+        pre.textContent = text;
+        domLen = text.length;
+        return;
+      }
+      const kept = text.slice(-CMD_OUTPUT_DOM_KEEP);
+      const dropped = text.length - kept.length;
+      pre.textContent =
+        `… ${dropped.toLocaleString()} earlier characters hidden — use ⤢ for the full output …\n${kept}`;
+      domLen = kept.length;
+    };
+    const flush = () => {
+      raf = 0;
+      if (!pending) return;
+      pre.appendChild(document.createTextNode(pending));
+      domLen += pending.length;
+      pending = "";
+      fullOutput.set(pre, b.buffer);
+      if (domLen > CMD_OUTPUT_DOM_MAX) setPre(b.buffer);
+      scrollToBottom();
+    };
     const b: ItemBlock = {
       root: card, buffer: "",
-      appendDelta: (s) => { b.buffer += s; pre.textContent = b.buffer; scrollToBottom(); },
+      appendDelta: (s) => {
+        b.buffer += s;
+        pending += s;
+        if (!raf) raf = requestAnimationFrame(flush);
+      },
       setFinal: (item) => {
+        if (raf) { cancelAnimationFrame(raf); raf = 0; }
+        pending = "";
         if (item.command) { label.textContent = item.command; label.title = item.command; }
-        if (item.aggregatedOutput) pre.textContent = item.aggregatedOutput;
+        if (item.aggregatedOutput) { b.buffer = item.aggregatedOutput; setPre(item.aggregatedOutput); }
         const code = item.exitCode, st = item.status;
         if (st === "failed" || (typeof code === "number" && code !== 0)) { status.textContent = `exit ${code ?? "?"}`; status.className = "status fail"; }
         else if (st === "declined") { status.textContent = "declined"; status.className = "status fail"; }
@@ -3364,8 +3468,10 @@ function openSettings(force = false) {
 
 // ---------------------------------------------------------------- render helpers
 
-function renderMd(s: string): string {
-  return marked.parse(s) as string;
+/// `fast` skips syntax highlighting — use it for streaming repaints, where the
+/// output is replaced again milliseconds later (see markedFast).
+function renderMd(s: string, fast = false): string {
+  return (fast ? markedFast : marked).parse(s) as string;
 }
 function renderDiff(diff: string): string {
   return diff.split("\n").map((line) => {
