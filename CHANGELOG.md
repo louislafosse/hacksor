@@ -1,3 +1,17 @@
+# [1.3.0](https://github.com/louislafosse/hacksor/compare/v1.2.0...v1.3.0) (2026-09-27)
+
+
+### Features
+
+* **auto:** decide the recon-exploit handover with a judge, not keywords ([4664ff6](https://github.com/louislafosse/hacksor/commit/4664ff6f9895c4731acda2502c9d85c8188a36f5))
+* **ui:** show a heartbeat when a running turn goes quiet ([b564707](https://github.com/louislafosse/hacksor/commit/b5647070c4ddb074da7c4a8221505a3353651033))
+
+
+### Performance Improvements
+
+* **recents:** keep chat-history disk work off the main thread ([76f8760](https://github.com/louislafosse/hacksor/commit/76f8760851408577372c4f833aae71e734356135))
+* **ui:** stop re-rendering the whole answer on every streaming frame ([e5b7b7c](https://github.com/louislafosse/hacksor/commit/e5b7b7ce3de51715f2326112e5505063d02ef3ac))
+
 # [1.2.0](https://github.com/louislafosse/hacksor/compare/v1.1.1...v1.2.0) (2026-09-27)
 
 
