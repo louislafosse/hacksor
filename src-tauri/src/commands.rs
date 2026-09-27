@@ -1257,16 +1257,21 @@ fn parse_exec_output(raw: &str) -> (String, Option<i64>) {
 /// so we parse the on-disk rollout — the ground truth — instead, letting the
 /// thinking and command-execution blocks survive an app restart.
 #[tauri::command]
-pub fn read_transcript(
+pub async fn read_transcript(
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let path = match find_rollout(&state.codex_home, &thread_id) {
-        Some(p) => p,
-        None => return Ok(vec![]),
-    };
-    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    Ok(parse_rollout(&text))
+    // Off the main thread: a sync #[tauri::command] runs on it, and a large
+    // rollout (measured here: 22 MB / 2734 records) froze the whole UI while it
+    // was read and parsed.
+    let home = state.codex_home.clone();
+    tokio::task::spawn_blocking(move || {
+        let Some(path) = find_rollout(&home, &thread_id) else { return Ok(vec![]) };
+        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        Ok(parse_rollout(&text))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// The provider a thread was CREATED under, read from the rollout's
@@ -1276,13 +1281,24 @@ pub fn read_transcript(
 /// codex provider id (matches Hacksor's ids: openrouter/vercel/opencodex), or
 /// an empty string when unknown.
 #[tauri::command]
-pub fn thread_provider(state: State<'_, AppState>, thread_id: String) -> Result<String, String> {
-    let path = match find_rollout(&state.codex_home, &thread_id) {
-        Some(p) => p,
-        None => return Ok(String::new()),
-    };
-    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    Ok(provider_from_rollout(&text).unwrap_or_default())
+pub async fn thread_provider(state: State<'_, AppState>, thread_id: String) -> Result<String, String> {
+    let home = state.codex_home.clone();
+    tokio::task::spawn_blocking(move || {
+        use std::io::BufRead;
+        let Some(path) = find_rollout(&home, &thread_id) else { return Ok(String::new()) };
+        // session_meta is the FIRST record and provider_from_rollout only ever
+        // inspects the first 5 lines, so read just the head. This used to
+        // read_to_string the whole rollout — tens of MB — to look at line 1.
+        let f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+        let mut head = String::new();
+        for line in std::io::BufReader::new(f).lines().take(5).map_while(Result::ok) {
+            head.push_str(&line);
+            head.push('\n');
+        }
+        Ok(provider_from_rollout(&head).unwrap_or_default())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Build a compact, bounded "conversation so far" block from a thread's rollout
@@ -1551,8 +1567,16 @@ fn preview_from_rollout(path: &std::path::Path) -> String {
 /// through the app-server's `thread/list`, which was gated on the runtime being
 /// up and could return a subset or nothing while Docker provisioned.
 #[tauri::command]
-pub fn list_recents(state: State<'_, AppState>) -> Result<Vec<RecentChat>, String> {
+pub async fn list_recents(state: State<'_, AppState>) -> Result<Vec<RecentChat>, String> {
     let root = state.codex_home.join("sessions");
+    // Walking the store and previewing every rollout is disk work — keep it off
+    // the main thread so the sidebar populating never freezes the window.
+    tokio::task::spawn_blocking(move || list_recents_blocking(root))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn list_recents_blocking(root: std::path::PathBuf) -> Result<Vec<RecentChat>, String> {
     let mut files: Vec<(std::path::PathBuf, u64)> = Vec::new();
     fn walk(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, u64)>) {
         if let Ok(rd) = std::fs::read_dir(dir) {
