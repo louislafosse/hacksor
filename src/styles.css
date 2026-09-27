@@ -647,6 +647,32 @@ input::placeholder, textarea::placeholder { color: var(--muted-foreground); }
 .status.running { animation: think-pulse 1.4s ease-in-out infinite; }
 @keyframes blink { 50% { opacity: 0.3; } }
 
+/* "still working" heartbeat: a running turn that has gone quiet for a few
+   seconds. Motion is the whole point — a static line reads as a frozen app. */
+.still-working {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--muted-foreground); font-size: 13px; font-family: var(--font-mono);
+  padding: 2px 0;
+}
+.still-working .dots { display: inline-flex; align-items: center; gap: 3px; }
+.still-working .dots i {
+  width: 4px; height: 4px; border-radius: 50%; background: currentColor;
+  animation: dot-bounce 1.2s ease-in-out infinite;
+}
+.still-working .dots i:nth-child(2) { animation-delay: .16s; }
+.still-working .dots i:nth-child(3) { animation-delay: .32s; }
+.still-working .sw-text { animation: think-pulse 1.8s ease-in-out infinite; }
+@keyframes dot-bounce {
+  0%, 80%, 100% { opacity: .25; transform: translateY(0); }
+  40%           { opacity: 1;   transform: translateY(-3px); }
+}
+/* Respect a reduced-motion preference: keep the indicator, drop the movement. */
+@media (prefers-reduced-motion: reduce) {
+  .still-working .dots i, .still-working .sw-text,
+  .thinking-live, .status.running { animation: none; }
+  .still-working .dots i { opacity: .6; }
+}
+
 /* single scroll region so chat lists stack at the top under Recents */
 .sidebar-scroll { flex: 1; overflow-y: auto; min-height: 0; }
 .chat-list { flex: initial; overflow: visible; }

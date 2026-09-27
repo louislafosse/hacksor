@@ -174,6 +174,13 @@ interface Session {
   phase?: AutoPhase;
   thinkingEl?: HTMLElement;
   thinkTimer?: number;
+  // "Still working" heartbeat for a running turn that has gone quiet. The
+  // Thinking indicator above only covers the wait BEFORE the first block; once
+  // output exists, a long silent gap (a slow tool, a long think between tool
+  // calls, a stalled provider) would otherwise look like a frozen UI.
+  idleEl?: HTMLElement;
+  idleTimer?: number;
+  lastActivityMs?: number;
   lastText?: string;
   lastImages?: string[];
   // Shell-style prompt history for this chat (every message you've sent, oldest
@@ -1845,6 +1852,7 @@ function checkDoomLoop(session: Session, command: string) {
 function setSessionRunning(session: Session, r: boolean) {
   session.running = r;
   if (r) { session.unread = false; session.cmdSig = undefined; session.cmdRepeat = 0; }
+  if (r) startIdleWatch(session); else stopIdleWatch(session);
   if (session.id === state.activeSessionId) setSendButton(r);
   if (!r) drainQueue(session);
   renderSidebar();
@@ -2331,6 +2339,46 @@ function removeThinking(session: Session) {
   if (session.thinkingEl) { session.thinkingEl.remove(); session.thinkingEl = undefined; }
 }
 
+// A running turn may go silent for a long time — a slow scan, a long think
+// between tool calls, a provider stalling. Without a signal that looks like
+// motion, that is indistinguishable from a hung app. After this much quiet,
+// show an animated heartbeat with how long the silence has lasted.
+const IDLE_HINT_MS = 2500;
+
+/// Any event for this thread means the turn is alive: reset the clock and drop
+/// the heartbeat (so it never ends up stranded above later output).
+function markActivity(session: Session) {
+  session.lastActivityMs = Date.now();
+  if (session.idleEl) { session.idleEl.remove(); session.idleEl = undefined; }
+}
+
+function startIdleWatch(session: Session) {
+  stopIdleWatch(session);
+  session.lastActivityMs = Date.now();
+  session.idleTimer = window.setInterval(() => {
+    if (!session.running) return stopIdleWatch(session);
+    // The pre-first-token "Thinking… Ns" indicator already owns this gap.
+    if (session.thinkingEl) return;
+    const quiet = Date.now() - (session.lastActivityMs ?? Date.now());
+    if (quiet < IDLE_HINT_MS) return;
+    if (!session.idleEl) {
+      const e = el("div", "still-working");
+      e.innerHTML = `<span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="sw-text"></span>`;
+      e.setAttribute("role", "status");
+      session.turnsEl.appendChild(e);
+      session.idleEl = e;
+      scrollToBottom();
+    }
+    const t = session.idleEl.querySelector(".sw-text") as HTMLElement | null;
+    if (t) t.textContent = `Still working… ${Math.round(quiet / 1000)}s since the last update`;
+  }, 500);
+}
+
+function stopIdleWatch(session: Session) {
+  if (session.idleTimer) { clearInterval(session.idleTimer); session.idleTimer = undefined; }
+  if (session.idleEl) { session.idleEl.remove(); session.idleEl = undefined; }
+}
+
 // Fold any still-expanded live reasoning card into a "Thought for Ns" summary.
 function collapseReasoning(session: Session) {
   session.turnsEl.querySelectorAll(".card.reasoning:not(.collapsed)").forEach((c) => {
@@ -2647,6 +2695,7 @@ listen<Notif>("hacksor://event", (evt) => {
   const { method, params } = evt.payload;
   const session = sessionByThread(params?.threadId);
   if (!session) return;
+  markActivity(session); // any event = the turn is alive
   switch (method) {
     case "turn/started":
       setSessionRunning(session, true);
