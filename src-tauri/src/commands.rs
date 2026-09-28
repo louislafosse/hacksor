@@ -179,9 +179,9 @@ async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
                 "sh".into(),
                 "-c".into(),
                 format!(
-                    "export CODEX_HOME={}; exec ocx start --port {} > {OCX_START_LOG} 2>&1",
-                    ocx_codex_home(true),
-                    models::OPENCODEX_PORT
+                    "mkdir -p {home} && export CODEX_HOME={home}; exec ocx start --port {port} > {OCX_START_LOG} 2>&1",
+                    home = ocx_codex_home(true),
+                    port = models::OPENCODEX_PORT
                 ),
             ],
             exec_user(),
@@ -340,8 +340,17 @@ async fn run_ocx(args: &[&str], stdin_data: Option<&str>, docker: bool) -> Resul
         }
         // Every ocx invocation carries the private codex home, not just `start`:
         // several subcommands re-run the native-integration sync.
-        let mut cmd: Vec<String> =
-            vec!["env".into(), format!("CODEX_HOME={}", ocx_codex_home(true)), "ocx".into()];
+        // `sh -c '<script>' sh <argv...>` puts the ocx argv in "$@", so no arg
+        // has to be quoted into the script. mkdir first: ocx aborts if
+        // CODEX_HOME does not already exist.
+        let home = ocx_codex_home(true);
+        let mut cmd: Vec<String> = vec![
+            "sh".into(),
+            "-c".into(),
+            format!("mkdir -p {home} && exec env CODEX_HOME={home} \"$@\""),
+            "sh".into(),
+            "ocx".into(),
+        ];
         cmd.extend(args.iter().map(|s| s.to_string()));
         let (out, code) = runtime::exec_output(RUNTIME_CONTAINER, cmd, exec_user(), stdin_data).await?;
         if code == 0 {
@@ -2882,6 +2891,10 @@ mod transcript_tests {
         // unreachable, and the two modes must not collide.
         assert!(docker.starts_with("/tmp/"), "docker home must be container-local, got {docker}");
         assert_ne!(docker, host);
+        // ocx stats CODEX_HOME and aborts with ENOENT if it is missing, so the
+        // host path must already exist once resolved (the container path is
+        // created by the mkdir in the exec'd command).
+        assert!(std::path::Path::new(&host).is_dir(), "host codex home was not created: {host}");
     }
 
     #[test]
