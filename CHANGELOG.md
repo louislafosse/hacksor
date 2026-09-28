@@ -1,3 +1,10 @@
+## [1.3.1](https://github.com/louislafosse/hacksor/compare/v1.3.0...v1.3.1) (2026-09-28)
+
+
+### Bug Fixes
+
+* **runtime:** stop the bundled proxy rewriting the user's own codex config ([7a2659a](https://github.com/louislafosse/hacksor/commit/7a2659aabdef691efd9986496231f83923944559))
+
 # [1.3.0](https://github.com/louislafosse/hacksor/compare/v1.2.0...v1.3.0) (2026-09-27)
 
 
