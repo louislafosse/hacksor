@@ -1,3 +1,10 @@
+## [1.3.2](https://github.com/louislafosse/hacksor/compare/v1.3.1...v1.3.2) (2026-09-28)
+
+
+### Bug Fixes
+
+* **runtime:** create the proxy's private codex home before starting it ([3971b4f](https://github.com/louislafosse/hacksor/commit/3971b4f2098dad86a052e2aa30a3bd18913fd5ef))
+
 ## [1.3.1](https://github.com/louislafosse/hacksor/compare/v1.3.0...v1.3.1) (2026-09-28)
 
 
