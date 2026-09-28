@@ -179,7 +179,8 @@ async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
                 "sh".into(),
                 "-c".into(),
                 format!(
-                    "exec ocx start --port {} > {OCX_START_LOG} 2>&1",
+                    "export CODEX_HOME={}; exec ocx start --port {} > {OCX_START_LOG} 2>&1",
+                    ocx_codex_home(true),
                     models::OPENCODEX_PORT
                 ),
             ],
@@ -240,6 +241,7 @@ async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
         "OpenCodex is not installed on the host. Switch Runtime to Docker (it's bundled there), or run `npm i -g @bitkyc08/opencodex`.".to_string()
     })?;
     let child = tokio::process::Command::new(bin)
+        .env("CODEX_HOME", ocx_codex_home(false))
         .args(["start", "--port", &models::OPENCODEX_PORT.to_string()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -301,12 +303,45 @@ pub fn list_providers() -> Vec<ProviderInfo> {
 /// Run the `ocx` CLI with args, optionally piping `stdin_data` (for keys). In
 /// Docker mode it runs the container's bundled ocx (`docker exec … ocx …`); in
 /// host mode the host `ocx`.
+/// Container-local scratch codex home for the bundled OpenCodex proxy.
+const OCX_CODEX_HOME_CONTAINER: &str = "/tmp/hacksor-ocx-codex";
+
+/// A PRIVATE codex home for the OpenCodex proxy Hacksor manages.
+///
+/// ocx injects its own root routing (`openai_base_url = <the proxy>`) into
+/// whatever codex home it resolves, and its resolver falls back to `~/.codex`
+/// when `CODEX_HOME` is unset. Unset, Hacksor's proxy therefore rewrites the
+/// USER's personal codex config and silently redirects their standalone `codex`
+/// CLI — subscription login and all — through Hacksor's proxy. In Docker that
+/// reaches the real host file, because the user's home is bind-mounted.
+///
+/// Hacksor never needs that injection: its harness reaches the proxy through
+/// the `[model_providers.*] base_url` it writes in its OWN codex home. So give
+/// ocx a scratch home it may rewrite freely. Under Docker it is container-local
+/// (`/tmp`), so it cannot touch the host at all; on the host it is a per-user
+/// Hacksor directory. Either way it is never `~/.codex`, and never the codex
+/// home the harness uses.
+fn ocx_codex_home(docker: bool) -> String {
+    if docker {
+        return OCX_CODEX_HOME_CONTAINER.to_string();
+    }
+    let p = dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("hacksor")
+        .join("ocx-codex");
+    let _ = std::fs::create_dir_all(&p);
+    p.to_string_lossy().into_owned()
+}
+
 async fn run_ocx(args: &[&str], stdin_data: Option<&str>, docker: bool) -> Result<String, String> {
     if docker {
         if !runtime_container_running().await {
             return Err("Runtime container is not running.".into());
         }
-        let mut cmd: Vec<String> = vec!["ocx".into()];
+        // Every ocx invocation carries the private codex home, not just `start`:
+        // several subcommands re-run the native-integration sync.
+        let mut cmd: Vec<String> =
+            vec!["env".into(), format!("CODEX_HOME={}", ocx_codex_home(true)), "ocx".into()];
         cmd.extend(args.iter().map(|s| s.to_string()));
         let (out, code) = runtime::exec_output(RUNTIME_CONTAINER, cmd, exec_user(), stdin_data).await?;
         if code == 0 {
@@ -319,7 +354,8 @@ async fn run_ocx(args: &[&str], stdin_data: Option<&str>, docker: bool) -> Resul
             "OpenCodex (ocx) is not installed on the host. Use the Docker runtime (it's bundled there) or `npm i -g @bitkyc08/opencodex`.".to_string()
         })?;
         let mut cmd = tokio::process::Command::new(bin);
-        cmd.args(args)
+        cmd.env("CODEX_HOME", ocx_codex_home(false))
+            .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .stdin(if stdin_data.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() });
@@ -2823,6 +2859,29 @@ mod transcript_tests {
         // No count, or a non-numeric one: fall back to the generic message.
         assert_eq!(models_available_in("vercel-ai-gateway: connected"), None);
         assert_eq!(models_available_in("connected — no models available."), None);
+    }
+
+    #[test]
+    fn ocx_never_uses_the_users_own_codex_home() {
+        // Regression: ocx injects `openai_base_url = <proxy>` into whatever codex
+        // home it resolves, defaulting to ~/.codex. Left unset, Hacksor's proxy
+        // hijacked the user's standalone `codex` CLI.
+        let docker = ocx_codex_home(true);
+        let host = ocx_codex_home(false);
+        let user_codex = dirs::home_dir().map(|h| h.join(".codex"));
+        for (label, got) in [("docker", &docker), ("host", &host)] {
+            assert!(!got.is_empty(), "{label}: empty CODEX_HOME would fall back to ~/.codex");
+            let p = std::path::Path::new(got);
+            if let Some(u) = &user_codex {
+                assert_ne!(p, u.as_path(), "{label}: points at the user's own codex home");
+                assert!(!p.starts_with(u), "{label}: sits inside the user's codex home");
+            }
+            assert!(!got.ends_with("/.codex"), "{label}: resolves to a .codex dir");
+        }
+        // Docker's must be container-local so the bind-mounted host home is
+        // unreachable, and the two modes must not collide.
+        assert!(docker.starts_with("/tmp/"), "docker home must be container-local, got {docker}");
+        assert_ne!(docker, host);
     }
 
     #[test]
