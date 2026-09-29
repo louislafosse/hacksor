@@ -980,8 +980,11 @@ async function loadRecents() {
     // Re-render the whole sidebar: the Archive section (persisted archived
     // chats) is derived from `recents`, not just the Recents list.
     renderSidebar();
-  } catch {
-    // harness not ready / no history yet
+  } catch (err) {
+    // Keep whatever is already listed rather than blanking the sidebar, but
+    // don't swallow the reason: a silent catch here is why an empty Recents
+    // list looked like "my chats are gone" with nothing to go on.
+    console.error("list_recents failed:", err);
   }
 }
 
@@ -1358,8 +1361,14 @@ async function boot() {
   updateChips();
   updateHint();
   renderSidebar();
-  await loadModels();
+  // Recents FIRST, and deliberately not awaited: list_recents only reads the
+  // rollouts on disk, so it has no dependency on the runtime. It used to sit
+  // behind `await loadModels()`, which waits out ensure_opencodex (container
+  // start + up to 12s for the proxy) and then the catalog discovery poll (up to
+  // ~19s) — minutes while Docker provisions. The sidebar stayed empty for all
+  // of it, for no reason.
   loadRecents();
+  await loadModels();
   // First-run onboarding: with no key configured for any provider, open Settings
   // straight away so the user lands on the one thing they must do to begin.
   if (!state.keys.openrouter && !state.keys.vercel) {
@@ -3457,8 +3466,8 @@ function openSettings(force = false) {
     state.runtime = s.runtime;
     updateHint();
     close();
+    loadRecents(); // disk-only; don't make it wait on the catalog either
     await loadModels();
-    loadRecents();
     // Provision the runtime up front (download/build + start) so it's ready
     // before the first message. Idempotent, so safe whenever Docker is selected.
     void prevRuntime;
