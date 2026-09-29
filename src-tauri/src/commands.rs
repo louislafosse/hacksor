@@ -1305,18 +1305,61 @@ fn parse_exec_output(raw: &str) -> (String, Option<i64>) {
 pub async fn read_transcript(
     state: State<'_, AppState>,
     thread_id: String,
-) -> Result<Vec<serde_json::Value>, String> {
+    limit: Option<usize>,
+) -> Result<Transcript, String> {
     // Off the main thread: a sync #[tauri::command] runs on it, and a large
     // rollout (measured here: 22 MB / 2734 records) froze the whole UI while it
     // was read and parsed.
     let home = state.codex_home.clone();
     tokio::task::spawn_blocking(move || {
-        let Some(path) = find_rollout(&home, &thread_id) else { return Ok(vec![]) };
+        let Some(path) = find_rollout(&home, &thread_id) else {
+            return Ok(Transcript::default());
+        };
         let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        Ok(parse_rollout(&text))
+        Ok(slice_transcript(parse_rollout(&text), limit))
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// How many past prompts the composer's history keeps. Bounds the payload for
+/// a chat whose every turn pastes a large blob, without truncating any single
+/// prompt (a recalled prompt must be exactly what was sent).
+const PROMPT_HISTORY_MAX: usize = 500;
+
+/// A transcript slice: the tail the UI renders, how many records exist in all,
+/// and the full prompt history.
+#[derive(Serialize, Default)]
+pub struct Transcript {
+    pub items: Vec<serde_json::Value>,
+    pub total: usize,
+    pub prompts: Vec<String>,
+}
+
+/// Keep only the tail the UI renders, while reporting the true total and the
+/// FULL prompt history.
+///
+/// Prompts are collected before trimming, so up-arrow recall still reaches
+/// prompts that scrolled off the top, and they are never truncated (a recalled
+/// prompt must be exactly what was sent). That costs almost nothing: user text
+/// measured 3-74 KB per chat against a 12 MB transcript.
+fn slice_transcript(mut items: Vec<serde_json::Value>, limit: Option<usize>) -> Transcript {
+    let total = items.len();
+    let mut prompts: Vec<String> = items
+        .iter()
+        .filter(|i| i["type"] == "userMessage")
+        .filter_map(|i| i["content"][0]["text"].as_str().map(str::to_string))
+        .collect();
+    if prompts.len() > PROMPT_HISTORY_MAX {
+        prompts.drain(..prompts.len() - PROMPT_HISTORY_MAX);
+    }
+    // Ship only what the UI will render; the rest is fetched on demand when the
+    // reader asks for earlier messages. A full transcript was 12.46 MB over the
+    // IPC bridge to render 1.29 MB of it — ~90% discarded on every chat open.
+    if let Some(n) = limit.filter(|n| *n > 0 && *n < total) {
+        items.drain(..total - n);
+    }
+    Transcript { items, total, prompts }
 }
 
 /// The provider a thread was CREATED under, read from the rollout's
@@ -2868,6 +2911,39 @@ mod transcript_tests {
         // No count, or a non-numeric one: fall back to the generic message.
         assert_eq!(models_available_in("vercel-ai-gateway: connected"), None);
         assert_eq!(models_available_in("connected — no models available."), None);
+    }
+
+    #[test]
+    fn transcript_slice_keeps_the_tail_but_all_the_prompts() {
+        let mk = |i: usize, user: bool| {
+            if user {
+                serde_json::json!({"type":"userMessage","id":format!("t{i}"),"content":[{"type":"text","text":format!("prompt {i}")}]})
+            } else {
+                serde_json::json!({"type":"agentMessage","id":format!("t{i}"),"text":format!("answer {i}")})
+            }
+        };
+        // 100 records, every 10th a user prompt (10 prompts, 8 of them trimmed).
+        let items: Vec<_> = (0..100).map(|i| mk(i, i % 10 == 0)).collect();
+
+        let t = slice_transcript(items.clone(), Some(20));
+        assert_eq!(t.total, 100, "total must report the whole transcript");
+        assert_eq!(t.items.len(), 20, "only the tail is shipped");
+        assert_eq!(t.items[0]["id"], "t80", "tail must be the LAST 20, not the first");
+        assert_eq!(t.items[19]["id"], "t99");
+        // Prompts are collected before trimming, so recall reaches scrolled-off ones.
+        assert_eq!(t.prompts.len(), 10, "prompt history must survive the trim");
+        assert_eq!(t.prompts[0], "prompt 0");
+        assert_eq!(t.prompts[9], "prompt 90");
+
+        // No limit, 0, or a limit past the end: everything, unchanged.
+        for lim in [None, Some(0), Some(100), Some(500)] {
+            let t = slice_transcript(items.clone(), lim);
+            assert_eq!(t.items.len(), 100, "limit {lim:?} should not trim");
+            assert_eq!(t.total, 100);
+        }
+        // Empty transcript stays empty rather than panicking on the drain range.
+        let t = slice_transcript(vec![], Some(60));
+        assert_eq!((t.items.len(), t.total, t.prompts.len()), (0, 0, 0));
     }
 
     #[test]

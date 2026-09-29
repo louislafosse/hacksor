@@ -926,10 +926,16 @@ function selectSession(id: string) {
         // read_transcript rebuilds the FULL transcript (incl. thinking and
         // commands, which thread/resume drops) from codex's on-disk rollout —
         // it only reads disk, so it works even before the harness is ready.
-        let items: any[] = [];
-        try { items = await invoke<any[]>("read_transcript", { threadId: active.threadId }); } catch { /* handled below */ }
+        // Fetch only the tail the UI will actually render; earlier messages are
+        // pulled on demand (see renderTranscript). Shipping the whole rollout
+        // measured 12.46 MB over the IPC bridge to render 1.29 MB of it.
+        let tr: Transcript = { items: [], total: 0, prompts: [] };
+        try {
+          tr = await invoke<Transcript>("read_transcript", { threadId: active.threadId, limit: TRANSCRIPT_CAP });
+        } catch { /* handled below */ }
+        const items = tr.items;
         const s = state.sessions.find((x) => x.id === sid);
-        if (s && items && items.length) { s.turnsEl.innerHTML = ""; s.blocks.clear(); renderTranscript(s, items); }
+        if (s && items && items.length) { s.turnsEl.innerHTML = ""; s.blocks.clear(); renderTranscript(s, items, false, tr); }
         // Record the thread's true creation provider (from the rollout) so a
         // later provider switch starts a new thread — codex binds a thread to
         // its creation provider. Only set if we don't already know it.
@@ -1050,17 +1056,35 @@ function renderHistory(session: Session, thread: any) {
 // freezes the UI. Render the most recent ones instantly, with a button to
 // expand the rest on demand.
 const TRANSCRIPT_CAP = 60;
-function renderTranscript(session: Session, items: any[], full = false) {
+type Transcript = { items: any[]; total: number; prompts: string[] };
+
+function renderTranscript(session: Session, items: any[], full = false, meta?: Transcript) {
   const start = full ? 0 : Math.max(0, items.length - TRANSCRIPT_CAP);
-  session.sentHistory = []; // rebuilt from the transcript below
+  // Records that exist but are not on screen: the ones trimmed here, plus any
+  // the backend withheld because we only asked for the tail.
+  const withheld = Math.max(0, (meta?.total ?? items.length) - items.length);
+  const earlier = start + withheld;
+  // Prompt history covers the WHOLE chat even when only the tail was fetched,
+  // so up-arrow recall still reaches prompts scrolled off the top.
+  session.sentHistory = meta?.prompts ? meta.prompts.slice() : [];
+  const trackHistory = !meta?.prompts;
   historyRestoring = true;
   try {
-    if (start > 0) {
-      const btn = el("button", "transcript-more", `↑ Show ${start} earlier message${start > 1 ? "s" : ""}`);
-      btn.addEventListener("click", () => {
+    if (earlier > 0) {
+      const btn = el("button", "transcript-more", `↑ Show ${earlier} earlier message${earlier > 1 ? "s" : ""}`);
+      btn.addEventListener("click", async () => {
+        // Only now pay for the rest of the transcript.
+        let all = items;
+        if (withheld > 0 && session.threadId) {
+          btn.textContent = "Loading…";
+          try {
+            const tr = await invoke<Transcript>("read_transcript", { threadId: session.threadId });
+            if (tr.items.length) all = tr.items;
+          } catch { /* fall back to what we already have */ }
+        }
         session.turnsEl.innerHTML = "";
         session.blocks.clear();
-        renderTranscript(session, items, true);
+        renderTranscript(session, all, true, meta);
         stickToBottom = false;
         scrollEl.scrollTop = 0; // keep the reader near the newly-revealed top
       });
@@ -1073,7 +1097,7 @@ function renderTranscript(session: Session, items: any[], full = false) {
         addUserMessage(session, t);
         session.lastText = t;
         session.lastImages = [];
-        if (t && session.sentHistory[session.sentHistory.length - 1] !== t) session.sentHistory.push(t);
+        if (trackHistory && t && session.sentHistory[session.sentHistory.length - 1] !== t) session.sentHistory.push(t);
       } else if (item.id) {
         ensureBlock(session, item.id, item.type).setFinal?.(item);
       }
