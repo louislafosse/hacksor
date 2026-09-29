@@ -2579,6 +2579,37 @@ function makeSmoothReveal(paint: (text: string) => void, scroll = true, onDone?:
 const CMD_OUTPUT_DOM_MAX = 240_000;
 const CMD_OUTPUT_DOM_KEEP = 160_000;
 
+// Re-render a finished message through the FULL pipeline (syntax highlighting,
+// mermaid, code-block actions). The markdown source is already on the element
+// as `dataset.copy`, so nothing extra has to be retained.
+function upgradeHighlightNow(bubble: HTMLElement) {
+  const md = bubble.dataset.copy;
+  if (!md) return;
+  bubble.innerHTML = renderMd(md);
+  enhanceMermaid(bubble);
+  enhanceCodeBlocks(bubble);
+}
+
+// Upgrade lazily, once the message nears the viewport. Restoring a long chat
+// otherwise pays for highlighting dozens of messages the reader never scrolls
+// to. rootMargin starts the work before it is actually on screen so the swap
+// isn't visible while scrolling.
+let highlightObserver: IntersectionObserver | null = null;
+function upgradeHighlightWhenVisible(bubble: HTMLElement) {
+  if (typeof IntersectionObserver === "undefined") { upgradeHighlightNow(bubble); return; }
+  highlightObserver ??= new IntersectionObserver(
+    (entries, obs) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        obs.unobserve(e.target);
+        upgradeHighlightNow(e.target as HTMLElement);
+      }
+    },
+    { root: scrollEl, rootMargin: "800px 0px" },
+  );
+  highlightObserver.observe(bubble);
+}
+
 function createBlock(kind: string): ItemBlock {
   if (kind === "agentMessage") {
     const m = el("div", "msg assistant");
@@ -2594,9 +2625,12 @@ function createBlock(kind: string): ItemBlock {
       true,
       () => {
         if (!finalized) return;
-        bubble.innerHTML = renderMd(b.buffer);
-        enhanceMermaid(bubble);
-        enhanceCodeBlocks(bubble);
+        // Restoring a chat finalizes every message at once. Highlighting them
+        // all here measured 753ms for 46 messages (6ms unhighlighted), so defer
+        // it: the cheap render is already on screen, and each message upgrades
+        // when it nears the viewport. A live turn upgrades immediately.
+        if (historyRestoring) { upgradeHighlightWhenVisible(bubble); return; }
+        upgradeHighlightNow(bubble);
       },
     );
     const b: ItemBlock = {
