@@ -1,3 +1,16 @@
+## [1.3.3](https://github.com/louislafosse/hacksor/compare/v1.3.2...v1.3.3) (2026-09-29)
+
+
+### Bug Fixes
+
+* **sidebar:** don't block Recents behind the model catalog ([4d209f3](https://github.com/louislafosse/hacksor/commit/4d209f30f04ff6a12a1c601c9d9f19b17764c157))
+
+
+### Performance Improvements
+
+* **transcript:** ship only the slice of a chat the UI renders ([76033ae](https://github.com/louislafosse/hacksor/commit/76033ae3b61ca58214dfdb1c3b6f82aa436380a6))
+* **ui:** highlight restored messages only as they come into view ([3ab5f02](https://github.com/louislafosse/hacksor/commit/3ab5f02f03a2dedf10fc00bd5fd13814cc6299fd))
+
 ## [1.3.2](https://github.com/louislafosse/hacksor/compare/v1.3.1...v1.3.2) (2026-09-28)
 
 
