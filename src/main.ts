@@ -2235,6 +2235,23 @@ function addAutoNoteText(session: Session, text: string) {
   session.turnsEl.appendChild(el("div", "auto-note", escapeHtml(text)));
 }
 
+// A model that WRITES its tool call into the message body instead of calling
+// the tool. The call never runs, so the turn stalls and the model usually
+// retries the same way. Requires both halves of the syntax so an answer that
+// merely discusses the shape isn't flagged; `multi_tool_use.parallel` is an
+// OpenAI-internal pseudo-tool that some models hallucinate outright.
+const TOOL_AS_TEXT_RE = /<function=\w+[\s\S]{0,400}?<parameter=|multi_tool_use\.parallel/;
+
+function noteToolCallAsText(session: Session, requested?: string) {
+  const name = requested || session.turnModel || "The model";
+  const note = el("div", "auto-note flagged");
+  note.innerHTML =
+    `<b>${escapeHtml(name)}</b> wrote a tool call as text instead of calling the tool, so nothing ran. ` +
+    `That model isn't following the tool protocol reliably here — try another model, or the same one on a different provider.`;
+  session.turnsEl.appendChild(note);
+  scrollToBottom();
+}
+
 // A turn ended with no output at all — the model declined/flagged the request.
 // Name the model that flagged (authoritative served model from the ocx usage
 // log, falling back to the requested model) so it's clear WHO returned nothing.
@@ -2901,6 +2918,8 @@ listen<Notif>("hacksor://event", (evt) => {
       // so the user isn't left staring at silence with no explanation.
       if (session.sawOutputThisTurn === false && !(params.lastAgentMessage || "").trim()) {
         noteEmptyResponse(session, session.turnStartMs || Date.now(), session.turnModel);
+      } else if (TOOL_AS_TEXT_RE.test(params.lastAgentMessage || "")) {
+        noteToolCallAsText(session, session.turnModel);
       }
       afterTurn(session, params.lastAgentMessage);
       break;
