@@ -1,3 +1,15 @@
+# [1.4.0](https://github.com/louislafosse/hacksor/compare/v1.3.3...v1.4.0) (2026-10-04)
+
+
+### Bug Fixes
+
+* **ui:** re-arm auto-follow when the view is already at the bottom ([9360f13](https://github.com/louislafosse/hacksor/commit/9360f13262d48b80245e12f17d96f4eb025b7cae))
+
+
+### Features
+
+* **ui:** flag a model that writes its tool call as text ([71d3255](https://github.com/louislafosse/hacksor/commit/71d32556ceec0effaa437acbdce5f32f20f0b38e))
+
 ## [1.3.3](https://github.com/louislafosse/hacksor/compare/v1.3.2...v1.3.3) (2026-09-29)
 
 
