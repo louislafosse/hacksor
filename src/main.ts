@@ -456,15 +456,21 @@ let stickToBottom = true;
 let programmaticTop = -1;
 let lastScrollTop = 0;
 jumpBtn.addEventListener("click", () => { stickToBottom = true; scrollToBottom(true); });
-// A real gesture is unambiguous, so it never has to win a race with our own
-// scrolling: any upward wheel / touch drag stops following immediately.
-const releaseFollow = () => {
-  if (!stickToBottom) return;
-  stickToBottom = false;
-  jumpBtn.hidden = false;
-};
-scrollEl.addEventListener("wheel", (e) => { if (e.deltaY < 0) releaseFollow(); }, { passive: true });
-scrollEl.addEventListener("touchmove", releaseFollow, { passive: true });
+const atBottom = () => scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 40;
+const setFollow = (on: boolean) => { stickToBottom = on; jumpBtn.hidden = on; };
+// Gestures are a BACKSTOP for scroll events that get swallowed mid-stream —
+// they must never fire while the view is already pinned to the bottom. At the
+// bottom a wheel moves nothing, so NO scroll event follows, and the scroll
+// handler is the only place that re-arms following: releasing there left the
+// answer permanently unfollowed with no way back. So at the bottom, a downward
+// nudge re-arms and an upward one is left to the scroll handler (which sees the
+// view actually move); away from the bottom, scrolling up releases.
+scrollEl.addEventListener("wheel", (e) => {
+  if (atBottom()) { if (e.deltaY > 0) setFollow(true); return; }
+  if (e.deltaY < 0) setFollow(false);
+}, { passive: true });
+// Mid-drag the answer is followed exactly while the view sits at the bottom.
+scrollEl.addEventListener("touchmove", () => setFollow(atBottom()), { passive: true });
 scrollEl.addEventListener("scroll", () => {
   // Ignore the scroll event caused by our own scrollToBottom() — otherwise the
   // auto-scroll during streaming would keep re-asserting "at bottom" and fight
@@ -478,12 +484,11 @@ scrollEl.addEventListener("scroll", () => {
   programmaticTop = -1;
   const goingUp = scrollEl.scrollTop < lastScrollTop - 1;
   lastScrollTop = scrollEl.scrollTop;
-  const atBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 40;
   // Any upward move means the user wants to read: stop following immediately.
   // We only resume following once they return to the very bottom.
-  if (goingUp) stickToBottom = false;
-  else if (atBottom) stickToBottom = true;
-  jumpBtn.hidden = stickToBottom;
+  if (goingUp) setFollow(false);
+  else if (atBottom()) setFollow(true);
+  else jumpBtn.hidden = stickToBottom;
 });
 const sessList = document.getElementById("sesslist") as HTMLDivElement;
 const modelChip = document.getElementById("modelchip") as HTMLButtonElement;
