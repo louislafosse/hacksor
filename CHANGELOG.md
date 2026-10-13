@@ -1,3 +1,17 @@
+# [1.5.0](https://github.com/louislafosse/hacksor/compare/v1.4.0...v1.5.0) (2026-10-13)
+
+
+### Bug Fixes
+
+* **platform:** find docker and the other CLIs when launched from a GUI ([3251a99](https://github.com/louislafosse/hacksor/commit/3251a99e432710caeb9903925e749451a09c8ff4))
+* **runtime:** patch ocx's discovery timeout by content, not by filename ([4556318](https://github.com/louislafosse/hacksor/commit/4556318684bd9474b62974603678d7dc3836f6ed))
+* **ui:** don't replace message DOM while the user is selecting in it ([f728e3b](https://github.com/louislafosse/hacksor/commit/f728e3b8831cb994cb7c3eb970723b1f556b27e7))
+
+
+### Features
+
+* **runtime:** add REA, Ghidra and Unicorn to the runtime image ([dfa73b6](https://github.com/louislafosse/hacksor/commit/dfa73b691fabe9080bedfd9478725a499d8b9d52))
+
 # [1.4.0](https://github.com/louislafosse/hacksor/compare/v1.3.3...v1.4.0) (2026-10-04)
 
 
