@@ -34,6 +34,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     seclists wordlists exploitdb \
     # nodejs (for codex/ocx/playwright)
     nodejs npm \
+    # reverse engineering: ghidra (decompiler, also REA's native-analysis
+    # backend) and the Unicorn CPU emulator (+ python bindings) for shellcode
+    # and firmware emulation. ghidra pulls openjdk; ~1.2 GB together.
+    ghidra libunicorn-dev python3-unicorn \
  && rm -rf /var/lib/apt/lists/*
 
 # GitHub CLI (gh) — PoC/exploit repo + code search (not in Kali apt).
@@ -145,7 +149,7 @@ RUN npm config set fetch-retries 6 \
  && npm config set fetch-retry-maxtimeout 180000 \
  && npm config set fetch-timeout 600000 \
  && npm install -g @openai/codex @bitkyc08/opencodex @playwright/mcp agent-browser \
-    camofox-mcp camofox-browser \
+    camofox-mcp camofox-browser rea-agents \
  && (PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/playwright npx -y playwright install chromium 2>/dev/null || true) \
  && npm cache clean --force
 

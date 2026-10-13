@@ -173,6 +173,9 @@ The Docker runtime ships these on PATH (non-exhaustive):
 - **Web vuln:** nuclei (templates pre-fetched), dalfox (XSS), sqlmap (SQLi),
   sstimap (SSTI), nikto, testssl.
 - **SAST / secrets:** semgrep, trufflehog, gitleaks.
+- **Reverse engineering:** rea (REA - binaries, JS/Electron bundles, .NET,
+  APKs, firmware, pcaps), ghidra (decompiler, also REA's native backend),
+  Unicorn (CPU emulation for shellcode and firmware), radare2.
 - **Auth / crypto / API:** jwt_tool, phpggc and ysoserial (deserialization gadget
   chains), kiterunner (API routes), hydra, john, hashid.
 - **Cloud:** cloudfox and scoutsuite (need the target's cloud credentials).
