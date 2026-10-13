@@ -1,3 +1,10 @@
+## [1.5.3](https://github.com/louislafosse/hacksor/compare/v1.5.2...v1.5.3) (2026-10-13)
+
+
+### Bug Fixes
+
+* **models:** list ocx's direct upstreams in the OpenCodex picker ([5b72446](https://github.com/louislafosse/hacksor/commit/5b72446e09c10c6c62e37ec6c1f30172c1e24220))
+
 ## [1.5.2](https://github.com/louislafosse/hacksor/compare/v1.5.1...v1.5.2) (2026-10-13)
 
 
