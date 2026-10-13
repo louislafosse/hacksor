@@ -2604,12 +2604,19 @@ const CMD_OUTPUT_DOM_KEEP = 160_000;
 // Re-render a finished message through the FULL pipeline (syntax highlighting,
 // mermaid, code-block actions). The markdown source is already on the element
 // as `dataset.copy`, so nothing extra has to be retained.
-function upgradeHighlightNow(bubble: HTMLElement) {
+function upgradeHighlightNow(bubble: HTMLElement): boolean {
   const md = bubble.dataset.copy;
-  if (!md) return;
+  if (!md) return true;
+  // Never replace DOM the user is selecting in. Swapping innerHTML under a live
+  // range makes the browser re-anchor it onto the new nodes, so the highlight
+  // upgrade (which fires from a scroll observer) looked like text selecting
+  // itself while merely scrolling. Leave it for the next pass.
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed && sel.anchorNode && bubble.contains(sel.anchorNode)) return false;
   bubble.innerHTML = renderMd(md);
   enhanceMermaid(bubble);
   enhanceCodeBlocks(bubble);
+  return true;
 }
 
 // Upgrade lazily, once the message nears the viewport. Restoring a long chat
@@ -2623,8 +2630,9 @@ function upgradeHighlightWhenVisible(bubble: HTMLElement) {
     (entries, obs) => {
       for (const e of entries) {
         if (!e.isIntersecting) continue;
-        obs.unobserve(e.target);
-        upgradeHighlightNow(e.target as HTMLElement);
+        // Keep observing if the upgrade was deferred (active selection), so it
+        // still happens once the selection is released.
+        if (upgradeHighlightNow(e.target as HTMLElement)) obs.unobserve(e.target);
       }
     },
     { root: scrollEl, rootMargin: "800px 0px" },
