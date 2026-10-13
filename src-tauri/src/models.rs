@@ -182,10 +182,25 @@ pub fn parse_json_lenient<T: serde::de::DeserializeOwned>(out: &str) -> Option<T
 }
 
 /// Parse the JSON array from `ocx models live --json` into the subset that
-/// belongs to `upstream` (e.g. `openrouter`, `vercel-ai-gateway`), or the native
-/// OpenCodex routing models when `upstream` is `None`. This is the authoritative
+/// belongs to `upstream` (e.g. `openrouter`, `vercel-ai-gateway`), or EVERY
+/// model ocx can route to when `upstream` is `None`. This is the authoritative
 /// live catalog — ocx does NOT expose provider models on `/v1/models`, only its
 /// own native models, so per-provider selection must read this instead.
+///
+/// The `None` view used to keep only `native == true`. That hid every upstream
+/// the user had configured in ocx itself: a working `anthropic` provider with 12
+/// Claude models was in the catalog but reachable from no selection at all, so
+/// the OpenCodex picker showed 8 native OpenAI entries out of 973 and looked
+/// broken.
+///
+/// It is not the whole catalog either. The resale gateways — OpenRouter, Vercel,
+/// Cheaper Inference — each have their OWN entry in the composer, so repeating
+/// their ~950 models here just duplicates those pickers and buries everything
+/// else. The OpenCodex view is therefore "the upstreams no other selection
+/// covers": ocx's direct, first-party routes (Anthropic, the Codex-login OpenAI
+/// models) plus anything else configured in ocx by hand. The exclusion list is
+/// derived from `Provider::ocx_upstream`, so adding a composer provider removes
+/// it from this view automatically instead of drifting.
 pub fn parse_live_models(json: &str, upstream: Option<&str>) -> Vec<ModelInfo> {
     let arr: Vec<serde_json::Value> = parse_json_lenient(json).unwrap_or_default();
     let mut models: Vec<ModelInfo> = arr
@@ -193,8 +208,15 @@ pub fn parse_live_models(json: &str, upstream: Option<&str>) -> Vec<ModelInfo> {
         .filter(|m| match upstream {
             // A provider view: only that upstream's models.
             Some(u) => m.get("provider").and_then(|p| p.as_str()) == Some(u),
-            // OpenCodex view: its native routing models.
-            None => m.get("native").and_then(|n| n.as_bool()).unwrap_or(false),
+            // OpenCodex view: direct routes only, never the gateways that have
+            // a composer entry of their own.
+            None => {
+                let prov = m.get("provider").and_then(|p| p.as_str()).unwrap_or("");
+                !Provider::ALL
+                    .iter()
+                    .filter_map(|p| p.ocx_upstream())
+                    .any(|covered| covered == prov)
+            }
         })
         .filter_map(parse_live_model)
         .collect();
@@ -298,6 +320,30 @@ mod tests {
         assert!(Provider::OpenRouter.ocx_custom_args().is_empty());
         assert!(Provider::Vercel.ocx_custom_args().is_empty());
         assert!(Provider::OpenCodex.ocx_custom_args().is_empty());
+    }
+
+    #[test]
+    fn opencodex_view_lists_every_configured_upstream() {
+        // A catalog like the real one: ocx's own native models plus the
+        // upstreams the user configured in ocx (anthropic here).
+        let raw = r#"[
+          {"provider":"openai","id":"gpt-6-sol","namespaced":"gpt-6-sol","native":true},
+          {"provider":"anthropic","id":"claude-opus-5","namespaced":"anthropic/claude-opus-5"},
+          {"provider":"openrouter","id":"x","namespaced":"openrouter/x"}
+        ]"#;
+        // The OpenCodex selection reaches ocx's DIRECT routes — the native
+        // OpenAI models and the hand-configured anthropic upstream — but not
+        // openrouter, which has its own entry in the composer.
+        let all = parse_live_models(raw, None);
+        assert_eq!(all.len(), 2, "OpenCodex view should list direct routes only: {all:?}");
+        assert!(all.iter().any(|m| m.id == "anthropic/claude-opus-5"), "anthropic upstream missing");
+        assert!(all.iter().any(|m| m.id == "gpt-6-sol"), "native model missing");
+        assert!(!all.iter().any(|m| m.id.starts_with("openrouter/")), "gateway duplicated into the OpenCodex view");
+        // Per-provider views stay filtered to their own upstream.
+        let only = parse_live_models(raw, Some("anthropic"));
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].id, "anthropic/claude-opus-5");
+        assert!(parse_live_models(raw, Some("vercel-ai-gateway")).is_empty());
     }
 
     #[test]
