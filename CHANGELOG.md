@@ -1,3 +1,11 @@
+## [1.5.1](https://github.com/louislafosse/hacksor/compare/v1.5.0...v1.5.1) (2026-10-13)
+
+
+### Bug Fixes
+
+* **models:** tolerate ocx advisories in parsed command output ([25ddd27](https://github.com/louislafosse/hacksor/commit/25ddd27d87efa8e2a6b79c44a770cb396db61662))
+* **ui:** keep scrolling up from snapping back in a restored chat ([6298f20](https://github.com/louislafosse/hacksor/commit/6298f202adaae5604d98344fd2b05a536eff4c04))
+
 # [1.5.0](https://github.com/louislafosse/hacksor/compare/v1.4.0...v1.5.0) (2026-10-13)
 
 
