@@ -735,8 +735,10 @@ async fn ocx_status(docker: bool) -> String {
     match run_ocx(&["ready", "--json"], None, docker).await {
         // A non-ready status exits 1, which run_ocx reports as Err — the JSON we
         // want is in the output either way.
-        Ok(o) | Err(o) => serde_json::from_str::<serde_json::Value>(o.trim())
-            .ok()
+        // Lenient for the same reason as the catalog: ocx advisories ride along
+        // on stderr, and a strict parse here reported "" — which the caller
+        // reads as "keep waiting", so it polled out instead of seeing `ready`.
+        Ok(o) | Err(o) => models::parse_json_lenient::<serde_json::Value>(&o)
             .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
             .unwrap_or_default(),
     }

@@ -152,13 +152,33 @@ pub struct ModelInfo {
     pub reasoning_effort: String,
 }
 
+/// Parse JSON out of command output that may carry unrelated lines around it.
+///
+/// `ocx` prints advisories to stderr — 2.84 added "Legacy Unix shim requires
+/// explicit migration" — and the container exec helper deliberately MERGES
+/// stderr into the captured output so a failure can be reported. A strict parse
+/// of the whole buffer then fails, and because the catalog parse falls back to
+/// an empty list, a perfectly good 973-model catalog surfaced as "no models for
+/// this provider". Try the whole buffer first, then the bracketed payload.
+pub fn parse_json_lenient<T: serde::de::DeserializeOwned>(out: &str) -> Option<T> {
+    if let Ok(v) = serde_json::from_str::<T>(out.trim()) {
+        return Some(v);
+    }
+    let a = out.find(['[', '{'])?;
+    let b = out.rfind([']', '}'])?;
+    if b <= a {
+        return None;
+    }
+    serde_json::from_str::<T>(&out[a..=b]).ok()
+}
+
 /// Parse the JSON array from `ocx models live --json` into the subset that
 /// belongs to `upstream` (e.g. `openrouter`, `vercel-ai-gateway`), or the native
 /// OpenCodex routing models when `upstream` is `None`. This is the authoritative
 /// live catalog — ocx does NOT expose provider models on `/v1/models`, only its
 /// own native models, so per-provider selection must read this instead.
 pub fn parse_live_models(json: &str, upstream: Option<&str>) -> Vec<ModelInfo> {
-    let arr: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
+    let arr: Vec<serde_json::Value> = parse_json_lenient(json).unwrap_or_default();
     let mut models: Vec<ModelInfo> = arr
         .iter()
         .filter(|m| match upstream {
@@ -267,6 +287,28 @@ mod tests {
         assert!(Provider::OpenRouter.ocx_custom_args().is_empty());
         assert!(Provider::Vercel.ocx_custom_args().is_empty());
         assert!(Provider::OpenCodex.ocx_custom_args().is_empty());
+    }
+
+    #[test]
+    fn catalog_survives_ocx_stderr_banners() {
+        // The exec helper merges stderr into the captured output, so the real
+        // payload arrives wrapped in ocx advisories. This is what silently
+        // emptied the model picker after the image moved to ocx 2.84.
+        let body = r#"[{"provider":"vercel-ai-gateway","id":"m","namespaced":"vercel-ai-gateway/m"}]"#;
+        let banner = "\u{26a0}\u{fe0f}  Legacy Unix shim requires explicit migration: run ocx codex-shim install";
+        for raw in [
+            format!("{body}"),
+            format!("{body}\n{banner}"),
+            format!("{banner}\n{body}"),
+            format!("{banner}\n{body}\n{banner}"),
+        ] {
+            let got = parse_live_models(&raw, Some("vercel-ai-gateway"));
+            assert_eq!(got.len(), 1, "banner broke the parse: {raw:?}");
+            assert_eq!(got[0].id, "vercel-ai-gateway/m");
+        }
+        // Still yields nothing when there is genuinely no payload.
+        assert!(parse_live_models(banner, Some("vercel-ai-gateway")).is_empty());
+        assert!(parse_live_models("", Some("vercel-ai-gateway")).is_empty());
     }
 
     #[test]
