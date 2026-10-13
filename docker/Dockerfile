@@ -158,12 +158,22 @@ RUN npm config set fetch-retries 6 \
 # handful of rows. 45s covers the slow cases; a fetch that misses that is a real
 # outage, not a slow catalog.
 #
-# The final grep makes the build FAIL if the constant ever moves, so a future ocx
-# release cannot silently drop this and quietly bring the empty picker back.
-RUN OCX_FETCH=/usr/local/lib/node_modules/@bitkyc08/opencodex/src/codex/catalog/provider-fetch.ts \
- && grep -q 'AbortSignal\.timeout(8000)' "$OCX_FETCH" \
- && sed -i 's/AbortSignal\.timeout(8000)/AbortSignal.timeout(45000)/g' "$OCX_FETCH" \
- && grep -q 'AbortSignal\.timeout(45000)' "$OCX_FETCH"
+# Patch by CONTENT, not by filename: pinning the path broke the image build when
+# ocx 2.68 refactored provider-fetch.ts into a re-export barrel and moved the
+# constant to provider-models.ts. Every runtime-image publish failed from then
+# on, so this fix never actually reached anyone. Rewrite wherever the constant
+# lives under catalog/, and still FAIL the build if it is nowhere to be found, so
+# a future release cannot silently drop it and bring the empty picker back.
+RUN OCX_CATALOG=/usr/local/lib/node_modules/@bitkyc08/opencodex/src/codex/catalog \
+ && grep -rl 'AbortSignal\.timeout(8000)' "$OCX_CATALOG" > /tmp/ocx-patch-targets \
+ && [ -s /tmp/ocx-patch-targets ] \
+ && xargs -r sed -i 's/AbortSignal\.timeout(8000)/AbortSignal.timeout(45000)/g' < /tmp/ocx-patch-targets \
+ && grep -rq 'AbortSignal\.timeout(45000)' "$OCX_CATALOG" \
+ && rm -f /tmp/ocx-patch-targets
+
+# REA finds Ghidra through this (it never installs Ghidra or Java itself), and
+# Kali's package lays the installation out at /usr/share/ghidra.
+ENV GHIDRA_INSTALL_DIR=/usr/share/ghidra
 
 # Patch the installed camofox-browser + camofox-mcp so the MCP browser can solve
 # Cloudflare Turnstile, work behind the loopback intercept proxy, and lazy-start
