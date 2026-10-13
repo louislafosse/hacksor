@@ -468,15 +468,28 @@ const setFollow = (on: boolean) => { stickToBottom = on; jumpBtn.hidden = on; };
 // answer permanently unfollowed with no way back. So at the bottom, a downward
 // nudge re-arms and an upward one is left to the scroll handler (which sees the
 // view actually move); away from the bottom, scrolling up releases.
+// When the scroll handler runs, it needs to know whether the user caused this
+// scroll or the content merely resized under them. "Did the height change" was
+// too blunt a proxy: a streaming answer resizes on every repaint, so scrolling
+// down to rejoin a LIVE answer never re-armed following. Track real input
+// instead - a scroll within this long of a gesture is the user's.
+const GESTURE_MS = 500;
+let lastGestureMs = 0;
+const markGesture = () => { lastGestureMs = Date.now(); };
 scrollEl.addEventListener("wheel", (e) => {
+  markGesture();
   if (atBottom()) { if (e.deltaY > 0) setFollow(true); return; }
   if (e.deltaY < 0) setFollow(false);
 }, { passive: true });
+// Dragging the scrollbar or keyboard-scrolling counts too, so arriving at the
+// bottom that way also resumes following.
+scrollEl.addEventListener("pointerdown", markGesture, { passive: true });
+scrollEl.addEventListener("keydown", markGesture);
 // Mid-drag the answer is followed exactly while the view sits at the bottom.
 // Release-only mid-drag; re-arming is left to touchend, so a drag that merely
 // passes through the bottom does not re-pin the view.
-scrollEl.addEventListener("touchmove", () => { if (!atBottom()) setFollow(false); }, { passive: true });
-scrollEl.addEventListener("touchend", () => { if (atBottom()) setFollow(true); }, { passive: true });
+scrollEl.addEventListener("touchmove", () => { markGesture(); if (!atBottom()) setFollow(false); }, { passive: true });
+scrollEl.addEventListener("touchend", () => { markGesture(); if (atBottom()) setFollow(true); }, { passive: true });
 scrollEl.addEventListener("scroll", () => {
   // Ignore the scroll event caused by our own scrollToBottom() — otherwise the
   // auto-scroll during streaming would keep re-asserting "at bottom" and fight
@@ -499,10 +512,15 @@ scrollEl.addEventListener("scroll", () => {
   // back" while reading a restored chat.
   const resized = scrollEl.scrollHeight !== lastScrollHeight;
   lastScrollHeight = scrollEl.scrollHeight;
+  const userDriven = Date.now() - lastGestureMs < GESTURE_MS;
   // Any upward move means the user wants to read: stop following immediately.
-  // We only resume following once THEY return to the very bottom.
   if (goingUp) setFollow(false);
-  else if (atBottom() && !resized) setFollow(true);
+  // Reaching the bottom resumes following, so a live answer keeps itself in
+  // view with no further scrolling. A resize-only event may do this ONLY when
+  // no gesture is involved — that is the snap-back guard. With a gesture, the
+  // user genuinely scrolled down, so re-arm even mid-stream while the answer
+  // is still growing.
+  else if (atBottom() && (userDriven || !resized)) setFollow(true);
   else jumpBtn.hidden = stickToBottom;
 });
 const sessList = document.getElementById("sesslist") as HTMLDivElement;
