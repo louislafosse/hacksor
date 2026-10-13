@@ -1115,7 +1115,6 @@ pub async fn start_chat(
         args.role.as_deref().unwrap_or("default"),
         if kali_mode { Some(working_dir.as_str()) } else { None },
         custom.as_deref(),
-        effective_model_spec(&state, &args.model).as_deref(),
     );
 
     harness
@@ -1166,7 +1165,6 @@ fn turn_overrides_from(state: &AppState, args: &SendArgs, personality: Option<&s
             args.role.as_deref().unwrap_or("default"),
             if kali_mode { args.working_dir.as_deref() } else { None },
             custom,
-            effective_model_spec(state, model).as_deref(),
         )
     });
     // In Docker mode the per-turn cwd is the container path (identity off-Windows).
@@ -2080,32 +2078,6 @@ pub fn save_persona(state: State<'_, AppState>, content: String) -> Result<(), S
     Ok(())
 }
 
-/// The operating spec for one model (customized copy or the embedded default).
-/// `key` is one of `MODEL_SPEC_KEYS`; anything else is rejected.
-#[tauri::command]
-pub fn get_model_spec(state: State<'_, AppState>, key: String) -> Result<EditableText, String> {
-    let p = model_spec_file(&state.codex_home, &key).ok_or("Unknown model spec")?;
-    let custom = std::fs::read_to_string(p).ok().filter(|t| !t.trim().is_empty());
-    Ok(EditableText {
-        is_custom: custom.is_some(),
-        text: custom.unwrap_or_else(|| embedded_model_spec(&key).unwrap_or_default().to_string()),
-    })
-}
-
-/// Save a customized operating spec (empty ⇒ revert to the embedded default).
-/// Applies to the next turn (the spec is read per turn).
-#[tauri::command]
-pub fn save_model_spec(state: State<'_, AppState>, key: String, content: String) -> Result<(), String> {
-    let p = model_spec_file(&state.codex_home, &key).ok_or("Unknown model spec")?;
-    std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
-    if content.trim().is_empty() {
-        let _ = std::fs::remove_file(&p);
-    } else {
-        std::fs::write(&p, content).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
 /// Rebuild the runtime image from the (possibly customized) Dockerfile, then
 /// restart the container so the new image is used. Progress on `hacksor://runtime`.
 #[tauri::command]
@@ -2744,61 +2716,6 @@ async fn ensure_harness(state: &State<'_, AppState>, app: &AppHandle) -> Result<
     Ok(harness)
 }
 
-/// Per-model operating specs ("AGENTS.md") layered on top of the persona for
-/// the two Auto-pipeline models. Both are general-conduct specs that keep those
-/// models from drifting back into refusal/hedging on authorized offensive work.
-const AGENTS_DEEPSEEK_V41_FLASH: &str = include_str!("../../prompts/agents-deepseek-v4.1-flash.md");
-const AGENTS_MIMO_V26_PRO: &str = include_str!("../../prompts/agents-mimo-v2.6-pro.md");
-
-/// The spec keys, in the order the Settings picker lists them. Also the
-/// override filenames (`<codex_home>/specs/<key>.md`) and the embedded prompt
-/// filenames, so the three never drift apart.
-pub const MODEL_SPEC_KEYS: [&str; 2] = ["deepseek-v4.1-flash", "mimo-v2.6-pro"];
-
-/// The embedded default spec for a key. `None` for an unknown key — this is
-/// what keeps a key coming from the frontend off the filesystem as a path.
-fn embedded_model_spec(key: &str) -> Option<&'static str> {
-    match key {
-        "deepseek-v4.1-flash" => Some(AGENTS_DEEPSEEK_V41_FLASH),
-        "mimo-v2.6-pro" => Some(AGENTS_MIMO_V26_PRO),
-        _ => None,
-    }
-}
-
-/// Which spec key a model slug maps to, or `None` when the model has none.
-/// Mirrors the frontend pipeline matchers (`EXPLOIT_MATCH` / `RECON_MATCH` in
-/// `src/main.ts`) so the overlay follows the same models Auto routes to, across
-/// provider-namespaced ids (`openrouter/~deepseek/deepseek-v4.1-flash`, …).
-fn model_spec_key(model_slug: &str) -> Option<&'static str> {
-    let s = model_slug.to_lowercase();
-    let has_version = |variants: [&str; 3]| variants.iter().any(|v| s.contains(v));
-    if s.contains("deepseek") && has_version(["4.1", "4-1", "4_1"]) && s.contains("flash") {
-        return Some(MODEL_SPEC_KEYS[0]);
-    }
-    if s.contains("mimo") && has_version(["2.6", "2-6", "2_6"]) && s.contains("pro") {
-        return Some(MODEL_SPEC_KEYS[1]);
-    }
-    None
-}
-
-/// Path of a user-customized spec (absent ⇒ use the embedded one). `None` for
-/// an unknown key, so an arbitrary string can never become a path.
-fn model_spec_file(codex_home: &std::path::Path, key: &str) -> Option<std::path::PathBuf> {
-    embedded_model_spec(key)?;
-    Some(codex_home.join("specs").join(format!("{key}.md")))
-}
-
-/// The effective operating spec for a model: the user's customized copy if
-/// present and non-empty, else the embedded default, else `None` when the model
-/// has no spec. Read per turn so edits apply without an app restart.
-fn effective_model_spec(state: &AppState, model_slug: &str) -> Option<String> {
-    let key = model_spec_key(model_slug)?;
-    let custom = model_spec_file(&state.codex_home, key)
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .filter(|t| !t.trim().is_empty());
-    custom.or_else(|| embedded_model_spec(key).map(str::to_string))
-}
-
 /// Assemble developer instructions: a runtime header (date, model, mode,
 /// personality) plus the ported HackerAI persona, and — for the models that
 /// ship one — that model's operating spec.
@@ -2811,7 +2728,6 @@ fn build_developer_prompt(
     role: &str,
     kali_cwd: Option<&str>,
     custom: Option<&str>,
-    agents_spec: Option<&str>,
 ) -> String {
     let date = chrono::Local::now().format("%A, %B %-d, %Y");
     let mode_line = if mode == "ask" {
@@ -2832,16 +2748,6 @@ fn build_developer_prompt(
         None => String::new(),
     };
     let role_prefixed = if role_section.is_empty() { String::new() } else { format!("\n\n{}", role_section.trim_end()) };
-    // Model-specific operating spec. Sits next to the volatile runtime line
-    // rather than in the stable prefix: it changes with the model, so keeping it
-    // late leaves the persona prefix byte-identical for the models without one.
-    let agents_section = match agents_spec.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(spec) => format!(
-            "\n\n<agent_operating_spec>\nThis operating specification applies to you for the whole session, alongside the Hacksor security mandate above. The mandate governs the security engagement; this spec governs general conduct, calibration, and output quality. Where they differ on security work, the mandate wins.\n\n{}\n</agent_operating_spec>",
-            spec.trim()
-        ),
-        None => String::new(),
-    };
     // Put ALL the stable content (persona, personality, custom, role, kali, env)
     // FIRST as a byte-identical prefix, and the VOLATILE runtime line (date +
     // model + mode) LAST. The volatile bits used to lead the prompt, which
@@ -2849,7 +2755,7 @@ fn build_developer_prompt(
     // full re-bill. Keeping them at the end lets providers cache the big persona
     // prefix across turns (Anthropic/DeepSeek/OpenAI prompt caching).
     format!(
-        "{base}{persona}{custom_section}{role_prefixed}{kali_section}\n\n{env_note}{agents_section}\n\n<runtime_context>\nThe current date is {date}. You are running on the model {model_slug}. {mode_line}\n</runtime_context>"
+        "{base}{persona}{custom_section}{role_prefixed}{kali_section}\n\n{env_note}\n\n<runtime_context>\nThe current date is {date}. You are running on the model {model_slug}. {mode_line}\n</runtime_context>"
     )
 }
 
@@ -2974,63 +2880,16 @@ mod transcript_tests {
     }
 
     #[test]
-    fn spec_key_matches_only_the_two_pipeline_models() {
-        // Provider-namespaced ids and punctuation variants all resolve.
-        for id in [
-            "openrouter/~deepseek/deepseek-v4.1-flash",
-            "deepseek/deepseek-4-1-flash",
-            "vercel-ai-gateway/DeepSeek-V4_1-Flash",
-        ] {
-            assert_eq!(model_spec_key(id), Some("deepseek-v4.1-flash"), "{id}");
-        }
-        for id in ["openrouter/~xiaomi/mimo-v2.6-pro", "xiaomi/mimo-2-6-pro"] {
-            assert_eq!(model_spec_key(id), Some("mimo-v2.6-pro"), "{id}");
-        }
-        // Siblings and unrelated models get no overlay.
-        for id in [
-            "deepseek/deepseek-v4.1",          // not the flash build
-            "xiaomi/mimo-v2.6-flash",          // not the pro build
-            "anthropic/claude-opus-5",
-            "openai/gpt-5",
-        ] {
-            assert!(model_spec_key(id).is_none(), "{id}");
-        }
-        // Every key the picker offers has an embedded default and a file path.
-        for key in MODEL_SPEC_KEYS {
-            assert!(embedded_model_spec(key).is_some(), "{key}");
-            assert!(model_spec_file(std::path::Path::new("/home"), key).is_some(), "{key}");
-        }
-    }
-
-    #[test]
-    fn unknown_spec_key_never_becomes_a_path() {
-        for key in ["", "persona", "../../persona", "/etc/passwd"] {
-            assert!(embedded_model_spec(key).is_none(), "{key}");
-            assert!(model_spec_file(std::path::Path::new("/home"), key).is_none(), "{key}");
-        }
-    }
-
-    #[test]
-    fn developer_prompt_injects_the_spec_after_the_persona() {
-        let with = build_developer_prompt(
+    fn developer_prompt_is_the_persona_plus_runtime_context() {
+        let out = build_developer_prompt(
             "PERSONA", "ENVNOTE", "agent", "openrouter/~deepseek/deepseek-v4.1-flash",
-            None, "default", None, None, Some("SPEC BODY"),
+            None, "default", None, None,
         );
-        assert!(with.starts_with("PERSONA"), "persona stays the cache prefix");
-        assert!(with.contains("SPEC BODY"));
-        // Spec sits between the env note and the volatile runtime line.
-        let spec = with.find("<agent_operating_spec>").unwrap();
-        assert!(with.find("ENVNOTE").unwrap() < spec);
-        assert!(spec < with.find("<runtime_context>").unwrap());
-
-        // No spec, or a blank customized one, leaves the prompt untouched.
-        for empty in [None, Some(""), Some("  \n ")] {
-            let without = build_developer_prompt(
-                "PERSONA", "ENVNOTE", "agent", "anthropic/claude-opus-5",
-                None, "default", None, None, empty,
-            );
-            assert!(!without.contains("<agent_operating_spec>"));
-        }
+        assert!(out.starts_with("PERSONA"), "persona stays the cache prefix");
+        assert!(out.contains("ENVNOTE"));
+        assert!(out.find("ENVNOTE").unwrap() < out.find("<runtime_context>").unwrap());
+        // The per-model operating specs were removed: no model gets an overlay.
+        assert!(!out.contains("<agent_operating_spec>"));
     }
 
     #[test]

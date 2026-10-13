@@ -3242,19 +3242,6 @@ function openSettings(force = false) {
             <button id="s-persona-reset" class="ghost">Reset to default</button>
           </div>
         </div>
-        <div class="field">
-          <label>Model operating spec <span id="s-spec-badge" class="unset-badge"></span></label>
-          <p style="margin:0 0 8px">An extra spec layered <b>on top of</b> the system prompt, but only when that model is running — the two Auto pipeline models get one, since they otherwise drift back into hedging on offensive work. The system prompt still wins on security conduct. Applies to the next message. <b>Reset</b> restores the built-in default.</p>
-          <select id="s-spec-model" style="margin-bottom:8px">
-            <option value="deepseek-v4.1-flash">DeepSeek V4.1 Flash (exploit)</option>
-            <option value="mimo-v2.6-pro">MiMo v2.6 Pro (recon)</option>
-          </select>
-          <textarea id="s-spec" class="mono-edit" rows="14" spellcheck="false" placeholder="Loading…"></textarea>
-          <div class="row" style="margin-top:8px">
-            <button id="s-spec-save" class="ghost">Save spec</button>
-            <button id="s-spec-reset" class="ghost">Reset to default</button>
-          </div>
-        </div>
       </div>
 
       <div class="tab-pane" data-pane="advanced">
@@ -3408,32 +3395,28 @@ function openSettings(force = false) {
   // Editable Dockerfile + system prompt. Load current content, and wire
   // Save/Reset. Empty content on save reverts to the built-in default.
   type Editable = { text: string; is_custom: boolean };
-  // `argsFn` supplies extra command args (e.g. which model spec is selected);
-  // the returned `reload` re-reads the editor when those args change.
-  const wireEditor = (cmd: string, saveCmd: string, ta: HTMLTextAreaElement, badge: HTMLElement, saveBtn: HTMLElement, resetBtn: HTMLElement, lang?: string, argsFn?: () => Record<string, unknown>) => {
+  const wireEditor = (cmd: string, saveCmd: string, ta: HTMLTextAreaElement, badge: HTMLElement, saveBtn: HTMLElement, resetBtn: HTMLElement, lang?: string) => {
     const setBadge = (custom: boolean) => {
       badge.textContent = custom ? "· customized" : "· default";
       badge.className = custom ? "saved-badge" : "unset-badge";
     };
     const hl = lang ? attachHighlight(ta, lang) : null;
-    const args = () => argsFn?.() ?? {};
     const load = () =>
-      invoke<Editable>(cmd, args())
+      invoke<Editable>(cmd)
         .then((v) => { ta.value = v.text; setBadge(v.is_custom); hl?.(); })
         .catch(() => { ta.value = ""; ta.placeholder = "(failed to load)"; });
     load();
     saveBtn.addEventListener("click", async () => {
       const t = saveBtn.textContent;
       saveBtn.textContent = "Saved ✓";
-      try { await invoke(saveCmd, { ...args(), content: ta.value }); setBadge(!!ta.value.trim()); }
+      try { await invoke(saveCmd, { content: ta.value }); setBadge(!!ta.value.trim()); }
       catch (err) { saveBtn.textContent = "Save failed"; console.error(err); }
       setTimeout(() => (saveBtn.textContent = t), 1200);
     });
     resetBtn.addEventListener("click", async () => {
-      await invoke(saveCmd, { ...args(), content: "" }).catch(() => {});
+      await invoke(saveCmd, { content: "" }).catch(() => {});
       await load();
     });
-    return { reload: load };
   };
   wireEditor("get_dockerfile", "save_dockerfile",
     bg.querySelector("#s-dockerfile") as HTMLTextAreaElement,
@@ -3446,15 +3429,6 @@ function openSettings(force = false) {
     bg.querySelector("#s-persona-badge") as HTMLElement,
     bg.querySelector("#s-persona-save") as HTMLElement,
     bg.querySelector("#s-persona-reset") as HTMLElement);
-  // Per-model operating spec: one editor, the picker chooses which spec it edits.
-  const specSel = bg.querySelector("#s-spec-model") as HTMLSelectElement;
-  const specEditor = wireEditor("get_model_spec", "save_model_spec",
-    bg.querySelector("#s-spec") as HTMLTextAreaElement,
-    bg.querySelector("#s-spec-badge") as HTMLElement,
-    bg.querySelector("#s-spec-save") as HTMLElement,
-    bg.querySelector("#s-spec-reset") as HTMLElement,
-    undefined, () => ({ key: specSel.value }));
-  specSel.addEventListener("change", () => specEditor.reload());
   const ocxStatusEl = bg.querySelector("#s-ocx-status") as HTMLElement;
   const refreshOcx = async () => {
     const st = await invoke<{ installed: boolean; running: boolean }>("opencodex_status").catch(() => ({ installed: false, running: false }));

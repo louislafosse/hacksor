@@ -273,7 +273,6 @@ Windows signing setup to produce signed, notarized builds.
 | `src-tauri/src/models.rs` | Providers and the OpenCodex-fronted model catalog |
 | `src-tauri/src/settings.rs` | Local settings and secrets |
 | `prompts/hacksor-developer.md` | Security persona, authorization policy, methodology |
-| `prompts/agents-*.md` | Per-model operating specs layered on the persona (DeepSeek V4.1 Flash, MiMo v2.6 Pro), editable in Settings > Agent |
 | `skills/` | Methodology skill docs bundled into the binary |
 | `docker/Dockerfile` | The bundled Kali runtime image |
 | `docker/hacksor-*` | The bundled CLIs (proxy, findings, session, subagent) and cloudfish |
