@@ -72,11 +72,20 @@ impl Provider {
     /// Extra `ocx provider add` flags for upstreams that are not in OpenCodex's
     /// built-in registry. Registry providers (openrouter, vercel-ai-gateway) are
     /// auto-configured by name; a custom one must declare its adapter and base URL.
+    ///
+    /// The adapter choice is NOT cosmetic. Only ocx's `openai-chat` adapter
+    /// repairs tool calls a model writes into its message text instead of
+    /// emitting structurally — it parses `<tool_call>` / `<function=` blocks back
+    /// into real calls, and its reconciliation even special-cases `mimo-v2`
+    /// models, which do this constantly. Under `openai-responses` that repair is
+    /// absent, so MiMo's calls arrived as literal markup, nothing ran and the
+    /// turn stalled. openrouter and vercel-ai-gateway already use openai-chat,
+    /// which is why the same model behaved there.
     pub fn ocx_custom_args(self) -> &'static [&'static str] {
         match self {
             Provider::CheaperInference => &[
                 "--adapter",
-                "openai-responses",
+                "openai-chat",
                 "--base-url",
                 "https://api.cheaperinference.com/v1",
             ],
@@ -282,7 +291,9 @@ mod tests {
         // Cheaper Inference is not in ocx's provider registry, so `provider add`
         // must pass its adapter + base URL; registry providers take neither.
         let args = Provider::CheaperInference.ocx_custom_args();
-        assert!(args.contains(&"--adapter") && args.contains(&"openai-responses"));
+        // openai-chat specifically: it is the only adapter that repairs tool
+        // calls emitted as message text (see ocx_custom_args).
+        assert!(args.contains(&"--adapter") && args.contains(&"openai-chat"));
         assert!(args.contains(&"https://api.cheaperinference.com/v1"));
         assert!(Provider::OpenRouter.ocx_custom_args().is_empty());
         assert!(Provider::Vercel.ocx_custom_args().is_empty());
