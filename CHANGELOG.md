@@ -1,3 +1,11 @@
+## [1.5.2](https://github.com/louislafosse/hacksor/compare/v1.5.1...v1.5.2) (2026-10-13)
+
+
+### Bug Fixes
+
+* **providers:** route Cheaper Inference through ocx's openai-chat adapter ([f959546](https://github.com/louislafosse/hacksor/commit/f9595467b9bfed2356cfe8cf2a9183dfbd3631d1))
+* **ui:** resume following a live answer when you scroll back to the bottom ([4282b0d](https://github.com/louislafosse/hacksor/commit/4282b0d68345ccbbf7f46cfc8e517207bcaedfa1))
+
 ## [1.5.1](https://github.com/louislafosse/hacksor/compare/v1.5.0...v1.5.1) (2026-10-13)
 
 
