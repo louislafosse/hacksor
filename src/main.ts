@@ -455,6 +455,9 @@ let stickToBottom = true;
 // like being unable to scroll up at all.
 let programmaticTop = -1;
 let lastScrollTop = 0;
+// Document height at the last scroll event, to tell a user scroll apart from
+// one the browser emitted because the content resized under them.
+let lastScrollHeight = 0;
 jumpBtn.addEventListener("click", () => { stickToBottom = true; scrollToBottom(true); });
 const atBottom = () => scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 40;
 const setFollow = (on: boolean) => { stickToBottom = on; jumpBtn.hidden = on; };
@@ -470,7 +473,10 @@ scrollEl.addEventListener("wheel", (e) => {
   if (e.deltaY < 0) setFollow(false);
 }, { passive: true });
 // Mid-drag the answer is followed exactly while the view sits at the bottom.
-scrollEl.addEventListener("touchmove", () => setFollow(atBottom()), { passive: true });
+// Release-only mid-drag; re-arming is left to touchend, so a drag that merely
+// passes through the bottom does not re-pin the view.
+scrollEl.addEventListener("touchmove", () => { if (!atBottom()) setFollow(false); }, { passive: true });
+scrollEl.addEventListener("touchend", () => { if (atBottom()) setFollow(true); }, { passive: true });
 scrollEl.addEventListener("scroll", () => {
   // Ignore the scroll event caused by our own scrollToBottom() — otherwise the
   // auto-scroll during streaming would keep re-asserting "at bottom" and fight
@@ -484,10 +490,19 @@ scrollEl.addEventListener("scroll", () => {
   programmaticTop = -1;
   const goingUp = scrollEl.scrollTop < lastScrollTop - 1;
   lastScrollTop = scrollEl.scrollTop;
+  // Did this event come from the CONTENT changing size rather than the user
+  // moving? Upgrading a message's highlighting re-renders it (a mermaid fence
+  // becomes a compact SVG), which resizes the document and fires scroll events
+  // on its own. Those must never re-arm following: when the shrink left the
+  // viewport within the at-bottom threshold, follow switched back on and the
+  // next scrollToBottom yanked the reader down — so scrolling up "snapped
+  // back" while reading a restored chat.
+  const resized = scrollEl.scrollHeight !== lastScrollHeight;
+  lastScrollHeight = scrollEl.scrollHeight;
   // Any upward move means the user wants to read: stop following immediately.
-  // We only resume following once they return to the very bottom.
+  // We only resume following once THEY return to the very bottom.
   if (goingUp) setFollow(false);
-  else if (atBottom()) setFollow(true);
+  else if (atBottom() && !resized) setFollow(true);
   else jumpBtn.hidden = stickToBottom;
 });
 const sessList = document.getElementById("sesslist") as HTMLDivElement;
@@ -2624,18 +2639,58 @@ function upgradeHighlightNow(bubble: HTMLElement): boolean {
 // to. rootMargin starts the work before it is actually on screen so the swap
 // isn't visible while scrolling.
 let highlightObserver: IntersectionObserver | null = null;
+// Upgrades are PACED, one per frame, and never run as a batch inside the
+// observer callback. Scrolling up through a restored chat brings several
+// messages into range at once, and each upgrade is a full marked +
+// highlight.js + KaTeX render (measured up to 270ms for one 11 KB message)
+// plus enhanceMermaid — doing them all synchronously stalled the main thread
+// for most of a second per scroll, which felt like scrolling was blocked.
+const highlightQueue: HTMLElement[] = [];
+let highlightPump = 0;
+
+function pumpHighlights() {
+  highlightPump = 0;
+  const el = highlightQueue.shift();
+  if (el) {
+    // Upgrading a message ABOVE the viewport changes its height (a mermaid
+    // fence becomes an SVG), which shifts everything below it and drags the
+    // reader away from what they were looking at. Hold the position across the
+    // swap by re-applying the height delta.
+    const box = el.getBoundingClientRect();
+    const above = box.bottom < scrollEl.getBoundingClientRect().top;
+    const heightBefore = scrollEl.scrollHeight;
+    const topBefore = scrollEl.scrollTop;
+    if (upgradeHighlightNow(el)) {
+      highlightObserver?.unobserve(el);
+      const delta = scrollEl.scrollHeight - heightBefore;
+      if (above && delta !== 0 && !stickToBottom) {
+        scrollEl.scrollTop = topBefore + delta;
+        programmaticTop = scrollEl.scrollTop; // our move, not the user's
+      }
+    }
+    // A deferred upgrade (live selection) is NOT requeued: the element stays
+    // observed, so it comes back on its own without spinning the pump.
+  }
+  if (highlightQueue.length) highlightPump = requestAnimationFrame(pumpHighlights);
+}
+
 function upgradeHighlightWhenVisible(bubble: HTMLElement) {
   if (typeof IntersectionObserver === "undefined") { upgradeHighlightNow(bubble); return; }
   highlightObserver ??= new IntersectionObserver(
-    (entries, obs) => {
+    (entries) => {
       for (const e of entries) {
         if (!e.isIntersecting) continue;
-        // Keep observing if the upgrade was deferred (active selection), so it
-        // still happens once the selection is released.
-        if (upgradeHighlightNow(e.target as HTMLElement)) obs.unobserve(e.target);
+        if (!highlightQueue.includes(e.target as HTMLElement)) {
+          highlightQueue.push(e.target as HTMLElement);
+        }
+      }
+      if (highlightQueue.length && !highlightPump) {
+        highlightPump = requestAnimationFrame(pumpHighlights);
       }
     },
-    { root: scrollEl, rootMargin: "800px 0px" },
+    // Tighter margin than before: a wide one pulls in many messages at once,
+    // and with paced upgrades there is no need to run so far ahead.
+    { root: scrollEl, rootMargin: "300px 0px" },
   );
   highlightObserver.observe(bubble);
 }
