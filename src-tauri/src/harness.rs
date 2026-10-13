@@ -174,7 +174,7 @@ impl Harness {
                 }
                 args.push("codex".into());
                 args.push("app-server".into());
-                let mut c = tokio::process::Command::new("docker");
+                let mut c = tokio::process::Command::new(crate::runtime::docker_bin());
                 c.args(&args);
                 c
             }

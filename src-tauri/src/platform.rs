@@ -34,9 +34,11 @@ pub fn home_dir() -> PathBuf {
 /// Cross-platform PATH lookup (`;`-separated on Windows, tries executable
 /// extensions there; `:`-separated elsewhere).
 pub fn which(tool: &str) -> Option<String> {
-    let path = std::env::var_os("PATH")?;
     let exts: &[&str] = if IS_WINDOWS { &["", ".exe", ".cmd", ".bat"] } else { &[""] };
-    for dir in std::env::split_paths(&path) {
+    let from_path: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    for dir in from_path.into_iter().chain(extra_tool_dirs()) {
         for ext in exts {
             let cand = dir.join(format!("{tool}{ext}"));
             if cand.is_file() {
@@ -45,6 +47,36 @@ pub fn which(tool: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Standard install locations to search when PATH doesn't name the tool.
+///
+/// A GUI launch inherits no shell environment: on macOS, Finder/launchd hands
+/// the app a minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), so none of the
+/// places these tools actually live are visible — Docker Desktop's CLI is in
+/// `/usr/local/bin`, Homebrew's in `/opt/homebrew/bin`, codex in
+/// `~/.local/bin`. Without this the app reported Docker "not installed" and
+/// never provisioned the runtime, while the same build started from a terminal
+/// (which inherits the login shell's PATH) worked fine.
+fn extra_tool_dirs() -> Vec<PathBuf> {
+    if IS_WINDOWS {
+        return Vec::new();
+    }
+    let mut out: Vec<PathBuf> = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/snap/bin"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    if let Some(home) = dirs::home_dir() {
+        for d in [".local/bin", ".cargo/bin", ".bun/bin", "go/bin", ".docker/bin"] {
+            out.push(home.join(d));
+        }
+    }
+    if IS_MACOS {
+        // Docker Desktop ships its CLI inside the app bundle; /usr/local/bin
+        // only symlinks it when the user enabled that during setup.
+        out.push(PathBuf::from("/Applications/Docker.app/Contents/Resources/bin"));
+    }
+    out
 }
 
 /// Open a URL in the user's default browser, per platform. Detached, no console.

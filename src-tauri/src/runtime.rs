@@ -33,6 +33,18 @@ use futures_util::StreamExt;
 ///
 /// Only unix-socket endpoints are adopted: Windows named pipes already work and
 /// are left untouched.
+/// Absolute path to the `docker` CLI.
+///
+/// Resolved through `platform::which`, which also searches the standard install
+/// locations — a GUI launch gets launchd's minimal PATH, where Docker Desktop's
+/// CLI is invisible, and a bare `Command::new("docker")` then fails with ENOENT.
+/// Falls back to the bare name so a PATH-based setup is unaffected.
+pub fn docker_bin() -> String {
+    static BIN: OnceLock<String> = OnceLock::new();
+    BIN.get_or_init(|| crate::platform::which("docker").unwrap_or_else(|| "docker".into()))
+        .clone()
+}
+
 fn sync_docker_host() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
@@ -40,7 +52,7 @@ fn sync_docker_host() {
         if std::env::var_os("DOCKER_HOST").is_some() {
             return;
         }
-        let mut cmd = std::process::Command::new("docker");
+        let mut cmd = std::process::Command::new(docker_bin());
         cmd.args(["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"])
             .stdin(Stdio::null())
             .stderr(Stdio::null());
@@ -71,7 +83,7 @@ pub fn docker_rootless() -> bool {
     static ROOTLESS: OnceLock<bool> = OnceLock::new();
     *ROOTLESS.get_or_init(|| {
         sync_docker_host();
-        let mut cmd = std::process::Command::new("docker");
+        let mut cmd = std::process::Command::new(docker_bin());
         cmd.args(["info", "--format", "{{.SecurityOptions}}"])
             .stdin(Stdio::null())
             .stderr(Stdio::null());
@@ -263,7 +275,7 @@ pub async fn create_and_start(spec: &RunSpec) -> Result<(), String> {
 async fn docker_cli(args: &[&str], stdin: Option<&str>) -> Result<(String, i64), String> {
     // Same daemon as bollard (matters for rootless Docker) — see sync_docker_host.
     sync_docker_host();
-    let mut cmd = tokio::process::Command::new("docker");
+    let mut cmd = tokio::process::Command::new(docker_bin());
     cmd.args(args)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
