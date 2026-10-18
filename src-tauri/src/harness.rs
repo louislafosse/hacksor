@@ -622,6 +622,13 @@ model_provider = \"opencodex\"\n\
 # Do not load a target directory's AGENTS.md/CLAUDE.md: it pollutes the Hacksor\n\
 # persona and is a prompt-injection vector when auditing untrusted repos.\n\
 project_doc_max_bytes = 0\n\
+# Count the auto-compaction threshold against what has been added SINCE the last\n\
+# compaction, not the whole active context. codex has no switch to turn\n\
+# auto-compaction off, and with the default `total` scope a long engagement that\n\
+# has compacted once sits near the threshold forever, so it compacts again on\n\
+# almost every turn. Valid values are `total` and `body_after_prefix` (checked\n\
+# against app-server 0.162.1; anything else makes codex refuse to start).\n\
+model_auto_compact_token_limit_scope = \"body_after_prefix\"\n\
 # codex 0.152+ ships update_plan disabled by default (it must be opted back in\n\
 # per-session); without this the model has no plan/todo tool and any attempt\n\
 # to call update_plan fails with \"unsupported call\". The persona explicitly\n\
@@ -690,6 +697,9 @@ mod tests {
 
         // Anti prompt-injection: never load a target repo's AGENTS.md/CLAUDE.md.
         assert!(toml.contains("project_doc_max_bytes = 0"));
+        // Repeated compaction: only the two values codex accepts are valid here,
+        // and the wrong one stops the app-server from starting at all.
+        assert!(toml.contains("model_auto_compact_token_limit_scope = \"body_after_prefix\""));
         // Everything routes through the OpenCodex proxy; one block per provider.
         assert!(toml.contains("model_provider = \"opencodex\""));
         for p in crate::models::Provider::ALL {
