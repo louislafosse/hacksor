@@ -1,3 +1,17 @@
+# [1.6.0](https://github.com/louislafosse/hacksor/compare/v1.5.3...v1.6.0) (2026-10-18)
+
+
+### Bug Fixes
+
+* **compaction:** count the auto-compact threshold since the last compaction ([36cd2eb](https://github.com/louislafosse/hacksor/commit/36cd2eba31dea4fac56275b122e86e6040f42a75))
+* **opencodex:** repair the "run ocx login" dead end, and stop a stray kill ([a86b8bd](https://github.com/louislafosse/hacksor/commit/a86b8bd66a54945f94504c1411c6f58056b09758))
+* **ui:** highlight restored messages up front instead of while scrolling ([d043172](https://github.com/louislafosse/hacksor/commit/d043172ec03b909459920e4ef681ed60cc870ce3))
+
+
+### Features
+
+* **branch:** branch a chat at one message, with its context extracted ([124733b](https://github.com/louislafosse/hacksor/commit/124733bb39ff49619b60c99ef6e426635263f788))
+
 ## [1.5.3](https://github.com/louislafosse/hacksor/compare/v1.5.2...v1.5.3) (2026-10-13)
 
 
