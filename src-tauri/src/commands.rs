@@ -92,18 +92,25 @@ async fn configure_ocx_upstreams(state: &AppState) -> bool {
 /// Is `pid` an OpenCodex process on THIS machine? Linux-only: host networking —
 /// the thing that lets a host proxy own the container's port — is Linux-only
 /// here, so that is the only place we need to tell the two apart.
+/// Is this HOST pid really an OpenCodex proxy?
+///
+/// The check is mandatory before signalling the pid from `~/.opencodex/ocx.pid`:
+/// the container bind-mounts $HOME, so the in-container proxy writes its OWN
+/// namespaced pid (a low number like 202) into the host's file. Signalling that
+/// number on the host hits an unrelated process — the user's, or the system's.
+/// Unknown pid or unknown platform means NOT ours, so nothing is killed.
 fn pid_is_opencodex(pid: i64) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read(format!("/proc/{pid}/cmdline"))
-            .map(|b| String::from_utf8_lossy(&b).contains("opencodex"))
-            .unwrap_or(false)
+    if pid <= 0 {
+        return false;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        false
-    }
+    platform::process_cmdline(pid).map(cmdline_is_opencodex).unwrap_or(false)
+}
+
+/// Does this command line belong to an OpenCodex proxy? ocx runs as a bun
+/// process pointed at its own package, so the package path is the reliable
+/// marker — the argv[0] is bun, not ocx.
+fn cmdline_is_opencodex(cmdline: String) -> bool {
+    cmdline.contains("opencodex") || cmdline.contains("/ocx")
 }
 
 /// Stop an OpenCodex proxy running on the HOST, via the pid ocx records in
@@ -111,15 +118,15 @@ fn pid_is_opencodex(pid: i64) -> bool {
 /// container shares the host's loopback, so the port can be held by a host `ocx`
 /// that an in-container `pkill` will never see.
 ///
-/// `verify` guards that Docker path. The container bind-mounts $HOME, so the pid
-/// file may hold a CONTAINER pid (namespaced, typically a low number); signalling
-/// that number on the host would hit an unrelated process. So there we kill only
-/// what /proc confirms is really an opencodex process here.
-fn kill_host_opencodex(verify: bool) {
+/// The pid is ALWAYS verified first. This used to skip the check in host mode on
+/// the grounds that the pid file "is ours there" — but the file is shared with
+/// the container, so after one Docker-mode run it holds a container pid, and the
+/// host-mode path then signalled that number blind.
+fn kill_host_opencodex() {
     let Some(home) = dirs::home_dir() else { return };
     let Ok(raw) = std::fs::read_to_string(home.join(".opencodex/ocx.pid")) else { return };
     let Ok(pid) = raw.trim().parse::<i64>() else { return };
-    if verify && !pid_is_opencodex(pid) {
+    if !pid_is_opencodex(pid) {
         return;
     }
     platform::kill_pid(pid);
@@ -136,13 +143,12 @@ async fn restart_opencodex(state: &AppState) {
         // proxy is the one holding the port. Without this, a stale host ocx
         // keeps serving its startup-time provider config and every key change
         // is silently ignored (ocx only reads providers at startup).
-        kill_host_opencodex(true);
+        kill_host_opencodex();
     } else {
         if let Some(mut child) = state.opencodex.lock().await.take() {
             let _ = child.start_kill();
         }
-        // Host mode: the pid file is written by a host process, so it is ours.
-        kill_host_opencodex(false);
+        kill_host_opencodex();
     }
     for _ in 0..15 {
         if !opencodex_up().await {
@@ -409,6 +415,107 @@ pub async fn ocx_add_provider(state: State<'_, AppState>, provider: String, key:
     // ocx only reads provider config at startup — restart so the new upstream serves.
     restart_opencodex(&state).await;
     Ok(())
+}
+
+/// What Hacksor found when an OpenCodex request came back "not logged in".
+#[derive(Serialize, Default)]
+pub struct OcxAuthState {
+    /// The ocx upstream the error named (`anthropic`, `openai`, …).
+    pub provider: String,
+    /// True when ocx still holds a stored account for that upstream, i.e. the
+    /// login the user already did is present and the failure was not a missing
+    /// login at all.
+    pub logged_in: bool,
+    /// The account row ocx printed (identifier already masked by ocx).
+    pub detail: String,
+    /// True when the proxy was restarted to drop the credential it was holding.
+    pub restarted: bool,
+    /// ocx serving the proxy, and the host CLI, when both exist. Two different
+    /// versions sharing `~/.opencodex` is its own source of auth flapping, so
+    /// it is worth naming rather than leaving the user to guess.
+    pub proxy_version: String,
+    pub host_version: String,
+}
+
+/// An ocx upstream name, as it appears in `ocx login <provider>`. Anything else
+/// is rejected rather than passed to a shell.
+fn safe_provider_name(raw: &str) -> Option<String> {
+    let name = raw.trim().to_lowercase();
+    if name.is_empty()
+        || name.len() > 40
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(name)
+}
+
+/// The account row `ocx account current <provider>` printed for that provider,
+/// and whether it is usable. Matched on the first column so `anthropic` never
+/// picks up an `anthropic2` row, and the header is skipped by the same rule.
+///
+/// A paused account is deliberately out of rotation: restarting the proxy would
+/// not bring it back, so it counts as not usable and is reported as it is.
+fn parse_account_row(listing: &str, name: &str) -> Option<(String, bool)> {
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .find(|l| l.split_whitespace().next() == Some(name))
+        .map(|row| (row.to_string(), !row.contains("paused")))
+}
+
+/// Recover from OpenCodex's "run `ocx login <provider>`" error.
+///
+/// ocx raises it when the proxy had no usable token for the upstream as it
+/// built the request. That is not the same as the user never having logged in:
+/// the stored credential sits in `~/.opencodex/auth.json`, which this machine's
+/// container proxy and any host `ocx` share, and both can refresh it.
+///
+/// What was measured in the usage log: two bursts of six 401s each (codex
+/// retrying one turn), and auth.json rewritten about a minute after the second
+/// burst. So the proxy was sending a bearer the upstream had stopped accepting
+/// while the login itself was still on disk — the exact case where telling the
+/// user to log in again is the wrong advice. It is wrong twice over in Docker
+/// mode, where `ocx` is in the container and not on their PATH at all.
+///
+/// So: ask ocx whether an account is still stored, and if one is, restart the
+/// proxy so the next request resolves the credential afresh.
+#[tauri::command]
+pub async fn ocx_auth_check(state: State<'_, AppState>, provider: String) -> Result<OcxAuthState, String> {
+    let Some(name) = safe_provider_name(&provider) else {
+        return Err(format!("Not a provider name: {provider}"));
+    };
+    let docker = docker_runtime(&state).await;
+    let mut out = OcxAuthState { provider: name.clone(), ..Default::default() };
+
+    // `account current` is read-only and prints one row per stored credential.
+    // A non-zero exit (no such provider configured) is a "no account" answer,
+    // not a failure to report.
+    let listing = run_ocx(&["account", "current", &name], None, docker).await.unwrap_or_default();
+    if let Some((row, active)) = parse_account_row(&listing, &name) {
+        out.detail = row;
+        out.logged_in = active;
+    }
+
+    out.proxy_version = run_ocx(&["--version"], None, docker)
+        .await
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if docker {
+        if let Some(bin) = which_bin("ocx") {
+            if let Ok(o) = tokio::process::Command::new(bin).arg("--version").output().await {
+                out.host_version = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            }
+        }
+    }
+
+    if out.logged_in {
+        restart_opencodex(&state).await;
+        out.restarted = opencodex_up().await;
+    }
+    Ok(out)
 }
 
 /// Make a configured provider the default upstream for OpenCodex.
@@ -2900,6 +3007,61 @@ mod transcript_tests {
         let (out, code) = parse_exec_output(raw);
         assert_eq!(out, "bishop\n");
         assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn only_a_real_opencodex_cmdline_may_be_killed() {
+        // The two command lines this machine actually serves the proxy with
+        // (from ~/.opencodex/serving-runtimes.json): bundled in the container,
+        // and installed on the host.
+        for real in [
+            "/usr/local/lib/node_modules/@bitkyc08/opencodex/node_modules/bun/bin/bun.exe /usr/local/lib/node_modules/@bitkyc08/opencodex/src/cli/index.ts start --port 10100",
+            "/opt/homebrew/lib/node_modules/@bitkyc08/opencodex/node_modules/bun/bin/bun.exe /opt/homebrew/lib/node_modules/@bitkyc08/opencodex/src/cli/index.ts",
+            "/usr/local/bin/ocx start",
+        ] {
+            assert!(cmdline_is_opencodex(real.to_string()), "{real}");
+        }
+        // The pid file is shared with the container, so it can name a pid that
+        // on the host is something else entirely. None of these may be killed.
+        for other in [
+            "/usr/libexec/opendirectoryd",
+            "/Applications/Hacksor.app/Contents/MacOS/hacksor",
+            "/sbin/launchd",
+            "node /usr/local/bin/codex app-server",
+        ] {
+            assert!(!cmdline_is_opencodex(other.to_string()), "{other}");
+        }
+    }
+
+    #[test]
+    fn ocx_account_row_is_matched_on_the_provider_column() {
+        // Verbatim shape of `ocx account current anthropic` (2.88.0).
+        let listing = "PROVIDER   TYPE   ID                                PLAN/LABEL       PRIORITY  STATUS\n\
+                       anthropic  oauth  2f038da95488712dead06cf1004be7ce  l***8@gmail.com  -         active\n";
+        let (row, active) = parse_account_row(listing, "anthropic").unwrap();
+        assert!(row.starts_with("anthropic  oauth"));
+        assert!(active);
+
+        // The header must never be mistaken for a row, and a different
+        // provider's row must not answer for this one.
+        assert!(parse_account_row(listing, "anthropic2").is_none());
+        assert!(parse_account_row(listing, "openai").is_none());
+        assert!(parse_account_row("", "anthropic").is_none());
+
+        // A paused account is stored but not usable.
+        let paused = "anthropic  oauth  abc  l***8@gmail.com  -  paused\n";
+        let (_, active) = parse_account_row(paused, "anthropic").unwrap();
+        assert!(!active);
+    }
+
+    #[test]
+    fn provider_names_are_validated_before_reaching_a_shell() {
+        assert_eq!(safe_provider_name(" Anthropic ").as_deref(), Some("anthropic"));
+        assert_eq!(safe_provider_name("github-copilot").as_deref(), Some("github-copilot"));
+        assert_eq!(safe_provider_name("anthropic2").as_deref(), Some("anthropic2"));
+        for bad in ["", "   ", "anthropic; rm -rf /", "an thropic", "a/b", "$(id)", "../etc", &"x".repeat(41)] {
+            assert!(safe_provider_name(bad).is_none(), "{bad} must be rejected");
+        }
     }
 
     #[test]

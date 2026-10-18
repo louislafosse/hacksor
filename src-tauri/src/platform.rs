@@ -128,6 +128,37 @@ fn id_flag(_flag: &str) -> Option<String> {
     None
 }
 
+/// The command line of a HOST process, for identifying a pid before signalling
+/// it. `/proc` on Linux, `ps` elsewhere on Unix. `None` on Windows and whenever
+/// the pid does not exist, which callers must treat as "do not touch it".
+pub fn process_cmdline(pid: i64) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(b) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+            // /proc separates argv with NULs; a lossy join is enough to match on.
+            return Some(String::from_utf8_lossy(&b).replace('\0', " "));
+        }
+        return None;
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let out = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None; // no such process
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Kill a process by PID (host side). `kill` on Unix, `taskkill /F` on Windows.
 pub fn kill_pid(pid: i64) {
     let mut cmd = if IS_WINDOWS {

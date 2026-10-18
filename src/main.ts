@@ -2297,6 +2297,69 @@ async function noteEmptyResponse(session: Session, _sinceMs: number, requested?:
   session.turnsEl.appendChild(note);
   scrollToBottom();
 }
+// OpenCodex refuses a request when the proxy has no usable token for an
+// upstream, and the message tells the user to run `ocx login <provider>`. That
+// advice is wrong from inside Hacksor: the login is usually still stored (the
+// proxy was holding a credential that had since been rotated or had expired),
+// and in Docker mode `ocx` lives in the container, not on the user's PATH. So
+// catch it, let the backend check and repair it, and say what actually happened.
+const OCX_LOGIN_RE = /ocx login\s+([a-z0-9_-]+)|not logged in to\s+([a-z0-9_-]+)|\b([a-z0-9_-]+) oauth token missing/i;
+
+interface OcxAuthState {
+  provider: string;
+  logged_in: boolean;
+  detail: string;
+  restarted: boolean;
+  proxy_version: string;
+  host_version: string;
+}
+
+function noteOcxAuthError(session: Session, msg: string): boolean {
+  const m = OCX_LOGIN_RE.exec(msg);
+  if (!m) return false;
+  const provider = (m[1] ?? m[2] ?? m[3] ?? "").toLowerCase();
+  const note = el("div", "auto-note flagged");
+  note.innerHTML = `OpenCodex refused the request for <b>${escapeHtml(provider)}</b> — checking the stored login…`;
+  session.turnsEl.appendChild(note);
+  scrollToBottom();
+  (async () => {
+    let st: OcxAuthState | null = null;
+    try {
+      st = await invoke<OcxAuthState>("ocx_auth_check", { provider });
+    } catch { /* fall through to the raw advice */ }
+    if (!st) {
+      note.innerHTML = `OpenCodex refused the request for <b>${escapeHtml(provider)}</b>: ${escapeHtml(msg)}`;
+      return;
+    }
+    const skew = st.proxy_version && st.host_version && st.proxy_version !== st.host_version
+      ? ` The proxy runs ocx ${escapeHtml(st.proxy_version)} while the host CLI is ${escapeHtml(st.host_version)}; both share <code>~/.opencodex</code>, and a refresh by one invalidates the other's token.`
+      : "";
+    if (st.logged_in && st.restarted) {
+      note.innerHTML = `Your <b>${escapeHtml(provider)}</b> login is still stored${st.detail ? ` (${escapeHtml(st.detail)})` : ""}, so this was not a missing login: the proxy was holding a token the upstream had stopped accepting. Restarted it — send the message again.${skew}`;
+      const b = el("button", "msg-act", "↻ Resend");
+      b.onclick = () => { if (session.lastText) regenerate(session); else flash(b, "Nothing to resend"); };
+      note.appendChild(document.createTextNode(" "));
+      note.appendChild(b);
+    } else if (st.logged_in) {
+      note.innerHTML = `Your <b>${escapeHtml(provider)}</b> login is still stored${st.detail ? ` (${escapeHtml(st.detail)})` : ""}, but the proxy did not come back up after the restart. Check it in the OpenCodex dashboard.${skew}`;
+      note.appendChild(document.createTextNode(" "));
+      note.appendChild(ocxDashboardButton());
+    } else {
+      note.innerHTML = `OpenCodex has no usable <b>${escapeHtml(provider)}</b> account${st.detail ? ` (${escapeHtml(st.detail)})` : ""}. Log in from the OpenCodex dashboard — <code>ocx login</code> on this machine would not reach the proxy Hacksor uses.${skew}`;
+      note.appendChild(document.createTextNode(" "));
+      note.appendChild(ocxDashboardButton());
+    }
+    scrollToBottom();
+  })();
+  return true;
+}
+
+function ocxDashboardButton(): HTMLButtonElement {
+  const b = el("button", "msg-act", "⚙ Open OpenCodex");
+  b.onclick = () => { invoke("open_opencodex_setup").catch(() => {}); };
+  return b;
+}
+
 function modelSupportsVision(id: string): boolean {
   const m = state.models.find((x) => x.id === id);
   // Unknown models: assume capable (don't reroute) — only reroute when we know
@@ -2416,6 +2479,10 @@ async function escalateContinue(session: Session, reason: string) {
   }
 }
 function addError(session: Session | undefined, msg: string) {
+  // An OpenCodex auth refusal reaches the UI through several paths (the turn
+  // error event, a rejected send, a failed start). Classify here so every one
+  // of them gets the repair instead of the raw `ocx login` advice.
+  if (session && noteOcxAuthError(session, msg)) return;
   (session?.turnsEl ?? turnsHost).appendChild(el("div", "errbar", escapeHtml(msg)));
   scrollToBottom();
 }

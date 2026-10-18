@@ -99,6 +99,7 @@ pub fn run() {
             commands::ocx_provider_list,
             commands::ocx_add_provider,
             commands::ocx_set_default,
+            commands::ocx_auth_check,
             commands::runtime_status,
             commands::build_runtime,
             commands::rebuild_runtime,
