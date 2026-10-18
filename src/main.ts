@@ -455,9 +455,6 @@ let stickToBottom = true;
 // like being unable to scroll up at all.
 let programmaticTop = -1;
 let lastScrollTop = 0;
-// Document height at the last scroll event, to tell a user scroll apart from
-// one the browser emitted because the content resized under them.
-let lastScrollHeight = 0;
 jumpBtn.addEventListener("click", () => { stickToBottom = true; scrollToBottom(true); });
 const atBottom = () => scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 40;
 const setFollow = (on: boolean) => { stickToBottom = on; jumpBtn.hidden = on; };
@@ -469,10 +466,8 @@ const setFollow = (on: boolean) => { stickToBottom = on; jumpBtn.hidden = on; };
 // nudge re-arms and an upward one is left to the scroll handler (which sees the
 // view actually move); away from the bottom, scrolling up releases.
 // When the scroll handler runs, it needs to know whether the user caused this
-// scroll or the content merely resized under them. "Did the height change" was
-// too blunt a proxy: a streaming answer resizes on every repaint, so scrolling
-// down to rejoin a LIVE answer never re-armed following. Track real input
-// instead - a scroll within this long of a gesture is the user's.
+// scroll or the content merely resized under them. Track real input: a scroll
+// within this long of a gesture is the user's.
 const GESTURE_MS = 500;
 let lastGestureMs = 0;
 const markGesture = () => { lastGestureMs = Date.now(); };
@@ -502,25 +497,19 @@ scrollEl.addEventListener("scroll", () => {
   }
   programmaticTop = -1;
   const goingUp = scrollEl.scrollTop < lastScrollTop - 1;
+  const goingDown = scrollEl.scrollTop > lastScrollTop + 1;
   lastScrollTop = scrollEl.scrollTop;
-  // Did this event come from the CONTENT changing size rather than the user
-  // moving? Upgrading a message's highlighting re-renders it (a mermaid fence
-  // becomes a compact SVG), which resizes the document and fires scroll events
-  // on its own. Those must never re-arm following: when the shrink left the
-  // viewport within the at-bottom threshold, follow switched back on and the
-  // next scrollToBottom yanked the reader down — so scrolling up "snapped
-  // back" while reading a restored chat.
-  const resized = scrollEl.scrollHeight !== lastScrollHeight;
-  lastScrollHeight = scrollEl.scrollHeight;
   const userDriven = Date.now() - lastGestureMs < GESTURE_MS;
   // Any upward move means the user wants to read: stop following immediately.
   if (goingUp) setFollow(false);
   // Reaching the bottom resumes following, so a live answer keeps itself in
-  // view with no further scrolling. A resize-only event may do this ONLY when
-  // no gesture is involved — that is the snap-back guard. With a gesture, the
-  // user genuinely scrolled down, so re-arm even mid-stream while the answer
-  // is still growing.
-  else if (atBottom() && (userDriven || !resized)) setFollow(true);
+  // view with no further scrolling. Content growing or shrinking under the
+  // reader also fires scroll events without moving them, and those must never
+  // re-arm: a shrink that left the viewport inside the at-bottom threshold
+  // switched follow back on and the next scrollToBottom yanked the reader
+  // down, which read as scrolling up "snapping back". Both tests here need the
+  // position to have actually moved, or a real gesture behind it.
+  else if (atBottom() && (goingDown || userDriven)) setFollow(true);
   else jumpBtn.hidden = stickToBottom;
 });
 const sessList = document.getElementById("sesslist") as HTMLDivElement;
@@ -1083,6 +1072,7 @@ function renderHistory(session: Session, thread: any) {
   } finally {
     historyRestoring = false;
   }
+  flushRestoredHighlights(false);
   if (session.turnsEl.children.length === 0) renderEmpty(session);
   scrollToBottom();
 }
@@ -1144,6 +1134,9 @@ function renderTranscript(session: Session, items: any[], full = false, meta?: T
   } finally {
     historyRestoring = false;
   }
+  // `full` means the reader asked for the earlier history and is sent to the
+  // top of it, so that end is the one worth upgrading.
+  flushRestoredHighlights(full);
   if (session.turnsEl.children.length === 0) renderEmpty(session);
   if (!full) scrollToBottom(true);
 }
@@ -2708,9 +2701,8 @@ function upgradeHighlightNow(bubble: HTMLElement): boolean {
   const md = bubble.dataset.copy;
   if (!md) return true;
   // Never replace DOM the user is selecting in. Swapping innerHTML under a live
-  // range makes the browser re-anchor it onto the new nodes, so the highlight
-  // upgrade (which fires from a scroll observer) looked like text selecting
-  // itself while merely scrolling. Leave it for the next pass.
+  // range makes the browser re-anchor it onto the new nodes, which looked like
+  // text selecting itself. Leave the message as it is.
   const sel = window.getSelection();
   if (sel && !sel.isCollapsed && sel.anchorNode && bubble.contains(sel.anchorNode)) return false;
   bubble.innerHTML = renderMd(md);
@@ -2719,65 +2711,28 @@ function upgradeHighlightNow(bubble: HTMLElement): boolean {
   return true;
 }
 
-// Upgrade lazily, once the message nears the viewport. Restoring a long chat
-// otherwise pays for highlighting dozens of messages the reader never scrolls
-// to. rootMargin starts the work before it is actually on screen so the swap
-// isn't visible while scrolling.
-let highlightObserver: IntersectionObserver | null = null;
-// Upgrades are PACED, one per frame, and never run as a batch inside the
-// observer callback. Scrolling up through a restored chat brings several
-// messages into range at once, and each upgrade is a full marked +
-// highlight.js + KaTeX render (measured up to 270ms for one 11 KB message)
-// plus enhanceMermaid — doing them all synchronously stalled the main thread
-// for most of a second per scroll, which felt like scrolling was blocked.
-const highlightQueue: HTMLElement[] = [];
-let highlightPump = 0;
+// Restored messages are upgraded up front, by the restore that created them,
+// rather than lazily as they scroll into view. Deferring it put a full marked +
+// highlight.js + KaTeX render (up to 270ms for one message) on the scroll path,
+// and pacing those one per frame still stalled every frame in a row, so
+// scrolling up through a restored chat felt blocked. It also meant messages
+// changed height under the reader (a mermaid fence becomes an SVG), which is
+// what made scrolling up snap back.
+//
+// The cost is bounded by upgrading only the messages nearest where the reader
+// is put: the tail for an ordinary restore, the head when they expanded the
+// earlier history and were sent to the top. Anything past that stays on the
+// cheap render — in a transcript long enough to reach the cap, those messages
+// are hundreds of messages away from the reader.
+const RESTORE_HIGHLIGHT_CAP = 60;
+const restoredPending: HTMLElement[] = [];
 
-function pumpHighlights() {
-  highlightPump = 0;
-  const el = highlightQueue.shift();
-  if (el) {
-    // Upgrading a message ABOVE the viewport changes its height (a mermaid
-    // fence becomes an SVG), which shifts everything below it and drags the
-    // reader away from what they were looking at. Hold the position across the
-    // swap by re-applying the height delta.
-    const box = el.getBoundingClientRect();
-    const above = box.bottom < scrollEl.getBoundingClientRect().top;
-    const heightBefore = scrollEl.scrollHeight;
-    const topBefore = scrollEl.scrollTop;
-    if (upgradeHighlightNow(el)) {
-      highlightObserver?.unobserve(el);
-      const delta = scrollEl.scrollHeight - heightBefore;
-      if (above && delta !== 0 && !stickToBottom) {
-        scrollEl.scrollTop = topBefore + delta;
-        programmaticTop = scrollEl.scrollTop; // our move, not the user's
-      }
-    }
-    // A deferred upgrade (live selection) is NOT requeued: the element stays
-    // observed, so it comes back on its own without spinning the pump.
-  }
-  if (highlightQueue.length) highlightPump = requestAnimationFrame(pumpHighlights);
-}
-
-function upgradeHighlightWhenVisible(bubble: HTMLElement) {
-  if (typeof IntersectionObserver === "undefined") { upgradeHighlightNow(bubble); return; }
-  highlightObserver ??= new IntersectionObserver(
-    (entries) => {
-      for (const e of entries) {
-        if (!e.isIntersecting) continue;
-        if (!highlightQueue.includes(e.target as HTMLElement)) {
-          highlightQueue.push(e.target as HTMLElement);
-        }
-      }
-      if (highlightQueue.length && !highlightPump) {
-        highlightPump = requestAnimationFrame(pumpHighlights);
-      }
-    },
-    // Tighter margin than before: a wide one pulls in many messages at once,
-    // and with paced upgrades there is no need to run so far ahead.
-    { root: scrollEl, rootMargin: "300px 0px" },
-  );
-  highlightObserver.observe(bubble);
+function flushRestoredHighlights(fromTop: boolean) {
+  const picked = fromTop
+    ? restoredPending.slice(0, RESTORE_HIGHLIGHT_CAP)
+    : restoredPending.slice(-RESTORE_HIGHLIGHT_CAP);
+  restoredPending.length = 0;
+  for (const bubble of picked) upgradeHighlightNow(bubble);
 }
 
 function createBlock(kind: string): ItemBlock {
@@ -2795,11 +2750,9 @@ function createBlock(kind: string): ItemBlock {
       true,
       () => {
         if (!finalized) return;
-        // Restoring a chat finalizes every message at once. Highlighting them
-        // all here measured 753ms for 46 messages (6ms unhighlighted), so defer
-        // it: the cheap render is already on screen, and each message upgrades
-        // when it nears the viewport. A live turn upgrades immediately.
-        if (historyRestoring) { upgradeHighlightWhenVisible(bubble); return; }
+        // A restored message is upgraded by the restore itself, not here: see
+        // flushRestoredHighlights.
+        if (historyRestoring) { restoredPending.push(bubble); return; }
         upgradeHighlightNow(bubble);
       },
     );
