@@ -1315,12 +1315,6 @@ pub async fn interrupt(app: AppHandle, state: State<'_, AppState>, thread_id: St
 }
 
 #[tauri::command]
-pub async fn fork_thread(app: AppHandle, state: State<'_, AppState>, thread_id: String) -> Result<String, String> {
-    let harness = ensure_harness(&state, &app).await?;
-    harness.fork_thread(&thread_id).await.map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 pub async fn list_threads(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -1519,8 +1513,11 @@ pub fn build_carryover(
     Ok(carryover_from_items(&parse_rollout(&text), cap))
 }
 
-/// Pure formatter for `build_carryover` (unit-tested).
-fn carryover_from_items(items: &[serde_json::Value], cap: usize) -> String {
+/// Render the kept turns as one bounded block, newest-first-priority: returns
+/// the body and whether anything older had to be dropped to fit `cap`. Shared by
+/// the provider-switch carryover and a branch's inline digest, which wrap it in
+/// their own framing.
+fn carryover_body(items: &[serde_json::Value], cap: usize) -> (String, bool) {
     // Render each turn to a line, then keep the most recent lines within cap.
     let mut lines: Vec<String> = Vec::new();
     for it in items {
@@ -1558,7 +1555,7 @@ fn carryover_from_items(items: &[serde_json::Value], cap: usize) -> String {
         }
     }
     if lines.is_empty() {
-        return String::new();
+        return (String::new(), false);
     }
     // Keep the most recent lines that fit within cap (measured on the joined body).
     let mut kept: std::collections::VecDeque<String> = std::collections::VecDeque::new();
@@ -1574,12 +1571,201 @@ fn carryover_from_items(items: &[serde_json::Value], cap: usize) -> String {
         kept.push_front(line);
     }
     let body: Vec<String> = kept.into_iter().collect();
+    (body.join("\n"), truncated)
+}
+
+/// Pure formatter for `build_carryover` (unit-tested).
+fn carryover_from_items(items: &[serde_json::Value], cap: usize) -> String {
+    let (body, truncated) = carryover_body(items, cap);
+    if body.is_empty() {
+        return String::new();
+    }
     let head = if truncated {
         "This is the RECENT part of an ongoing conversation (earlier turns omitted), migrated because the provider/model changed. Continue it seamlessly using this context — do not re-introduce yourself, re-run completed steps, or repeat findings already established below."
     } else {
         "This is the conversation so far, migrated because the provider/model changed. Continue it seamlessly using this context — do not re-introduce yourself, re-run completed steps, or repeat findings already established below."
     };
-    format!("<conversation_carryover>\n{head}\n\n{}\n</conversation_carryover>", body.join("\n"))
+    format!("<conversation_carryover>\n{head}\n\n{body}\n</conversation_carryover>")
+}
+
+// ---- branch (fork a chat at one message) ----
+
+/// What a branch needs to carry: the extracted context file, a bounded inline
+/// digest for the branch's first message, and what was in the cut.
+#[derive(Serialize, Default)]
+pub struct BranchContext {
+    /// Path the AGENT reads (container-side in Docker mode).
+    pub path: String,
+    /// Path on the host, for the UI to show and for diagnostics.
+    pub host_path: String,
+    /// Bounded digest of the kept conversation, prepended to the first message
+    /// so the branch has usable context even before it opens the file.
+    pub inline: String,
+    /// How many transcript items the branch keeps.
+    pub items: usize,
+    /// How many upstream compactions the kept range spans. The rollout is
+    /// append-only, so the pre-compaction turns are still on disk and are
+    /// written to the file even though codex's own resume would only replay the
+    /// post-compaction summary.
+    pub compactions: usize,
+}
+
+/// Keep the conversation up to the `ordinal`-th user message (1-based).
+///
+/// `include_reply` extends the cut past that prompt's answer (everything up to
+/// just before the NEXT user message), which is what branching from an answer
+/// means. Everything below the cut is dropped: that is the whole point of a
+/// branch, so the new chat carries the branch point and what came before it and
+/// nothing after.
+fn truncate_at_user(items: &[serde_json::Value], ordinal: usize, include_reply: bool) -> Vec<serde_json::Value> {
+    if ordinal == 0 {
+        return Vec::new();
+    }
+    // Index of every user message, so both the cut point and the next prompt
+    // (the end of the answer) are a lookup rather than a second scan.
+    let users: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| it["type"] == "userMessage")
+        .map(|(i, _)| i)
+        .collect();
+    let Some(&at) = users.get(ordinal - 1) else {
+        // Past the end (a live message not yet on disk): keep everything.
+        return items.to_vec();
+    };
+    let end = if include_reply {
+        users.get(ordinal).copied().unwrap_or(items.len())
+    } else {
+        at + 1
+    };
+    items[..end].to_vec()
+}
+
+/// Render a kept range as the markdown the branch reads. Commands keep their
+/// output (truncated): in a pentest the discovered ports, endpoints and creds
+/// ARE the context. Reasoning is dropped — it is verbose, provider-specific,
+/// and not something the next model should imitate.
+fn branch_markdown(items: &[serde_json::Value], compactions: usize) -> String {
+    let mut out = String::new();
+    out.push_str("# Branch context\n\n");
+    out.push_str(
+        "This is the full conversation up to the point this chat was branched from. \
+         It is the only record of it: the branch starts a fresh thread, so nothing here \
+         is in the model's context until it is read.\n\n",
+    );
+    if compactions > 0 {
+        out.push_str(&format!(
+            "The source conversation was compacted {compactions} time(s) before the branch point. \
+             Everything from before each compaction is included below, recovered from the \
+             on-disk transcript, so no context is missing here even though the original chat \
+             had already dropped it.\n\n",
+        ));
+    }
+    out.push_str("---\n\n");
+    for it in items {
+        match it["type"].as_str() {
+            Some("userMessage") => {
+                let t = it["content"][0]["text"].as_str().unwrap_or("").trim();
+                if !t.is_empty() {
+                    out.push_str(&format!("## User\n\n{t}\n\n"));
+                }
+            }
+            Some("agentMessage") => {
+                let t = it["text"].as_str().unwrap_or("").trim();
+                if !t.is_empty() {
+                    out.push_str(&format!("## Assistant\n\n{t}\n\n"));
+                }
+            }
+            Some("commandExecution") => {
+                let cmd = it["command"].as_str().unwrap_or("").trim();
+                if cmd.is_empty() {
+                    continue;
+                }
+                let code = it["exitCode"].as_i64();
+                let out_short = truncate(it["aggregatedOutput"].as_str().unwrap_or("").trim(), 4_000);
+                out.push_str("### Command\n\n```\n$ ");
+                out.push_str(cmd);
+                if let Some(c) = code {
+                    out.push_str(&format!("\n(exit {c})"));
+                }
+                if !out_short.is_empty() {
+                    out.push('\n');
+                    out.push_str(&out_short);
+                }
+                out.push_str("\n```\n\n");
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The digest prepended to a branch's first message. Framed as a branch, not a
+/// provider migration: the branch is a fresh thread, so without this the model
+/// starts with no idea that any of it happened.
+fn branch_inline(items: &[serde_json::Value], cap: usize) -> String {
+    let (body, truncated) = carryover_body(items, cap);
+    if body.is_empty() {
+        return String::new();
+    }
+    let head = if truncated {
+        "This chat is a BRANCH of an earlier conversation, taken at the last turn below. This digest holds its recent part; the full conversation up to the branch point is in the file named after it. Continue from here — do not re-introduce yourself or redo work already done below."
+    } else {
+        "This chat is a BRANCH of an earlier conversation, taken at the last turn below. Continue from here — do not re-introduce yourself or redo work already done below."
+    };
+    format!("<branch_context>\n{head}\n\n{body}\n</branch_context>")
+}
+
+/// Extract a branch's context: everything up to the branch point, written to a
+/// file the agent can read.
+///
+/// A branch deliberately does NOT use codex's `thread/fork`. Fork copies the
+/// whole thread and offers no way to cut it at a message (verified against
+/// app-server 0.162.1: `thread/fork` ignores unknown params, and `thread/revert`
+/// with `beforeTurnId` leaves the turn list intact), so a forked chat carried
+/// the messages BELOW the branch point as context. The branch gets a fresh
+/// thread instead — which also means it is a normal chat with the current
+/// permission, not a replay of a thread whose stored sandbox may be restrictive.
+#[tauri::command]
+pub async fn branch_context(
+    state: State<'_, AppState>,
+    thread_id: String,
+    user_ordinal: usize,
+    include_reply: bool,
+) -> Result<BranchContext, String> {
+    let home = state.codex_home.clone();
+    // The path the agent is told to read has to be the path IT sees: the
+    // container's in Docker mode, the host's when the agent runs on the host.
+    let docker_mode = { state.settings.lock().await.runtime == "docker" };
+    tokio::task::spawn_blocking(move || {
+        let Some(path) = find_rollout(&home, &thread_id) else {
+            return Ok(BranchContext::default());
+        };
+        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let items = truncate_at_user(&parse_rollout(&text), user_ordinal, include_reply);
+        let compactions = compactions_before(&text, user_ordinal, include_reply);
+        let dir = home.join("notes").join("branches");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let file = dir.join(format!("branch-{stamp}.md"));
+        std::fs::write(&file, branch_markdown(&items, compactions)).map_err(|e| e.to_string())?;
+        Ok(BranchContext {
+            path: if docker_mode {
+                crate::platform::to_container_path(&file)
+            } else {
+                file.to_string_lossy().into_owned()
+            },
+            host_path: file.to_string_lossy().into_owned(),
+            inline: branch_inline(&items, 8_000),
+            items: items.len(),
+            compactions,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Recent OpenCodex request records (from `~/.opencodex/usage.jsonl`), newest
@@ -1816,19 +2002,60 @@ fn list_recents_blocking(root: std::path::PathBuf) -> Result<Vec<RecentChat>, St
     Ok(out)
 }
 
+/// Wrappers codex injects as `user` messages (environment, permissions, skills,
+/// world state). They are not prompts: they must not show in a transcript and
+/// must not be counted when a prompt is named by its position.
+const SKIP_USER_PREFIXES: [&str; 7] = [
+    "<environment_context",
+    "<model_switch",
+    "<permissions",
+    "<skills_instructions",
+    "<user_instructions",
+    "<world_state",
+    "<worldstate",
+];
+
+/// Is this `user`-role content an actual prompt rather than an injected wrapper?
+fn is_real_user_text(content: &str) -> bool {
+    let t = content.trim_start();
+    !t.is_empty() && !SKIP_USER_PREFIXES.iter().any(|p| t.starts_with(p))
+}
+
+/// How many compactions the kept range spans, i.e. those recorded BEFORE the
+/// branch point. Counted on the raw lines because `parse_rollout` drops the
+/// `compacted` records — which is exactly why the pre-compaction turns survive
+/// into a branch at all. Counting them is what lets the branch say so.
+fn compactions_before(text: &str, ordinal: usize, include_reply: bool) -> usize {
+    // The cut ends at the ordinal-th prompt, or just before the next one when
+    // the answer is kept too.
+    let stop_at = if include_reply { ordinal + 1 } else { ordinal };
+    let mut prompts = 0usize;
+    let mut compactions = 0usize;
+    for line in text.lines() {
+        let Ok(o) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue };
+        if o.get("type").and_then(|v| v.as_str()) == Some("compacted") {
+            compactions += 1;
+            continue;
+        }
+        let pay = o.get("payload").filter(|p| p.is_object()).unwrap_or(&o);
+        if pay.get("type").and_then(|v| v.as_str()) != Some("message")
+            || pay.get("role").and_then(|v| v.as_str()) != Some("user")
+        {
+            continue;
+        }
+        if is_real_user_text(&collect_text(pay.get("content"))) {
+            prompts += 1;
+            if prompts >= stop_at {
+                break;
+            }
+        }
+    }
+    compactions
+}
+
 fn parse_rollout(text: &str) -> Vec<serde_json::Value> {
     use serde_json::{json, Value};
     use std::collections::{HashMap, VecDeque};
-
-    const SKIP_USER_PREFIXES: [&str; 7] = [
-        "<environment_context",
-        "<model_switch",
-        "<permissions",
-        "<skills_instructions",
-        "<user_instructions",
-        "<world_state",
-        "<worldstate",
-    ];
 
     let mut items: Vec<Value> = Vec::new();
     let mut pending: HashMap<String, VecDeque<usize>> = HashMap::new();
@@ -1853,8 +2080,7 @@ fn parse_rollout(text: &str) -> Vec<serde_json::Value> {
                     continue;
                 }
                 if role == "user" {
-                    let t = content.trim_start();
-                    if SKIP_USER_PREFIXES.iter().any(|p| t.starts_with(p)) {
+                    if !is_real_user_text(&content) {
                         continue;
                     }
                     items.push(json!({"type":"userMessage","id":format!("t{idx}"),"content":[{"type":"text","text":content}]}));
@@ -3062,6 +3288,92 @@ mod transcript_tests {
         for bad in ["", "   ", "anthropic; rm -rf /", "an thropic", "a/b", "$(id)", "../etc", &"x".repeat(41)] {
             assert!(safe_provider_name(bad).is_none(), "{bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn branch_cut_keeps_only_the_branch_point_and_what_came_before() {
+        let items = parse_rollout(
+            &[
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first"}]}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer one"}]}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"second"}]}}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"id\"}"}}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: x\nProcess exited with code 0\nOutput:\nroot\n"}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer two"}]}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"third"}]}}"#,
+            ]
+            .join("\n"),
+        );
+        // Branching from the SECOND prompt keeps it and drops its answer.
+        let at_prompt = truncate_at_user(&items, 2, false);
+        let types: Vec<&str> = at_prompt.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["userMessage", "agentMessage", "userMessage"]);
+        assert_eq!(at_prompt.last().unwrap()["content"][0]["text"], "second");
+
+        // Branching from that prompt's ANSWER keeps the whole turn (command
+        // included) and still drops the next prompt.
+        let at_answer = truncate_at_user(&items, 2, true);
+        let types: Vec<&str> = at_answer.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            ["userMessage", "agentMessage", "userMessage", "commandExecution", "agentMessage"]
+        );
+        assert_eq!(at_answer.last().unwrap()["text"], "answer two");
+
+        // Out of range (a live message not yet on disk) keeps everything, and
+        // ordinal 0 is not a branch point at all.
+        assert_eq!(truncate_at_user(&items, 9, true).len(), items.len());
+        assert!(truncate_at_user(&items, 0, true).is_empty());
+    }
+
+    #[test]
+    fn compactions_are_counted_only_up_to_the_branch_point() {
+        let user = |t: &str| format!(r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{t}"}}]}}}}"#);
+        let text = [
+            user("one"),
+            r#"{"type":"compacted","payload":{"message":"summary"}}"#.to_string(),
+            user("two"),
+            user("<environment_context>\n cwd </environment_context>"),
+            r#"{"type":"compacted","payload":{"message":"summary"}}"#.to_string(),
+            user("three"),
+        ]
+        .join("\n");
+        // Branching at the first prompt is before either compaction.
+        assert_eq!(compactions_before(&text, 1, false), 0);
+        // Keeping the first answer runs up to the second prompt, past the first
+        // compaction.
+        assert_eq!(compactions_before(&text, 1, true), 1);
+        assert_eq!(compactions_before(&text, 2, false), 1);
+        // The injected <environment_context> wrapper is not a prompt, so the
+        // third prompt is the one after the second compaction.
+        assert_eq!(compactions_before(&text, 3, false), 2);
+        // The same enumeration the cut uses: three prompts, not four.
+        let items = parse_rollout(&text);
+        assert_eq!(items.iter().filter(|i| i["type"] == "userMessage").count(), 3);
+    }
+
+    #[test]
+    fn branch_markdown_carries_messages_commands_and_a_compaction_notice() {
+        let items = parse_rollout(
+            &[
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"scan the host"}]}}"#,
+                r#"{"type":"response_item","payload":{"type":"reasoning","content":[{"type":"reasoning_text","text":"internal"}]}}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"nmap -p- 10.0.0.1\"}"}}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: x\nProcess exited with code 0\nOutput:\n22/tcp open ssh\n"}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"port 22 is open"}]}}"#,
+            ]
+            .join("\n"),
+        );
+        let md = branch_markdown(&items, 2);
+        assert!(md.contains("## User\n\nscan the host"));
+        assert!(md.contains("## Assistant\n\nport 22 is open"));
+        assert!(md.contains("$ nmap -p- 10.0.0.1"));
+        assert!(md.contains("22/tcp open ssh"));
+        assert!(md.contains("compacted 2 time(s)"));
+        // Reasoning is deliberately left out.
+        assert!(!md.contains("internal"));
+        // With no compaction there is no notice to explain.
+        assert!(!branch_markdown(&items, 0).contains("compacted"));
     }
 
     #[test]

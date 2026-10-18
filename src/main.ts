@@ -136,6 +136,16 @@ type ItemBlock = {
   appendDelta?: (s: string) => void;
 };
 
+// What `branch_context` extracted for a branch: the file the agent can read,
+// a bounded digest to prepend to the first message, and what the cut spans.
+interface BranchContext {
+  path: string;
+  host_path: string;
+  inline: string;
+  items: number;
+  compactions: number;
+}
+
 interface Session {
   id: string;
   title: string;
@@ -166,6 +176,13 @@ interface Session {
   escalation: number;
   recency: number;
   queue: string[];
+  // How many user messages this conversation has, counting the ones scrolled
+  // off the top and any that were never rendered. Every rendered user message
+  // is tagged with its number, which is how a branch names its cut point to the
+  // backend (which counts the same prompts out of the rollout).
+  userOrdinal?: number;
+  // Set on a branch until its first message carries the extracted context.
+  branchContext?: BranchContext;
   cmdSig?: string;
   cmdRepeat?: number;
   // Per-turn: did the model emit ANY output (text, reasoning, or a command)?
@@ -1051,6 +1068,7 @@ function itemText(content: any): string {
 
 function renderHistory(session: Session, thread: any) {
   const turns = thread?.turns ?? [];
+  session.userOrdinal = 0; // this path renders the whole thread
   historyRestoring = true; // restored blocks paint instantly, not animated
   try {
     for (const turn of turns) {
@@ -1096,6 +1114,15 @@ function renderTranscript(session: Session, items: any[], full = false, meta?: T
   // so up-arrow recall still reaches prompts scrolled off the top.
   session.sentHistory = meta?.prompts ? meta.prompts.slice() : [];
   const trackHistory = !meta?.prompts;
+  // Number the rendered user messages from where they actually sit in the whole
+  // conversation, not from 1: the view starts at a tail, and a branch's cut
+  // point is named to the backend by that absolute number. `prompts` is the
+  // full prompt list even when only the tail of the transcript was fetched, so
+  // it gives the count of the ones not rendered here.
+  const renderedUsers = items.slice(start).filter((i) => i?.type === "userMessage").length;
+  session.userOrdinal = meta?.prompts
+    ? Math.max(0, meta.prompts.length - renderedUsers)
+    : items.slice(0, start).filter((i) => i?.type === "userMessage").length;
   historyRestoring = true;
   try {
     if (earlier > 0) {
@@ -1803,6 +1830,21 @@ async function onSend() {
   ensureThinking(session);
 
   try {
+    // A branch's first message carries the conversation it was cut from: the
+    // branch is a fresh thread, so this is the only thing that tells the model
+    // any of it happened. Consumed once — later messages are ordinary.
+    if (session.branchContext) {
+      const bc = session.branchContext;
+      session.branchContext = undefined;
+      const parts: string[] = [];
+      if (bc.inline) parts.push(bc.inline);
+      if (bc.path) {
+        parts.push(`The full conversation up to the branch point, with command output, is in ${bc.path}. Read it when you need more than the digest above.`);
+      }
+      if (parts.length) {
+        fullText = `${parts.join("\n\n")}\n\n---\nContinue with this next request:\n\n${fullText}`;
+      }
+    }
     // All composer providers route through the same OpenCodex proxy backend, so
     // switching among them (OpenRouter ↔ Vercel ↔ OpenCodex) is just a per-turn
     // model change on the same thread — no new thread needed. A new thread with
@@ -1966,6 +2008,11 @@ async function stopRun() {
 
 function addUserMessage(session: Session, text: string, atts: { name: string; isImage: boolean }[] = [], steer = false) {
   const m = el("div", "msg user");
+  // Counted here rather than from the DOM: a steer is a user message in the
+  // rollout but never enters `sentHistory`, so counting prompt history would
+  // drift from what the backend sees.
+  session.userOrdinal = (session.userOrdinal ?? 0) + 1;
+  m.dataset.uord = String(session.userOrdinal);
   const bubble = el("div", "bubble" + (steer ? " steer" : ""), escapeHtml(text));
   bubble.dataset.copy = text;
   if (steer) bubble.prepend(Object.assign(el("span", "steer-tag", "↪ steer"), {}));
@@ -2003,7 +2050,7 @@ function addMsgActions(session: Session, msgEl: HTMLElement, bubble: HTMLElement
   }
   mk("⑃ Branch", (b) => {
     if (!session.threadId) { flash(b, "Send first"); return; }
-    branchSession(session);
+    branchSession(session, msgEl, isAssistant, b);
   });
   if (isAssistant) {
     // Tag this answer with the turn's time window + selection so Info can pull
@@ -2216,28 +2263,91 @@ async function regenerate(session: Session) {
   }
 }
 
-async function branchSession(session: Session) {
+async function branchSession(session: Session, msgEl: HTMLElement, isAssistant: boolean, btn?: HTMLButtonElement) {
   if (!session.threadId) return addError(session, "Send a message before branching.");
+  // Which prompt is the cut point. For an answer it is the prompt that asked
+  // for it, with the answer kept (`include_reply`); for a prompt it is itself,
+  // and its answer is dropped — branching from a prompt means asking it again
+  // differently.
+  const ordinal = branchOrdinal(session, msgEl);
+  if (!ordinal) {
+    if (btn) flash(btn, "No branch point");
+    return;
+  }
   try {
-    const newId = await invoke<string>("fork_thread", { threadId: session.threadId });
+    const bc = await invoke<BranchContext>("branch_context", {
+      threadId: session.threadId,
+      userOrdinal: ordinal,
+      includeReply: isAssistant,
+    });
     const ns = makeSession();
     ns.title = session.title.replace(/ \(branch\)$/, "") + " (branch)";
     ns.workingDir = session.workingDir;
-    ns.threadId = newId;
+    // A FRESH thread, not a codex fork. Forking copies the whole thread with no
+    // way to cut it at a message, so a forked chat carried the messages below
+    // the branch point as context — the thing a branch exists to avoid. The
+    // context comes from the extracted file instead, and because this is an
+    // ordinary new chat it runs with the current permission rather than
+    // whatever sandbox the old thread was stored with.
+    ns.threadId = null;
     ns.started = true;
-    ns.lastText = session.lastText;
-    ns.lastImages = session.lastImages;
-    // Clone the current transcript for visual continuity (static snapshot).
-    ns.turnsEl.innerHTML = session.turnsEl.innerHTML;
-    ns.turnsEl.querySelectorAll(".msg-actions").forEach((r) => r.remove());
+    ns.branchContext = bc.inline || bc.path ? bc : undefined;
+    // Show the conversation up to the cut and nothing after it.
+    ns.turnsEl.innerHTML = "";
+    for (const node of Array.from(session.turnsEl.children)) {
+      const copy = node.cloneNode(true) as HTMLElement;
+      // A clone carries no event listeners, so the buttons that came with it
+      // are dead. Drop them and give each inherited message a working Copy;
+      // the rest (Edit, Try again, Branch) act on a thread this chat does not
+      // have, so they are deliberately not offered on inherited messages.
+      copy.querySelectorAll(".msg-actions, .code-copy").forEach((r) => r.remove());
+      // The inherited numbering belongs to the source conversation; this chat
+      // numbers its own prompts from 1, so leaving it on would let a later
+      // branch cut at a prompt that is not in this thread's transcript.
+      delete copy.dataset.uord;
+      const bubble = copy.querySelector<HTMLElement>(".bubble");
+      if (copy.classList.contains("msg") && bubble) {
+        const row = el("div", "msg-actions");
+        const b = el("button", "msg-act", "⧉ Copy");
+        b.onclick = () => copyWithFeedback(bubble.dataset.copy ?? bubble.innerText, b);
+        row.appendChild(b);
+        copy.appendChild(row);
+      }
+      ns.turnsEl.appendChild(copy);
+      if (node === msgEl) break;
+    }
+    // The branch's own prompts start at 1: its transcript is its own, so that is
+    // what a branch OF this branch has to count against.
+    ns.userOrdinal = 0;
+    ns.sentHistory = session.sentHistory.slice(0, ordinal);
+    ns.lastText = ns.sentHistory[ns.sentHistory.length - 1] ?? session.lastText;
+    ns.lastImages = [];
     state.sessions.push(ns);
     selectSession(ns.id);
+    addAutoNoteText(ns, bc.path
+      ? `⑃ Branched at message ${ordinal}. The conversation up to here was written to ${bc.path}${bc.compactions > 0 ? ` (including ${bc.compactions} compaction${bc.compactions > 1 ? "s" : ""} the original chat had already dropped)` : ""} — the first message you send carries it.`
+      : `⑃ Branched at message ${ordinal}. No transcript was found on disk, so this chat starts without the earlier context.`);
     const dom = sessionItemEl(ns.id);
     if (dom) { dom.classList.add("item-enter"); setTimeout(() => dom.classList.remove("item-enter"), 220); }
   } catch (e) {
     addError(session, "Branch failed: " + String(e));
   }
 }
+
+// The absolute number of the prompt a branch cuts at: the clicked element's own
+// tag, else the nearest tagged element above it, else the prompt before the
+// first one still on screen (the view starts mid-turn, so what produced this
+// answer scrolled off the top).
+function branchOrdinal(session: Session, msgEl: HTMLElement): number {
+  for (let node: Element | null = msgEl; node; node = node.previousElementSibling) {
+    const uord = (node as HTMLElement).dataset?.uord;
+    if (uord) return Number(uord) || 0;
+  }
+  const first = session.turnsEl.querySelector<HTMLElement>("[data-uord]");
+  const n = Number(first?.dataset.uord ?? 0) - 1;
+  return n > 0 ? n : 0;
+}
+
 // Show which model Auto is using. Only prints when it actually CHANGES from the
 // previous turn (so it reads as a switch, not repeated noise). Memory is kept —
 // switching is a per-turn model override on the same thread.
@@ -2576,6 +2686,14 @@ function ensureBlock(session: Session, id: string, kind: string): ItemBlock {
   if (b) return b;
   b = createBlock(kind);
   session.blocks.set(id, b);
+  // Which prompt this block belongs to. Every block carries it, not just the
+  // user messages: a tool-heavy turn can fill the whole rendered tail, so an
+  // answer often has NO prompt above it on screen (measured on this machine:
+  // 2 of the 8 most recent chats render no prompt at all in their last 60
+  // items). Walking up for one found nothing and Branch refused with "no
+  // branch point". The counter is the off-screen prompt count until the first
+  // visible prompt arrives, which is exactly the prompt those items came from.
+  if ((session.userOrdinal ?? 0) > 0) b.root.dataset.uord = String(session.userOrdinal);
   session.turnsEl.appendChild(b.root);
   if (kind === "agentMessage") {
     // The model has switched from thinking to answering: fold any live reasoning

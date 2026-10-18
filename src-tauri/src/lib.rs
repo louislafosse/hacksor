@@ -73,7 +73,7 @@ pub fn run() {
             commands::start_chat,
             commands::send_message,
             commands::interrupt,
-            commands::fork_thread,
+            commands::branch_context,
             commands::list_threads,
             commands::resume_thread,
             commands::read_transcript,

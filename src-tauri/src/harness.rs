@@ -407,8 +407,8 @@ impl Harness {
     }
 
     pub async fn start_thread(&self, params: StartParams) -> Result<String> {
-        // Non-ephemeral so history persists locally, which enables branch (fork)
-        // and try-again (rollback).
+        // Non-ephemeral so history persists locally: the on-disk rollout is the
+        // record a restored chat renders and a branch extracts its context from.
         let mut p = json!({
             "model": params.model_slug,
             "modelProvider": params.provider.codex_provider_id(),
@@ -517,19 +517,6 @@ impl Harness {
         Ok(res.get("thread").cloned().unwrap_or(Value::Null))
     }
 
-    /// Branch: fork the thread into a new thread id with copied history.
-    pub async fn fork_thread(&self, thread_id: &str) -> Result<String> {
-        let res = self
-            .request("thread/fork", json!({ "threadId": thread_id }))
-            .await
-            .map_err(|e| anyhow!(e))?;
-        res.get("thread")
-            .and_then(|t| t.get("id"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("thread/fork returned no thread id"))
-    }
-
     /// Try again: drop the last turn, then re-submit the given input.
     pub async fn regenerate(
         &self,
@@ -545,8 +532,13 @@ impl Harness {
             .request("thread/resume", json!({ "threadId": thread_id }))
             .await;
         // Best-effort rollback of the last `num_turns` turns (1 for a plain retry,
-        // more for edit-and-resend of an earlier message); if there is no history
-        // yet the resubmission simply appends a new turn.
+        // more for edit-and-resend of an earlier message).
+        //
+        // NOTE: app-server 0.162.1 has no `thread/rollback` — it rejects the
+        // method outright ("unknown variant"), so this is a no-op there and the
+        // resubmission just appends a new turn. The replacement is
+        // `thread/revert` with a `beforeTurnId`, which needs the turn id the UI
+        // does not currently track.
         let _ = self
             .request("thread/rollback", json!({ "threadId": thread_id, "numTurns": num_turns }))
             .await;
