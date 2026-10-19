@@ -1,3 +1,11 @@
+# [1.9.0](https://github.com/louislafosse/hacksor/compare/v1.8.0...v1.9.0) (2026-10-19)
+
+
+### Features
+
+* **prompts:** pick the right HTTP client, and reach for an enum tool first ([7e32e9f](https://github.com/louislafosse/hacksor/commit/7e32e9f1923b89495eb961b96b5520134d0f9511))
+* **runtime:** add curl_cffi for browser-matching TLS fingerprints ([50d56c3](https://github.com/louislafosse/hacksor/commit/50d56c3401831a8de9428240e960914a925ee7f5))
+
 # [1.8.0](https://github.com/louislafosse/hacksor/compare/v1.7.0...v1.8.0) (2026-10-19)
 
 
