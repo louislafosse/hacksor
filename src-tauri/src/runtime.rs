@@ -162,6 +162,50 @@ pub async fn image_exists(name: &str) -> bool {
     }
 }
 
+/// The manifest digest the registry currently serves for `image` on THIS host's
+/// architecture.
+///
+/// Read with `docker manifest inspect --verbose`, which returns the same shape
+/// for a multi-arch index (an array, one entry per platform) and for a plain
+/// manifest (a single object), so both are handled without guessing which the
+/// registry published. `None` means the question could not be answered at all
+/// (offline, registry down, no such tag) — never "up to date", because a failed
+/// check must not look like a fresh image.
+pub async fn remote_digest(image: &str) -> Option<String> {
+    let want_arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    };
+    let (out, code) = docker_cli(&["manifest", "inspect", "--verbose", image], None).await.ok()?;
+    if code != 0 {
+        return None;
+    }
+    pick_platform_digest(&out, want_arch)
+}
+
+/// Pull this architecture's digest out of `docker manifest inspect --verbose`
+/// output. Separated from the command so the platform selection is testable:
+/// picking the wrong architecture would make every start think the image is
+/// stale and re-download 19 GB.
+fn pick_platform_digest(json: &str, want_arch: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let entries: Vec<&serde_json::Value> = match v.as_array() {
+        Some(a) => a.iter().collect(),
+        None => vec![&v],
+    };
+    // Prefer this architecture; a single-platform tag has no platform block, so
+    // fall back to the only entry there is.
+    let pick = entries
+        .iter()
+        .find(|e| {
+            let p = &e["Descriptor"]["platform"];
+            p["architecture"] == want_arch && (p["os"] == "linux" || p["os"].is_null())
+        })
+        .or_else(|| entries.first())?;
+    pick["Descriptor"]["digest"].as_str().map(|s| s.to_string())
+}
+
 /// Is a container with this name currently running?
 pub async fn container_running(name: &str) -> bool {
     let Ok(d) = connect().await else { return false };
@@ -434,6 +478,31 @@ pub fn tun_present() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn platform_digest_picks_this_architecture() {
+        // Verbatim shape of `docker manifest inspect --verbose` for the real
+        // multi-arch runtime tag (trimmed to the fields that are read).
+        let index = r#"[
+          {"Ref":"ghcr.io/x/y:latest","Descriptor":{"digest":"sha256:aaa","platform":{"architecture":"amd64","os":"linux"}}},
+          {"Ref":"ghcr.io/x/y:latest","Descriptor":{"digest":"sha256:bbb","platform":{"architecture":"arm64","os":"linux"}}}
+        ]"#;
+        assert_eq!(pick_platform_digest(index, "arm64").as_deref(), Some("sha256:bbb"));
+        assert_eq!(pick_platform_digest(index, "amd64").as_deref(), Some("sha256:aaa"));
+        // An architecture that is not published falls back to the first entry
+        // rather than returning nothing, so the check still has a baseline.
+        assert_eq!(pick_platform_digest(index, "riscv64").as_deref(), Some("sha256:aaa"));
+
+        // A single-platform tag comes back as one object, with no platform block.
+        let single = r#"{"Ref":"ghcr.io/x/y:latest","Descriptor":{"digest":"sha256:ccc"}}"#;
+        assert_eq!(pick_platform_digest(single, "arm64").as_deref(), Some("sha256:ccc"));
+
+        // Garbage must answer None, never a guess: a wrong digest here would
+        // re-download the whole image on every start.
+        for junk in ["", "not json", "[]", "{}", "null"] {
+            assert_eq!(pick_platform_digest(junk, "arm64"), None, "{junk}");
+        }
+    }
 
     // Live integration check against the real Docker engine. Ignored by default
     // (needs Docker + the runtime image); run with:

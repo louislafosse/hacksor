@@ -117,6 +117,8 @@ pub fn run() {
             commands::ack_version,
             commands::current_release_notes,
             commands::open_release_page,
+            commands::runtime_image_check,
+            commands::pull_runtime_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while running Hacksor")

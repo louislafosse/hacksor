@@ -2469,7 +2469,7 @@ const RUNTIME_REGISTRY_IMAGE: &str = match option_env!("HACKSOR_RUNTIME_IMAGE") 
 /// (percent + human bytes), then tag it locally as `RUNTIME_IMAGE` so the rest of
 /// the code finds it. Cross-platform: bollard talks the Docker socket on
 /// Linux/macOS and the named pipe on Windows.
-async fn pull_runtime_image(app: &AppHandle) -> Result<(), String> {
+async fn pull_runtime_image(app: &AppHandle, codex_home: &std::path::Path) -> Result<(), String> {
     let image = RUNTIME_REGISTRY_IMAGE;
     let _ = app.emit("hacksor://runtime", serde_json::json!({
         "phase": "pulling", "percent": 0, "message": "Preparing to download the runtime…"
@@ -2488,10 +2488,86 @@ async fn pull_runtime_image(app: &AppHandle) -> Result<(), String> {
     // Tag the pulled image as the local name the runtime code expects.
     let (repo, tag) = RUNTIME_IMAGE.split_once(':').unwrap_or((RUNTIME_IMAGE, "latest"));
     runtime::tag(image, repo, tag).await?;
+    // Remember WHICH manifest this is, so a later start can tell whether the
+    // registry has moved on. Comparing Docker's own digests is not reliable
+    // here: a locally built image and a pulled one do not describe their
+    // content the same way, so the pulled digest is recorded explicitly.
+    if let Some(d) = runtime::remote_digest(image).await {
+        record_runtime_digest(codex_home, &d);
+    }
     let _ = app.emit("hacksor://runtime", serde_json::json!({
         "phase": "pulling", "percent": 100, "message": "Runtime downloaded."
     }));
     Ok(())
+}
+
+/// Where the digest of the runtime image we pulled is remembered.
+fn runtime_digest_file(codex_home: &std::path::Path) -> std::path::PathBuf {
+    codex_home.join("runtime-image.json")
+}
+
+fn record_runtime_digest(codex_home: &std::path::Path, digest: &str) {
+    let body = serde_json::json!({
+        "image": RUNTIME_REGISTRY_IMAGE,
+        "digest": digest,
+        "pulled_at": chrono::Utc::now().to_rfc3339(),
+    });
+    let _ = std::fs::write(runtime_digest_file(codex_home), body.to_string());
+}
+
+fn recorded_runtime_digest(codex_home: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(runtime_digest_file(codex_home)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    // Only trust the record if it is about the image this build actually uses.
+    if v["image"].as_str().unwrap_or_default() != RUNTIME_REGISTRY_IMAGE {
+        return None;
+    }
+    v["digest"].as_str().map(|s| s.to_string())
+}
+
+/// Freshness of the local runtime image against the registry.
+#[derive(Serialize, Default)]
+pub struct RuntimeImageStatus {
+    /// The registry image this build pulls from, empty when it always builds.
+    pub image: String,
+    /// Digest of the manifest we pulled, empty when never pulled by this app.
+    pub local: String,
+    /// What the registry serves now, empty when the check could not run.
+    pub remote: String,
+    pub up_to_date: bool,
+    /// True when a pull would bring something newer (or the local image was not
+    /// pulled by us, so its contents are unknown).
+    pub update_available: bool,
+    pub error: String,
+}
+
+/// Compare the local runtime image with the registry.
+///
+/// An unanswerable check (offline, registry down) reports the error and claims
+/// NOTHING: the caller must not read it as either fresh or stale.
+async fn runtime_image_status(codex_home: &std::path::Path) -> RuntimeImageStatus {
+    let mut out = RuntimeImageStatus {
+        image: RUNTIME_REGISTRY_IMAGE.to_string(),
+        local: recorded_runtime_digest(codex_home).unwrap_or_default(),
+        ..Default::default()
+    };
+    if RUNTIME_REGISTRY_IMAGE.is_empty() {
+        out.up_to_date = true; // this build always builds locally; nothing to compare
+        return out;
+    }
+    if !runtime_image_exists().await {
+        out.update_available = true; // nothing local at all
+        return out;
+    }
+    match runtime::remote_digest(RUNTIME_REGISTRY_IMAGE).await {
+        Some(remote) => {
+            out.update_available = out.local.is_empty() || out.local != remote;
+            out.up_to_date = !out.update_available;
+            out.remote = remote;
+        }
+        None => out.error = "could not read the registry manifest".into(),
+    }
+    out
 }
 
 /// Ensure the runtime image exists locally: pull the prebuilt image with a
@@ -2499,7 +2575,7 @@ async fn pull_runtime_image(app: &AppHandle) -> Result<(), String> {
 /// (Progress is emitted on `hacksor://runtime`.)
 async fn provision_runtime_image(state: &State<'_, AppState>, app: &AppHandle) -> Result<(), String> {
     if !RUNTIME_REGISTRY_IMAGE.is_empty() {
-        match pull_runtime_image(app).await {
+        match pull_runtime_image(app, &state.codex_home).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 // Registry unreachable / image missing — fall back to a local build.
@@ -2646,6 +2722,24 @@ pub fn save_persona(state: State<'_, AppState>, content: String) -> Result<(), S
     Ok(())
 }
 
+/// Is the local runtime image the one the registry serves? For Settings.
+#[tauri::command]
+pub async fn runtime_image_check(state: State<'_, AppState>) -> Result<RuntimeImageStatus, String> {
+    Ok(runtime_image_status(&state.codex_home).await)
+}
+
+/// Pull the newest runtime image on demand and drop the old container so the
+/// next start uses it.
+#[tauri::command]
+pub async fn pull_runtime_update(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+    if RUNTIME_REGISTRY_IMAGE.is_empty() {
+        return Err("This build has no registry image configured; it builds the runtime locally.".into());
+    }
+    pull_runtime_image(&app, &state.codex_home).await?;
+    runtime::remove_container(RUNTIME_CONTAINER).await;
+    Ok(())
+}
+
 /// Rebuild the runtime image from the (possibly customized) Dockerfile, then
 /// restart the container so the new image is used. Progress on `hacksor://runtime`.
 #[tauri::command]
@@ -2694,6 +2788,49 @@ async fn ensure_runtime_ready(state: &State<'_, AppState>, app: &AppHandle) -> R
     }
     if !runtime_image_exists().await {
         provision_runtime_image(state, app).await?;
+    } else {
+        // The image exists, but the registry may have moved on. Hacksor used to
+        // check existence ONLY, so anyone holding an old image silently kept it
+        // forever and missed every runtime fix.
+        //
+        // The refresh runs in the BACKGROUND and the session continues on the
+        // image already present. Pulling here would be a correctness bug of its
+        // own: the image is ~19 GB and measured 1.5 MB/s from GHCR on this
+        // machine, so awaiting it would hold the first chat hostage for hours
+        // over an image that merely has a newer build of the same tools. The
+        // new one is adopted when the container is next recreated (quit and
+        // relaunch), which is also the only moment it can be swapped safely:
+        // the running container cannot change image underneath a live turn.
+        //
+        // Failure is not staleness: an unanswerable check (offline, registry
+        // down) leaves the working image alone and says nothing.
+        let home = state.codex_home.clone();
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let st = runtime_image_status(&home).await;
+            if !st.update_available || !st.error.is_empty() {
+                return;
+            }
+            let _ = app2.emit("hacksor://runtime", serde_json::json!({
+                "phase": "pulling", "percent": 0,
+                "message": "A newer runtime image is available — downloading it in the background…"
+            }));
+            match pull_runtime_image(&app2, &home).await {
+                Ok(()) => {
+                    let _ = app2.emit("hacksor://runtime", serde_json::json!({
+                        "phase": "ready",
+                        "message": "Newer runtime image downloaded — it is used next time you start Hacksor."
+                    }));
+                }
+                Err(e) => {
+                    // Keep the working image; just say why the refresh failed.
+                    let _ = app2.emit("hacksor://runtime", serde_json::json!({
+                        "phase": "ready",
+                        "message": format!("Could not download the newer runtime image ({e}); continuing with the current one.")
+                    }));
+                }
+            }
+        });
     }
     let _ = app.emit("hacksor://runtime", serde_json::json!({ "phase": "starting", "message": "Starting runtime container…" }));
     // On-demand (default): don't pre-start the heavy proxy/browser — the agent's

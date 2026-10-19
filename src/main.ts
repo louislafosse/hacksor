@@ -3376,6 +3376,11 @@ function openSettings(force = false) {
             <option value="host" ${state.runtime !== "docker" ? "selected" : ""}>Host (requires codex installed)</option>
             <option value="docker" ${state.runtime === "docker" ? "selected" : ""}>Docker (bundled — full toolset; needs only Docker)</option>
           </select>
+          <div class="row" style="margin-top:8px">
+            <input id="s-img" value="Runtime image" readonly />
+            <button id="s-img-pull" class="ghost">Pull latest</button>
+          </div>
+          <p id="s-img-note" style="margin:6px 0 0;opacity:.8"></p>
           <p style="margin:6px 0 0">Docker mode bundles the whole hacking environment (nmap, nuclei, sqlmap, mitmproxy, wordlists…). Everything — image build, container, proxy, and vuln-intel updates — happens automatically on your first message; it's torn down when you quit.</p>
         </div>
         <div class="field">
@@ -3642,6 +3647,51 @@ function openSettings(force = false) {
     const rn = await invoke<ReleaseNotes>("current_release_notes").catch(() => null);
     if (rn && rn.notes.trim()) openReleaseNotes(`What's new in ${rn.version}`, "", rn.notes);
     else openReleaseNotes("Release notes", "", "No notes are bundled with this build (a local build between releases).");
+  });
+
+  // Runtime image freshness. Hacksor pulls a newer image automatically on
+  // startup; this is the manual lever and the explanation.
+  const imgEl = bg.querySelector("#s-img") as HTMLInputElement;
+  const imgNote = bg.querySelector("#s-img-note") as HTMLElement;
+  const imgBtn = bg.querySelector("#s-img-pull") as HTMLButtonElement;
+  interface RuntimeImageStatus {
+    image: string; local: string; remote: string;
+    up_to_date: boolean; update_available: boolean; error: string;
+  }
+  const short = (d: string) => (d.startsWith("sha256:") ? d.slice(7, 19) : d.slice(0, 12));
+  const refreshImg = async () => {
+    imgNote.textContent = "Checking the registry…";
+    const st = await invoke<RuntimeImageStatus>("runtime_image_check").catch(() => null);
+    if (!st) { imgNote.textContent = "Could not check the runtime image."; return; }
+    imgEl.value = st.image || "Runtime image (built locally)";
+    imgBtn.hidden = !st.image;
+    if (st.error) {
+      imgNote.textContent = `Could not check for a newer image: ${st.error}. The image you have keeps working.`;
+    } else if (!st.image) {
+      imgNote.textContent = "This build has no prebuilt image configured, so the runtime is built from the Dockerfile.";
+    } else if (st.update_available) {
+      imgNote.textContent = st.local
+        ? `A newer image is available (${short(st.remote)}, you have ${short(st.local)}). Hacksor downloads it in the background and uses it next time you start.`
+        : `Your image was not pulled by Hacksor, so its contents are unknown. ${short(st.remote)} is downloading in the background, or pull it now.`;
+    } else {
+      imgNote.textContent = `Up to date (${short(st.local)}).`;
+    }
+  };
+  refreshImg();
+  imgBtn.addEventListener("click", async () => {
+    const label = imgBtn.textContent;
+    imgBtn.textContent = "Pulling… (watch the banner)";
+    imgBtn.disabled = true;
+    try {
+      await invoke("pull_runtime_update");
+      imgNote.textContent = "Downloaded. Quit and relaunch Hacksor to run on it.";
+    } catch (e) {
+      imgNote.textContent = String(e);
+    } finally {
+      imgBtn.textContent = label;
+      imgBtn.disabled = false;
+      refreshImg();
+    }
   });
 
   const rtStatusEl = bg.querySelector("#s-rt-status") as HTMLElement;
