@@ -17,6 +17,9 @@ pub struct Settings {
     /// Cheaper Inference (OpenAI-compatible Responses gateway) API key.
     #[serde(default)]
     pub cheaper_inference_api_key: Option<String>,
+    /// abliteration.ai API key (`Authorization: Bearer <key>`).
+    #[serde(default)]
+    pub abliteration_api_key: Option<String>,
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default)]
@@ -82,6 +85,7 @@ impl Default for Settings {
             openrouter_api_key: None,
             vercel_api_key: None,
             cheaper_inference_api_key: None,
+            abliteration_api_key: None,
             provider: default_provider(),
             personality: None,
             custom_instructions: None,
@@ -111,6 +115,7 @@ impl Settings {
             Provider::OpenRouter => self.openrouter_api_key.as_deref(),
             Provider::Vercel => self.vercel_api_key.as_deref(),
             Provider::CheaperInference => self.cheaper_inference_api_key.as_deref(),
+            Provider::Abliteration => self.abliteration_api_key.as_deref(),
             // OpenCodex is a local proxy; keys live in its own config.
             Provider::OpenCodex => None,
         }

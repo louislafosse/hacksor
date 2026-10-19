@@ -1002,6 +1002,7 @@ pub struct SettingsView {
     pub has_openrouter_key: bool,
     pub has_vercel_key: bool,
     pub has_cheaper_inference_key: bool,
+    pub has_abliteration_key: bool,
     pub personality: Option<String>,
     pub custom_instructions: Option<String>,
     pub working_dir: String,
@@ -1021,6 +1022,7 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<SettingsView, St
         has_openrouter_key: s.key_for(Provider::OpenRouter).is_some(),
         has_vercel_key: s.key_for(Provider::Vercel).is_some(),
         has_cheaper_inference_key: s.key_for(Provider::CheaperInference).is_some(),
+        has_abliteration_key: s.key_for(Provider::Abliteration).is_some(),
         personality: s.personality.clone(),
         custom_instructions: s.custom_instructions.clone(),
         working_dir: s.working_dir.clone(),
@@ -1039,6 +1041,7 @@ pub struct SaveSettingsArgs {
     pub openrouter_api_key: Option<String>,
     pub vercel_api_key: Option<String>,
     pub cheaper_inference_api_key: Option<String>,
+    pub abliteration_api_key: Option<String>,
     pub personality: Option<String>,
     pub custom_instructions: Option<String>,
     pub working_dir: Option<String>,
@@ -1089,6 +1092,14 @@ pub async fn save_settings(
         needs_restart |= changed;
         keys_changed |= changed;
         s.cheaper_inference_api_key = v;
+    }
+    if let Some(k) = args.abliteration_api_key {
+        let t = k.trim().to_string();
+        let v = if t.is_empty() { None } else { Some(t) };
+        let changed = v != s.abliteration_api_key;
+        needs_restart |= changed;
+        keys_changed |= changed;
+        s.abliteration_api_key = v;
     }
     if let Some(p) = args.personality {
         s.personality = if p.trim().is_empty() { None } else { Some(p) };

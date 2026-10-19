@@ -92,6 +92,7 @@ type SettingsView = {
   has_openrouter_key: boolean;
   has_vercel_key: boolean;
   has_cheaper_inference_key: boolean;
+  has_abliteration_key: boolean;
   personality: string | null;
   custom_instructions: string | null;
   working_dir: string;
@@ -228,7 +229,7 @@ const state = {
   auto: false,
   effort: "high",
   permission: "full_access" as "full_access" | "ask_approval" | "auto_review" | "read_only",
-  keys: { openrouter: false, vercel: false, cheaperInference: false },
+  keys: { openrouter: false, vercel: false, cheaperInference: false, abliteration: false },
   personality: null as string | null,
   customInstructions: "",
   workingDir: "",
@@ -764,6 +765,7 @@ const PROVIDER_SUB: Record<string, string> = {
   openrouter: "400+ models · one key",
   vercel: "Vercel's model gateway",
   cheaper_inference: "Low-cost OpenAI-compatible gateway",
+  abliteration: "Abliterated models · no refusals",
   opencodex: "Route to any provider via OpenCodex",
 };
 function openModelMenu() {
@@ -1397,7 +1399,7 @@ async function boot() {
   state.workingDir = s.working_dir;
   state.kaliMode = s.kali_mode;
   state.runtime = s.runtime;
-  state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key, cheaperInference: s.has_cheaper_inference_key };
+  state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key, cheaperInference: s.has_cheaper_inference_key, abliteration: s.has_abliteration_key };
 
   // Restore saved composer preferences.
   const prefs = loadPrefs();
@@ -1501,8 +1503,16 @@ function prepareRuntime() {
 }
 
 function hasKeyFor(prov: string): boolean {
-  if (prov === "opencodex") return true; // local proxy; keys live in its own config
-  return prov === "vercel" ? state.keys.vercel : state.keys.openrouter;
+  switch (prov) {
+    case "opencodex": return true; // local proxy; keys live in its own config
+    case "vercel": return state.keys.vercel;
+    // Cheaper Inference fell through to OpenRouter's key here, so sending on it
+    // with no key of its own passed the gate (and with no OpenRouter key it
+    // opened Settings for the wrong provider).
+    case "cheaper_inference": return state.keys.cheaperInference;
+    case "abliteration": return state.keys.abliteration;
+    default: return state.keys.openrouter;
+  }
 }
 
 const COMPLEX_RE = /exploit|reverse|privilege|escalat|payload|shellcode|deobfus|decompile|analy[sz]|audit|chain|bypass|malware|forensic|crack|kernel|binary|fuzz/i;
@@ -1687,6 +1697,7 @@ async function loadModels() {
   // OpenCodex selection uses ocx's own upstreams, so it needs no key here.
   if ((state.provider === "vercel" && !state.keys.vercel) ||
       (state.provider === "cheaper_inference" && !state.keys.cheaperInference) ||
+      (state.provider === "abliteration" && !state.keys.abliteration) ||
       (state.provider === "openrouter" && !state.keys.openrouter)) {
     state.models = [];
     updateChips();
@@ -3409,7 +3420,7 @@ function openSettings(force = false) {
       </div>
 
       <div class="tab-pane" data-pane="providers">
-        <p style="margin:0 0 12px;opacity:.75">Every provider runs through the local OpenCodex proxy. The composer's <b>OpenRouter</b>, <b>Vercel</b> and <b>Cheaper Inference</b> selections are just filtered views over the upstreams you configure here — set their keys below, or add any of 40+ other upstreams via OpenCodex. Saving a key restarts the proxy so it takes effect.</p>
+        <p style="margin:0 0 12px;opacity:.75">Every provider runs through the local OpenCodex proxy. The composer's <b>OpenRouter</b>, <b>Vercel</b>, <b>Cheaper Inference</b> and <b>abliteration.ai</b> selections are just filtered views over the upstreams you configure here — set their keys below, or add any of 40+ other upstreams via OpenCodex. Saving a key restarts the proxy so it takes effect.</p>
         <div class="field">
           <label>OpenRouter API key ${keyBadge(state.keys.openrouter)}</label>
           <div class="key-row">
@@ -3430,6 +3441,14 @@ function openSettings(force = false) {
             <input id="s-ci" class="${state.keys.cheaperInference ? "saved" : ""}" type="password" placeholder="${state.keys.cheaperInference ? "•••••••••••••• — leave blank to keep" : "ci_..."}" />
             ${state.keys.cheaperInference ? '<button class="key-clear" id="s-ci-clear" title="Remove key">Remove</button>' : ""}
           </div>
+        </div>
+        <div class="field">
+          <label>abliteration.ai API key ${keyBadge(state.keys.abliteration)}</label>
+          <div class="key-row">
+            <input id="s-ab" class="${state.keys.abliteration ? "saved" : ""}" type="password" placeholder="${state.keys.abliteration ? "•••••••••••••• — leave blank to keep" : "abliteration.ai key"}" />
+            ${state.keys.abliteration ? '<button class="key-clear" id="s-ab-clear" title="Remove key">Remove</button>' : ""}
+          </div>
+          <p style="margin:6px 0 0;opacity:.75">Abliterated (refusal-suppressed) models, served OpenAI- and Anthropic-compatible from <code>api.abliteration.ai</code>.</p>
         </div>
         <div class="field">
           <label>Other providers via OpenCodex <span id="s-ocx-status" class="unset-badge"></span></label>
@@ -3511,16 +3530,17 @@ function openSettings(force = false) {
   const orInput = bg.querySelector("#s-or") as HTMLInputElement;
   const vcInput = bg.querySelector("#s-vc") as HTMLInputElement;
   const ciInput = bg.querySelector("#s-ci") as HTMLInputElement;
+  const abInput = bg.querySelector("#s-ab") as HTMLInputElement;
   const persSel = bg.querySelector("#s-pers") as HTMLSelectElement;
   const dirInput = bg.querySelector("#s-dir") as HTMLInputElement;
   bg.querySelector("#s-pick")!.addEventListener("click", async () => {
     const d = await invoke<string | null>("pick_directory");
     if (d) dirInput.value = d;
   });
-  const clearKey = async (which: "openrouter_api_key" | "vercel_api_key" | "cheaper_inference_api_key") => {
+  const clearKey = async (which: "openrouter_api_key" | "vercel_api_key" | "cheaper_inference_api_key" | "abliteration_api_key") => {
     await invoke("save_settings", { args: { [which]: "" } });
     const s = await invoke<SettingsView>("get_settings");
-    state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key, cheaperInference: s.has_cheaper_inference_key };
+    state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key, cheaperInference: s.has_cheaper_inference_key, abliteration: s.has_abliteration_key };
     bg.remove();
     document.removeEventListener("keydown", onEsc);
     openSettings(force);
@@ -3529,16 +3549,17 @@ function openSettings(force = false) {
   bg.querySelector("#s-or-clear")?.addEventListener("click", () => clearKey("openrouter_api_key"));
   bg.querySelector("#s-vc-clear")?.addEventListener("click", () => clearKey("vercel_api_key"));
   bg.querySelector("#s-ci-clear")?.addEventListener("click", () => clearKey("cheaper_inference_api_key"));
+  bg.querySelector("#s-ab-clear")?.addEventListener("click", () => clearKey("abliteration_api_key"));
   // Enter in a key field saves just that key and shows it as set (badge → Saved,
   // masked placeholder), without discarding other unsaved fields in the modal.
-  const saveKeyInline = async (which: "openrouter_api_key" | "vercel_api_key" | "cheaper_inference_api_key", inputEl: HTMLInputElement) => {
+  const saveKeyInline = async (which: "openrouter_api_key" | "vercel_api_key" | "cheaper_inference_api_key" | "abliteration_api_key", inputEl: HTMLInputElement) => {
     const val = inputEl.value.trim();
     if (!val) return;
     inputEl.disabled = true;
     try {
       await invoke("save_settings", { args: { [which]: val } });
       const s = await invoke<SettingsView>("get_settings");
-      state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key, cheaperInference: s.has_cheaper_inference_key };
+      state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key, cheaperInference: s.has_cheaper_inference_key, abliteration: s.has_abliteration_key };
       inputEl.value = "";
       inputEl.classList.add("saved");
       inputEl.placeholder = "•••••••••••••• — leave blank to keep";
@@ -3554,6 +3575,7 @@ function openSettings(force = false) {
   orInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveKeyInline("openrouter_api_key", orInput); } });
   vcInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveKeyInline("vercel_api_key", vcInput); } });
   ciInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveKeyInline("cheaper_inference_api_key", ciInput); } });
+  abInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveKeyInline("abliteration_api_key", abInput); } });
   // Cloudflare creds (for cloudfish): populate current state from get_settings.
   const cfKey = bg.querySelector("#s-cf-key") as HTMLInputElement;
   const cfEmail = bg.querySelector("#s-cf-email") as HTMLInputElement;
@@ -3826,6 +3848,7 @@ function openSettings(force = false) {
         openrouter_api_key: orInput.value ? orInput.value : null,
         vercel_api_key: vcInput.value ? vcInput.value : null,
         cheaper_inference_api_key: ciInput.value ? ciInput.value : null,
+        abliteration_api_key: abInput.value ? abInput.value : null,
         personality: persSel.value,
         custom_instructions: (bg.querySelector("#s-custom") as HTMLTextAreaElement).value,
         working_dir: dirInput.value || null,
@@ -3839,7 +3862,7 @@ function openSettings(force = false) {
       },
     });
     const s = await invoke<SettingsView>("get_settings");
-    state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key, cheaperInference: s.has_cheaper_inference_key };
+    state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key, cheaperInference: s.has_cheaper_inference_key, abliteration: s.has_abliteration_key };
     state.personality = s.personality;
     state.customInstructions = s.custom_instructions ?? "";
     state.workingDir = s.working_dir;

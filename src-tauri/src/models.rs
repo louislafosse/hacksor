@@ -13,6 +13,9 @@ pub enum Provider {
     Vercel,
     /// Cheaper Inference — OpenAI-compatible Responses API gateway.
     CheaperInference,
+    /// abliteration.ai — OpenAI- and Anthropic-compatible gateway serving
+    /// abliterated (refusal-suppressed) models.
+    Abliteration,
     /// OpenCodex proxy — routes to 40+ upstream providers (Ollama, Anthropic,
     /// Gemini, Groq, Together, …) by `provider/model` id.
     OpenCodex,
@@ -25,15 +28,17 @@ impl Provider {
             "cheaper_inference" | "cheaper-inference" | "cheaperinference" => {
                 Provider::CheaperInference
             }
+            "abliteration" | "abliteration_ai" | "ablit" => Provider::Abliteration,
             "opencodex" | "ocx" => Provider::OpenCodex,
             _ => Provider::OpenRouter,
         }
     }
 
-    pub const ALL: [Provider; 4] = [
+    pub const ALL: [Provider; 5] = [
         Provider::OpenRouter,
         Provider::Vercel,
         Provider::CheaperInference,
+        Provider::Abliteration,
         Provider::OpenCodex,
     ];
 
@@ -45,6 +50,7 @@ impl Provider {
             Provider::OpenRouter => "openrouter",
             Provider::Vercel => "vercel",
             Provider::CheaperInference => "cheaper_inference",
+            Provider::Abliteration => "abliteration",
             Provider::OpenCodex => "opencodex",
         }
     }
@@ -65,6 +71,7 @@ impl Provider {
             Provider::OpenRouter => Some("openrouter"),
             Provider::Vercel => Some("vercel-ai-gateway"),
             Provider::CheaperInference => Some("cheaper-inference"),
+            Provider::Abliteration => Some("abliteration"),
             Provider::OpenCodex => None,
         }
     }
@@ -89,6 +96,20 @@ impl Provider {
                 "--base-url",
                 "https://api.cheaperinference.com/v1",
             ],
+            // abliteration.ai is not in ocx's registry (113 providers, checked),
+            // so it is configured as a custom upstream. It publishes BOTH an
+            // OpenAI Responses surface (/v1/responses) and Chat Completions
+            // (/v1/chat/completions); `openai-chat` is chosen deliberately, for
+            // the same reason Cheaper Inference uses it: only that adapter
+            // repairs a tool call a model writes into its message text instead
+            // of emitting it structurally. Abliterated models are community
+            // fine-tunes, exactly the population that gets this wrong.
+            Provider::Abliteration => &[
+                "--adapter",
+                "openai-chat",
+                "--base-url",
+                "https://api.abliteration.ai/v1",
+            ],
             _ => &[],
         }
     }
@@ -107,6 +128,7 @@ impl Provider {
             Provider::OpenRouter => "OPENROUTER_API_KEY",
             Provider::Vercel => "AI_GATEWAY_API_KEY",
             Provider::CheaperInference => "CHEAPER_INFERENCE_API_KEY",
+            Provider::Abliteration => "ABLITERATION_API_KEY",
             Provider::OpenCodex => "OPENCODEX_API_AUTH_TOKEN",
         }
     }
@@ -126,6 +148,7 @@ impl Provider {
             Provider::OpenRouter => "OpenRouter",
             Provider::Vercel => "Vercel AI Gateway",
             Provider::CheaperInference => "Cheaper Inference",
+            Provider::Abliteration => "abliteration.ai",
             Provider::OpenCodex => "OpenCodex (any provider)",
         }
     }
