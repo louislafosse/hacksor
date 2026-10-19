@@ -2575,6 +2575,35 @@ async fn start_runtime(codex_home: &std::path::Path, services_always_on: bool) -
             exec_user(),
         )
         .await;
+
+        // Self-heal camofox-browser's native dependencies.
+        //
+        // npm 12 refuses to run install scripts unless the package is approved,
+        // and only WARNS about the ones it skipped. camofox-browser needs
+        // better-sqlite3 (`prebuild-install || node-gyp rebuild`) and argon2
+        // (`node-gyp-build`), so any image built with npm 12 ships them with no
+        // compiled addon: the first browser call dies on "Could not locate the
+        // bindings file" and the whole Camoufox feature is unusable.
+        //
+        // The Dockerfile now builds them, but published images predating that
+        // fix are already broken, and the fix lands in a container-local path
+        // that a fresh container loses. So repair it here too: only when the
+        // addon is actually missing (a no-op on a good image), and detached so
+        // a slow compile never blocks the first chat.
+        let _ = runtime::exec_detached(
+            RUNTIME_CONTAINER,
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "cd /usr/local/lib/node_modules/camofox-browser 2>/dev/null || exit 0; \
+                 [ -f node_modules/better-sqlite3/build/Release/better_sqlite3.node ] && exit 0; \
+                 npm install-scripts approve better-sqlite3 argon2 --no-allow-scripts-pin >/tmp/hacksor-camofox-deps.log 2>&1; \
+                 npm rebuild better-sqlite3 argon2 >>/tmp/hacksor-camofox-deps.log 2>&1"
+                    .into(),
+            ],
+            Some("0".into()),
+        )
+        .await;
     }
     let _ = codex_home; // the home mount already covers codex-home + working dirs
     // Refresh vuln intel in the background so each session has fresh CVE data.

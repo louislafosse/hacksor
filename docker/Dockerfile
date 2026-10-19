@@ -153,6 +153,21 @@ RUN npm config set fetch-retries 6 \
  && (PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/playwright npx -y playwright install chromium 2>/dev/null || true) \
  && npm cache clean --force
 
+# Build camofox-browser's native dependencies.
+#
+# npm 12 does NOT run install scripts unless the package is approved
+# (`allowScripts`), and it only WARNS about the ones it skipped. camofox-browser
+# depends on better-sqlite3 (`prebuild-install || node-gyp rebuild`) and argon2
+# (`node-gyp-build`), so on this image they installed with no compiled binding
+# at all: no `build/`, no `prebuilds/`. The browser then died on the very first
+# tool call with "Could not locate the bindings file", every Camoufox session
+# failed, and the agent fell back to Playwright. Nothing in the build logged an
+# error, because npm treated the skipped scripts as a warning.
+#
+# Approve the two native packages, rebuild them, and FAIL the build if the
+# addon is still missing, so this cannot silently regress again.
+RUN cd /usr/local/lib/node_modules/camofox-browser  && npm install-scripts approve better-sqlite3 argon2 --no-allow-scripts-pin  && npm rebuild better-sqlite3 argon2  && test -f node_modules/better-sqlite3/build/Release/better_sqlite3.node  && node -e "require('/usr/local/lib/node_modules/camofox-browser/node_modules/better-sqlite3')"  && echo "camofox-browser native deps built"
+
 # Raise OpenCodex's provider model-discovery timeout. ocx hard-codes an 8s abort
 # on the upstream /models fetch, which these catalogs routinely exceed (measured
 # from this image: OpenRouter ~11s for 449 models, Cheaper Inference 5-13s for
