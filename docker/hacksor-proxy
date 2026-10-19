@@ -326,7 +326,14 @@ def cmd_history(a):
         print(json.dumps(rows, indent=2))
         return
     if not rows:
-        print("(no matching flows — is the proxy running and traffic in scope?)")
+        scope = (load_rules().get("scope") or [])
+        if scope:
+            # The usual cause of an empty history: a scope from an earlier
+            # engagement is still set, so nothing else was ever recorded.
+            print(f"(no matching flows — SCOPE is ONLY {', '.join(scope)}, so every other host is dropped; "
+                  "`hacksor-proxy scope clear` to capture everything)")
+        else:
+            print("(no matching flows — is the proxy running and is traffic routed through it?)")
         return
     print(f"{'ID':8}  {'METHOD':6}  {'STAT':4}  {'LEN':>7}  URL")
     for f in rows:
@@ -646,6 +653,15 @@ def cmd_status(a):
     ca = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
     print(f"proxy:   {'running' if _running() else 'stopped'} on 127.0.0.1:{proxy_port()}")
     print(f"history: {log_path()} ({len(read_flows())} flows)")
+    # A scope left over from an earlier engagement silently drops every capture
+    # for any other host, which looks exactly like a dead proxy: status says
+    # running, traffic gets a 200, and history never grows. Say it out loud.
+    scope = (load_rules().get("scope") or [])
+    if scope:
+        print(f"scope:   ONLY {', '.join(scope)} is captured. Anything else is DROPPED.")
+        print("         `hacksor-proxy scope clear` to capture every host again.")
+    else:
+        print("scope:   (none) every host is captured")
     print(f"rules:   {rules_path()}")
     print(f"CA cert: {ca}")
     print(f"route a tool through it: curl -x http://127.0.0.1:{proxy_port()} -k <url>")

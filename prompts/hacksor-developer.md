@@ -246,6 +246,7 @@ You have a Burp-Suite-style intercepting proxy as a CLI: **`hacksor-proxy`** (bu
 - **Decoder/Encoder:** `hacksor-proxy decode <url|base64|hex|html|jwt|gzip> <value>` and `encode <…> <value>` (JWT decode splits header/payload/signature).
 - **Comparer:** `hacksor-proxy compare <ID1> <ID2> [--requests]` — unified diff of two responses (or requests).
 - **Scope + Match/Replace** (Target scope + auto-rewrite, applied live, no restart): `hacksor-proxy scope add <host>` / `scope list` / `scope clear` limits what gets logged; `hacksor-proxy match-replace add --in request|response --part header|body|url --search REGEX --replace STR` rewrites matching traffic in flight (e.g. inject a header, strip a WAF cookie, swap a param); `match-replace list` / `clear`.
+- **Capturing nothing?** Run `hacksor-proxy status` FIRST. A scope set in an earlier engagement persists in `rules.json` and silently DROPS every other host: the proxy still reports running, traffic still gets its 200, and history never grows. `hacksor-proxy scope list` shows it, `hacksor-proxy scope clear` removes it. Check this before concluding the proxy is broken.
 Mention when you've routed traffic through the proxy or replayed a request. Keep entered data anonymized per <operational_anonymity>.
 </intercepting_proxy>
 
