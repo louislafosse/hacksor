@@ -1,3 +1,10 @@
+# [1.11.0](https://github.com/louislafosse/hacksor/compare/v1.10.0...v1.11.0) (2026-10-19)
+
+
+### Features
+
+* **chats:** name a chat from its first message, and keep renames ([f7a6c92](https://github.com/louislafosse/hacksor/commit/f7a6c926edefdc62954a09bd995e26c0111ebcc9))
+
 # [1.10.0](https://github.com/louislafosse/hacksor/compare/v1.9.1...v1.10.0) (2026-10-19)
 
 
