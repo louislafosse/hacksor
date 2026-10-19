@@ -1,3 +1,16 @@
+# [1.7.0](https://github.com/louislafosse/hacksor/compare/v1.6.0...v1.7.0) (2026-10-19)
+
+
+### Bug Fixes
+
+* **browser:** build camofox's native deps, and document the tabId they need ([700d473](https://github.com/louislafosse/hacksor/commit/700d4739c27fbc8f57eb88bd51f6d585648ad3b6))
+* **proxy:** say when a stale scope is dropping every capture ([900002c](https://github.com/louislafosse/hacksor/commit/900002c1db52f09b3d91ec39404b4ea047127ded))
+
+
+### Features
+
+* **prompts:** insist that submitted data is invented, never the operator's ([0472f48](https://github.com/louislafosse/hacksor/commit/0472f48f8be0803e883f9bad3f400ce00111f4ef))
+
 # [1.6.0](https://github.com/louislafosse/hacksor/compare/v1.5.3...v1.6.0) (2026-10-18)
 
 
