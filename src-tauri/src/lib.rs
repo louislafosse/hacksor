@@ -66,6 +66,7 @@ pub fn run() {
             commands::list_providers,
             commands::verify_turn,
             commands::judge_phase,
+            commands::suggest_title,
             commands::review_action,
             commands::list_models,
             commands::get_settings,

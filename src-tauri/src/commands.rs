@@ -812,6 +812,66 @@ Reply with ONLY compact JSON, no prose: {\"phase\":\"recon\"|\"exploit\",\"reaso
     }
 }
 
+#[derive(Deserialize)]
+pub struct TitleArgs {
+    pub provider: String,
+    pub model: String,
+    pub text: String,
+}
+
+/// Name a chat from its first message.
+///
+/// Keeping the raw prompt as the title makes every sidebar row a wall of the
+/// same opening sentence. This asks for a few words instead. It is advisory:
+/// an empty answer means the caller keeps the truncated prompt, so a model
+/// that is slow, down, or chatty never blocks naming a chat.
+#[tauri::command]
+pub async fn suggest_title(state: State<'_, AppState>, args: TitleArgs) -> Result<String, String> {
+    let sys = "You name chat threads. Reply with a title of 2 to 5 words for the user's request, \
+and NOTHING else: no quotes, no trailing period, no prose, no explanation, no markdown. \
+Name the subject or task, not the fact that it is a request (\"Nmap Scan Of Staging\", not \
+\"User Asks For A Scan\"). Keep the target's own words where they are short and concrete.";
+    let user = format!("Name this request:\n\n{}", truncate(args.text.trim(), 2000));
+    let raw = judge_call(&state, &args.provider, &args.model, sys, &user).await;
+    Ok(raw.map(|r| clean_title(&r)).unwrap_or_default())
+}
+
+/// Reduce whatever the model replied with to a usable title, or "" to mean
+/// "not usable, keep the fallback".
+///
+/// Models ignore "a few words" in every direction: quoting the title, prefixing
+/// "Title:", answering in several lines, or writing a sentence. Take the first
+/// non-empty line, strip the decoration, and give up rather than letting a
+/// paragraph into the sidebar.
+fn clean_title(raw: &str) -> String {
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let line = line
+        .trim_start_matches("Title:")
+        .trim_start_matches("title:")
+        .trim();
+    let line = line.trim_matches(|c| c == '"' || c == '\'' || c == '`' || c == '*' || c == '#');
+    let line = line.trim().trim_end_matches(['.', ':', '!']).trim();
+    // Collapse runs of whitespace so a stray newline or tab cannot widen a row.
+    let words: Vec<&str> = line.split_whitespace().collect();
+    if words.is_empty() {
+        return String::new();
+    }
+    // A sentence is not a title: anything this long means the model ignored the
+    // instruction, and the truncated prompt is a better fallback than prose.
+    if words.len() > 8 {
+        return String::new();
+    }
+    let out = words.join(" ");
+    if out.chars().count() > 60 {
+        return String::new();
+    }
+    out
+}
+
 /// Parse the judge's reply. Anything unexpected — no JSON, a phase outside the
 /// two known ones, junk — becomes "unknown", which keeps the current phase.
 fn parse_phase_verdict(content: &str) -> PhaseVerdict {
@@ -3643,6 +3703,29 @@ mod transcript_tests {
         let (out, code) = parse_exec_output(raw);
         assert_eq!(out, "bishop\n");
         assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn a_generated_title_is_reduced_to_a_few_clean_words() {
+        // What models actually reply with.
+        assert_eq!(clean_title("Nmap Scan Of Staging"), "Nmap Scan Of Staging");
+        assert_eq!(clean_title("\"Quoted Title\""), "Quoted Title");
+        assert_eq!(clean_title("Title: IDOR On Orders"), "IDOR On Orders");
+        assert_eq!(clean_title("**Bold Title**"), "Bold Title");
+        assert_eq!(clean_title("  Spaced   Out  Title \n"), "Spaced Out Title");
+        assert_eq!(clean_title("Subdomain Enumeration."), "Subdomain Enumeration");
+        // Several lines: take the first usable one, not the commentary.
+        assert_eq!(clean_title("\nLogin Bypass\n\nThis title describes…"), "Login Bypass");
+
+        // Unusable answers return "" so the caller keeps the truncated prompt
+        // rather than putting prose in the sidebar.
+        assert_eq!(clean_title(""), "");
+        assert_eq!(clean_title("   \n  "), "");
+        assert_eq!(
+            clean_title("Sure! Here is a concise title that describes what the user is asking about today"),
+            ""
+        );
+        assert_eq!(clean_title(&"x".repeat(80)), "");
     }
 
     #[test]

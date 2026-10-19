@@ -269,6 +269,48 @@ function loadSet(key: string): Set<string> {
 function saveSet(key: string, set: Set<string>) {
   try { localStorage.setItem(key, JSON.stringify([...set])); } catch {}
 }
+// Chat titles the user renamed, or that were generated for them, keyed by
+// THREAD id so they survive a restart. Session ids are per-run, and the
+// sidebar rebuilds a restored chat's row from the transcript preview, so
+// without this a rename lasted only until the app closed.
+function loadTitles(): Map<string, string> {
+  try { return new Map(Object.entries(JSON.parse(localStorage.getItem("hacksor-titles") || "{}"))); }
+  catch { return new Map(); }
+}
+const chatTitles = loadTitles();
+function saveTitles() {
+  try { localStorage.setItem("hacksor-titles", JSON.stringify(Object.fromEntries(chatTitles))); } catch {}
+}
+/// Remember a title for a thread (and forget it when cleared).
+function setChatTitle(tid: string | null | undefined, title: string) {
+  if (!tid) return;
+  if (title.trim()) chatTitles.set(tid, title.trim()); else chatTitles.delete(tid);
+  saveTitles();
+}
+/// The stored title for a thread, if any.
+function storedTitle(tid: string | null | undefined): string | undefined {
+  return tid ? chatTitles.get(tid) : undefined;
+}
+
+// Two chats called "Nmap Scan" are indistinguishable in the sidebar, so a
+// repeat gets a counter: "Nmap Scan 2". Compared case-insensitively against
+// every open chat and every stored title, skipping the chat being named.
+function uniqueTitle(base: string, selfTid?: string | null, selfId?: string): string {
+  const taken = new Set<string>();
+  for (const [tid, t] of chatTitles) if (tid !== selfTid) taken.add(t.toLowerCase());
+  for (const s of state.sessions) {
+    if (s.id === selfId || (selfTid && s.threadId === selfTid)) continue;
+    if (s.title) taken.add(s.title.toLowerCase());
+  }
+  const clean = base.trim() || "Chat";
+  if (!taken.has(clean.toLowerCase())) return clean;
+  for (let n = 2; n < 500; n++) {
+    const candidate = `${clean} ${n}`;
+    if (!taken.has(candidate.toLowerCase())) return candidate;
+  }
+  return clean;
+}
+
 const archivedIds = loadSet("hacksor-archived");
 const hiddenIds = loadSet("hacksor-hidden");
 const pinnedIds = loadSet("hacksor-pinned"); // by threadId
@@ -1049,7 +1091,7 @@ function resumeRecent(r: Recent, keepArchived = false) {
 
   const s = makeSession();
   s.threadId = r.id;
-  s.title = (r.preview || "Chat").slice(0, 40);
+  s.title = storedTitle(r.id) || (r.preview || "Chat").slice(0, 40);
   s.started = true;
   s.archived = keepArchived;
   s.recency = r.recencyAt ?? r.updatedAt ?? Date.now(); // keep its place in the list
@@ -1189,7 +1231,7 @@ function renderSidebar() {
   }
   for (const r of recents) {
     if (!r.id || openByThread.has(r.id) || archivedIds.has(r.id) || hiddenIds.has(r.id)) continue;
-    rows.push({ key: r.id, tid: r.id, title: (r.preview || "Untitled chat").slice(0, 60), sub: "", recency: r.recencyAt ?? r.updatedAt ?? 0 });
+    rows.push({ key: r.id, tid: r.id, title: storedTitle(r.id) || (r.preview || "Untitled chat").slice(0, 60), sub: "", recency: r.recencyAt ?? r.updatedAt ?? 0 });
   }
   // Pinned chats float to the top (still recency-sorted within each group).
   const isPinned = (row: Row) => !!row.tid && pinnedIds.has(row.tid);
@@ -1209,7 +1251,10 @@ function renderSidebar() {
         `<button class="i2-btn pin" title="${pinned ? "Unpin" : "Pin"}">${pinned ? PINNED_ICON : PIN_ICON}</button>` +
         `<button class="i2-btn" title="Archive chat">${ARCHIVE_ICON}</button>` +
       `</span>`;
-    if (s) item.title = s.workingDir;
+    // Rows are one line with an ellipsis, so the tooltip carries the FULL
+    // title (it used to show only the working directory, which is the one
+    // thing already visible underneath).
+    item.title = s ? `${row.title}\n${s.workingDir}` : row.title;
     item.addEventListener("click", () => {
       if (s) selectSession(s.id);
       else { const r = recents.find((x) => x.id === row.key); if (r) resumeRecent(r); }
@@ -1264,7 +1309,7 @@ function renderSidebar() {
   );
   for (const r of diskArchived) {
     const item = el("div", "item2 arch-item");
-    const label = (r.preview || "Chat").slice(0, 60);
+    const label = storedTitle(r.id) || (r.preview || "Chat").slice(0, 60);
     item.innerHTML =
       `<div class="i2-main"><span class="t">${escapeHtml(label)}</span></div>` +
       `<span class="i2-actions">` +
@@ -1310,7 +1355,12 @@ function renameSession(id: string) {
     if (done) return;
     done = true;
     const val = input.value.trim();
-    if (save && val) s.title = val;
+    if (save && val) {
+      s.title = uniqueTitle(val, s.threadId, s.id);
+      // Keyed by thread id so the name survives a restart, and so the sidebar
+      // uses it instead of rebuilding the row from the transcript preview.
+      setChatTitle(s.threadId, s.title);
+    }
     renderSidebar();
   };
   input.addEventListener("keydown", (e) => {
@@ -1423,7 +1473,7 @@ async function boot() {
     if (state.sessions.some((s) => s.threadId === c.threadId)) continue;
     const s = makeSession();
     s.threadId = c.threadId;
-    s.title = c.title || "Chat";
+    s.title = storedTitle(c.threadId) || c.title || "Chat";
     s.started = true;
     s.resumed = false;
     s.workingDir = c.workingDir || state.workingDir;
@@ -1822,8 +1872,11 @@ async function onSend() {
   input.style.height = "auto";
   session.turnsEl.querySelector(".empty")?.remove();
   if (session.title === "New chat") {
+    // The truncated prompt is the placeholder: the row must say something
+    // immediately, and it is also the fallback if naming fails.
     session.title = text.slice(0, 40) || "New chat";
     renderSidebar();
+    void nameChat(session, text);
   }
   session.lastText = fullText;
   session.lastImages = images;
@@ -1895,6 +1948,13 @@ async function onSend() {
       });
       session.threadProvider = state.provider;
       session.starting = false;
+      // Titles are stored against the THREAD, which only exists now. The name
+      // was chosen before this point (placeholder, or an AI title that landed
+      // while the thread was being created), so persist it here too — without
+      // this a first-message title was never written and vanished on restart.
+      if (session.title && session.title !== "New chat") {
+        setChatTitle(session.threadId, session.title);
+      }
     }
     setSessionRunning(session, true);
     await invoke("send_message", {
@@ -2475,6 +2535,29 @@ function ocxDashboardButton(): HTMLButtonElement {
   const b = el("button", "msg-act", "⚙ Open OpenCodex");
   b.onclick = () => { invoke("open_opencodex_setup").catch(() => {}); };
   return b;
+}
+
+// Name a new chat from its first message.
+//
+// Keeping the raw prompt made every row a wall of the same opening sentence,
+// and a long one was unreadable truncated. Runs in parallel with the turn (the
+// title depends on the request, not the answer) so the row settles within a
+// second or two, and it is strictly advisory: any failure, or a title the user
+// has already changed by hand, leaves the placeholder alone.
+async function nameChat(session: Session, text: string) {
+  const placeholder = session.title;
+  try {
+    const suggested = await invoke<string>("suggest_title", {
+      args: { provider: state.provider, model: session.turnModel || state.model, text },
+    });
+    if (!suggested.trim()) return;
+    // Do not fight the user: if they renamed the chat while this was in
+    // flight, or moved on, keep what is there.
+    if (session.title !== placeholder) return;
+    session.title = uniqueTitle(suggested, session.threadId, session.id);
+    setChatTitle(session.threadId, session.title);
+    renderSidebar();
+  } catch { /* keep the placeholder */ }
 }
 
 function modelSupportsVision(id: string): boolean {
