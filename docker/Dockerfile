@@ -93,6 +93,17 @@ ENV PIPX_HOME=/opt/pipx
 ENV PIPX_BIN_DIR=/usr/local/bin
 # arjun (params), wafw00f (WAF detect), s3scanner (bucket enum)
 RUN pipx install arjun 2>/dev/null || pip install --break-system-packages arjun || true
+# curl_cffi: an HTTP client that impersonates a real browser's TLS + HTTP/2
+# fingerprint (JA3/JA4 + Akamai), not just its User-Agent. Plain curl has a
+# fingerprint of its own that Cloudflare, Akamai and DataDome recognise on
+# sight, so a 403 from curl is often the fingerprint rather than the target.
+# Measured in this image against tls.browserleaks.com: curl ja3_hash
+# c654189f0cbcfb638bb74b824e790138, while impersonate="chrome" gives
+# 84feddd6f06e125cfc66b95ff7445a34, safari ecdf4f49dd59effc439639da29186671
+# and firefox 6f7889b9fb1a62a9577e685c1fcfa919. A library, not a CLI, so pipx
+# cannot install it: it has to go into the system interpreter the agent uses.
+RUN pip install --break-system-packages curl_cffi \
+ && python3 -c "import curl_cffi; print('curl_cffi', curl_cffi.__version__)"
 RUN pipx install wafw00f 2>/dev/null || pip install --break-system-packages wafw00f || true
 RUN pipx install s3scanner 2>/dev/null || pip install --break-system-packages s3scanner || true
 ENV PATH="/root/.local/bin:${PATH}"
