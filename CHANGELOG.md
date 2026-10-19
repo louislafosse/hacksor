@@ -1,3 +1,11 @@
+# [1.10.0](https://github.com/louislafosse/hacksor/compare/v1.9.1...v1.10.0) (2026-10-19)
+
+
+### Features
+
+* **providers:** add abliteration.ai as a composer provider ([e90da12](https://github.com/louislafosse/hacksor/commit/e90da12a6cad471eb37b5ff0e6cabaf9d63ad43b))
+* **runtime:** notice when the published image is newer, and fetch it ([7ded478](https://github.com/louislafosse/hacksor/commit/7ded4788ac15a70f3986b43e7b1c6376877f7c1f))
+
 ## [1.9.1](https://github.com/louislafosse/hacksor/compare/v1.9.0...v1.9.1) (2026-10-19)
 
 
