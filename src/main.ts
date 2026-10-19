@@ -1461,6 +1461,9 @@ async function boot() {
   // container + proxy) so it's ready before the first message — not lazily on
   // send. Runs in the background; progress shows in the runtime banner.
   prepareRuntime();
+  // Last, so it never delays the UI coming up: if this launch is the first
+  // after an update, show what changed.
+  void showUpdateNotesOnce();
 }
 
 // Kick off runtime provisioning (Docker pull/build/start) without blocking the
@@ -3359,6 +3362,15 @@ function openSettings(force = false) {
 
       <div class="tab-pane active" data-pane="general">
         <div class="field">
+          <label>Version <span id="s-ver-badge" class="unset-badge">checking…</span></label>
+          <div class="row">
+            <input id="s-ver" value="Hacksor" readonly />
+            <button id="s-ver-check" class="ghost">Check again</button>
+            <button id="s-ver-notes" class="ghost">What's new</button>
+          </div>
+          <p id="s-ver-note" style="margin:6px 0 0"></p>
+        </div>
+        <div class="field">
           <label>Runtime <span id="s-rt-status" class="unset-badge"></span></label>
           <select id="s-runtime">
             <option value="host" ${state.runtime !== "docker" ? "selected" : ""}>Host (requires codex installed)</option>
@@ -3588,6 +3600,50 @@ function openSettings(force = false) {
     kaliStatusEl.className = st.running ? "saved-badge" : "unset-badge";
   };
   refreshKali();
+  // Version + update check. A failed check reports WHY instead of claiming the
+  // app is up to date, which is the one answer that must never be guessed.
+  const verEl = bg.querySelector("#s-ver") as HTMLInputElement;
+  const verBadge = bg.querySelector("#s-ver-badge") as HTMLElement;
+  const verNote = bg.querySelector("#s-ver-note") as HTMLElement;
+  let latestUrl = "";
+  let latestNotes = "";
+  const refreshVersion = async () => {
+    verBadge.textContent = "checking…";
+    verBadge.className = "unset-badge";
+    verNote.textContent = "";
+    const st = await invoke<UpdateStatus>("check_update").catch((e) => ({
+      current: "", latest: "", up_to_date: false, url: "", notes: "", error: String(e),
+    } as UpdateStatus));
+    verEl.value = `Hacksor ${st.current || "?"}`;
+    latestUrl = st.url;
+    latestNotes = st.notes;
+    if (st.error) {
+      verBadge.textContent = "· check failed";
+      verBadge.className = "unset-badge";
+      verNote.textContent = st.error;
+      return;
+    }
+    if (st.up_to_date) {
+      verBadge.textContent = "· up to date";
+      verBadge.className = "saved-badge";
+      return;
+    }
+    verBadge.textContent = `· ${st.latest} available`;
+    verBadge.className = "unset-badge";
+    verNote.innerHTML = `<b>${escapeHtml(st.latest)}</b> is out. <a href="#" id="s-ver-get">See what changed and download</a>.`;
+    verNote.querySelector("#s-ver-get")?.addEventListener("click", (e) => {
+      e.preventDefault();
+      openReleaseNotes(`Hacksor ${st.latest}`, `You are running ${st.current}.`, latestNotes || "See the release page for details.", latestUrl);
+    });
+  };
+  refreshVersion();
+  bg.querySelector("#s-ver-check")!.addEventListener("click", () => { void refreshVersion(); });
+  bg.querySelector("#s-ver-notes")!.addEventListener("click", async () => {
+    const rn = await invoke<ReleaseNotes>("current_release_notes").catch(() => null);
+    if (rn && rn.notes.trim()) openReleaseNotes(`What's new in ${rn.version}`, "", rn.notes);
+    else openReleaseNotes("Release notes", "", "No notes are bundled with this build (a local build between releases).");
+  });
+
   const rtStatusEl = bg.querySelector("#s-rt-status") as HTMLElement;
   const refreshRt = async () => {
     const st = await invoke<{ docker: boolean; image: boolean; running: boolean }>("runtime_status").catch(() => ({ docker: false, image: false, running: false }));
@@ -3748,6 +3804,62 @@ function openSettings(force = false) {
     void prevRuntime;
     if (state.runtime === "docker") prepareRuntime();
   });
+}
+
+// ---------------------------------------------------------------- version + updates
+
+interface UpdateStatus {
+  current: string;
+  latest: string;
+  up_to_date: boolean;
+  url: string;
+  notes: string;
+  error: string;
+}
+interface ReleaseNotes { version: string; notes: string; previous: string; }
+
+// Show a release-notes panel. Used both for "what changed in the version you
+// just launched" and for "what a newer version brings".
+function openReleaseNotes(title: string, sub: string, markdown: string, download?: string) {
+  const bg = el("div", "modal-bg");
+  bg.innerHTML = `
+    <div class="modal wide">
+      <button class="modal-close" id="rn-close" title="Close (Esc)">✕</button>
+      <h2>${escapeHtml(title)}</h2>
+      ${sub ? `<p>${escapeHtml(sub)}</p>` : ""}
+      <div class="rn-body" id="rn-body"></div>
+      <div class="actions">
+        ${download ? `<button id="rn-get" class="primary">Download</button>` : ""}
+        <button id="rn-ok" class="ghost">Close</button>
+      </div>
+    </div>`;
+  app.appendChild(bg);
+  (bg.querySelector("#rn-body") as HTMLElement).innerHTML = renderMd(markdown);
+  const close = () => { document.removeEventListener("keydown", esc); bg.remove(); };
+  const esc = (e: KeyboardEvent) => { if (e.key === "Escape") { e.preventDefault(); close(); } };
+  document.addEventListener("keydown", esc);
+  bg.addEventListener("mousedown", (e) => { if (e.target === bg) close(); });
+  bg.querySelector("#rn-close")!.addEventListener("click", close);
+  bg.querySelector("#rn-ok")!.addEventListener("click", close);
+  if (download) {
+    bg.querySelector("#rn-get")!.addEventListener("click", () => {
+      invoke("open_release_page", { url: download }).catch(() => {});
+    });
+  }
+}
+
+// On the first launch after an update, show what changed. The backend returns
+// nothing on a fresh install (there is no "before") and nothing once the
+// version has been acknowledged, so this fires exactly once per update.
+async function showUpdateNotesOnce() {
+  try {
+    const rn = await invoke<ReleaseNotes | null>("pending_release_notes");
+    if (!rn || !rn.notes.trim()) return;
+    openReleaseNotes(`What's new in ${rn.version}`, `Updated from ${rn.previous}.`, rn.notes);
+    // Acknowledge only once it is actually on screen: a crash before this point
+    // means the notes are shown again next launch rather than lost.
+    await invoke("ack_version").catch(() => {});
+  } catch { /* never block startup on this */ }
 }
 
 // ---------------------------------------------------------------- render helpers

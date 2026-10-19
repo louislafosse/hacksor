@@ -49,6 +49,11 @@ pub struct Settings {
     pub cloudflare_email: Option<String>,
     #[serde(default)]
     pub cloudflare_account_id: Option<String>,
+    /// The app version whose release notes the user has already been shown.
+    /// Empty/absent on a fresh install, which is why a first run shows nothing:
+    /// "what changed" is meaningless before there is a previous version.
+    #[serde(default)]
+    pub last_seen_version: Option<String>,
 }
 
 fn default_services_mode() -> String {
@@ -87,6 +92,7 @@ impl Default for Settings {
             cloudflare_api_key: None,
             cloudflare_email: None,
             cloudflare_account_id: None,
+            last_seen_version: None,
         }
     }
 }

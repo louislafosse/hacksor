@@ -111,6 +111,12 @@ pub fn run() {
             commands::stop_runtime,
             commands::refresh_intel,
             commands::services_status,
+            commands::app_version,
+            commands::check_update,
+            commands::pending_release_notes,
+            commands::ack_version,
+            commands::current_release_notes,
+            commands::open_release_page,
         ])
         .build(tauri::generate_context!())
         .expect("error while running Hacksor")

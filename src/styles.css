@@ -685,6 +685,14 @@ input::placeholder, textarea::placeholder { color: var(--muted-foreground); }
 .note-body { background: var(--background); color: var(--foreground); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: var(--font-mono); resize: vertical; }
 .note-actions { display: flex; gap: 6px; justify-content: flex-end; }
 .note-empty { color: var(--muted-foreground); font-size: 13px; padding: 12px; text-align: center; }
+/* Release notes panel (first run after an update, and Settings > What's new). */
+.rn-body { max-height: 52vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; font-size: 13px; line-height: 1.55; background: var(--background); }
+.rn-body h1, .rn-body h2, .rn-body h3 { font-size: 14px; margin: 14px 0 8px; }
+.rn-body h1:first-child, .rn-body h2:first-child, .rn-body h3:first-child { margin-top: 0; }
+.rn-body ul { margin: 0 0 10px; padding-left: 20px; }
+.rn-body li { margin: 4px 0; }
+.rn-body a { color: var(--link-color); text-decoration: underline; text-underline-offset: 2px; }
+.rn-body code { font-family: var(--font-mono); font-size: 12px; }
 .search-input { width: 100%; background: var(--background); color: var(--foreground); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 14px; margin-bottom: 12px; }
 .search-results { max-height: 50vh; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
 .search-row { padding: 8px 10px; border-radius: 8px; cursor: pointer; }

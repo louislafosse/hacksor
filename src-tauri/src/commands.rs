@@ -1768,6 +1768,239 @@ pub async fn branch_context(
     .map_err(|e| e.to_string())?
 }
 
+// ---- version, update check, and release notes ----
+
+/// This build's own changelog, so "what's new" works offline and always matches
+/// the binary. The release workflow tags the commit semantic-release made (the
+/// bundle jobs check out `v<version>`), so a shipped build always contains its
+/// own section.
+const CHANGELOG: &str = include_str!("../../CHANGELOG.md");
+
+/// Where releases are published. Used for the update check and the download link.
+const RELEASES_API: &str = "https://api.github.com/repos/louislafosse/hacksor/releases/latest";
+const RELEASES_PAGE: &str = "https://github.com/louislafosse/hacksor/releases/latest";
+
+/// The running version, straight from the crate (Cargo.toml and
+/// tauri.conf.json are both bumped by semantic-release).
+#[tauri::command]
+pub fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[derive(Serialize, Default)]
+pub struct UpdateStatus {
+    pub current: String,
+    /// The newest published version, or empty when the check could not run.
+    pub latest: String,
+    pub up_to_date: bool,
+    /// Release page for the download.
+    pub url: String,
+    /// The newer release's notes, for the "update available" panel.
+    pub notes: String,
+    /// Why the check failed, shown instead of a misleading "up to date".
+    pub error: String,
+}
+
+/// Compare two semver-ish versions. Only the numeric `major.minor.patch` part is
+/// compared; a pre-release suffix is ignored, which is deliberate — this only
+/// ever answers "is the published release newer than what is running".
+fn version_newer(latest: &str, current: &str) -> bool {
+    fn parts(v: &str) -> Vec<u64> {
+        v.trim()
+            .trim_start_matches(['v', 'V'])
+            .split(['-', '+'])
+            .next()
+            .unwrap_or("")
+            .split('.')
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect()
+    }
+    let (a, b) = (parts(latest), parts(current));
+    if a.iter().all(|n| *n == 0) {
+        return false; // unparseable: never claim an update
+    }
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
+/// Ask GitHub for the newest release and compare it with the running build.
+///
+/// Read-only and best effort: a failed check reports the error rather than
+/// claiming the app is up to date, because "up to date" is exactly the wrong
+/// thing to show when the check never reached the network.
+#[tauri::command]
+pub async fn check_update() -> Result<UpdateStatus, String> {
+    let current = app_version();
+    let mut out = UpdateStatus {
+        current: current.clone(),
+        url: RELEASES_PAGE.to_string(),
+        ..Default::default()
+    };
+    let client = match reqwest::Client::builder()
+        .user_agent(format!("hacksor/{current}"))
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            out.error = e.to_string();
+            return Ok(out);
+        }
+    };
+    let res = match client.get(RELEASES_API).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            out.error = format!("could not reach GitHub: {e}");
+            return Ok(out);
+        }
+    };
+    if !res.status().is_success() {
+        out.error = format!("GitHub returned {}", res.status());
+        return Ok(out);
+    }
+    let body: serde_json::Value = match res.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            out.error = format!("unreadable release feed: {e}");
+            return Ok(out);
+        }
+    };
+    let tag = body["tag_name"].as_str().unwrap_or("").trim_start_matches('v').to_string();
+    if tag.is_empty() {
+        out.error = "the release feed has no tag_name".into();
+        return Ok(out);
+    }
+    if let Some(u) = body["html_url"].as_str() {
+        out.url = u.to_string();
+    }
+    out.up_to_date = !version_newer(&tag, &current);
+    out.latest = tag;
+    if !out.up_to_date {
+        out.notes = body["body"].as_str().unwrap_or("").trim().to_string();
+    }
+    Ok(out)
+}
+
+/// Open a Hacksor release page in the browser.
+///
+/// Deliberately narrow: anything that is not a release URL of this repository
+/// is ignored in favour of the releases page, so the only thing the frontend
+/// can ever open through here is our own release listing.
+#[tauri::command]
+pub fn open_release_page(url: Option<String>) -> Result<(), String> {
+    let target = url
+        .filter(|u| is_release_url(u))
+        .unwrap_or_else(|| RELEASES_PAGE.to_string());
+    platform::open_url(&target).map_err(|e| e.to_string())
+}
+
+fn is_release_url(u: &str) -> bool {
+    u.starts_with("https://github.com/louislafosse/hacksor/releases/")
+}
+
+/// One version's section of the changelog.
+///
+/// semantic-release writes `# [1.6.0](…) (date)` for a minor and
+/// `## [1.5.3](…)` for a patch, so a section runs from its own heading to the
+/// next heading of any level.
+fn changelog_section(text: &str, version: &str) -> String {
+    let is_heading = |l: &str| {
+        let t = l.trim_start_matches('#').trim_start();
+        l.starts_with('#') && (t.starts_with('[') || t.starts_with(|c: char| c.is_ascii_digit()))
+    };
+    let heading_version = |l: &str| -> String {
+        l.trim_start_matches('#')
+            .trim()
+            .trim_start_matches('[')
+            .split(|c: char| c == ']' || c == '(' || c.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut out: Vec<&str> = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if is_heading(line) {
+            if inside {
+                break;
+            }
+            if heading_version(line) == version {
+                inside = true;
+                out.push(line);
+            }
+            continue;
+        }
+        if inside {
+            out.push(line);
+        }
+    }
+    out.join("\n").trim().to_string()
+}
+
+#[derive(Serialize)]
+pub struct ReleaseNotes {
+    pub version: String,
+    pub notes: String,
+    /// The version the user last saw, for "1.5.3 -> 1.6.0" framing.
+    pub previous: String,
+}
+
+/// The notes to show once, on the first run after an update.
+///
+/// Returns nothing on a fresh install (no previous version, so nothing
+/// "changed") and nothing when this version has already been acknowledged.
+/// Acknowledgement is a SEPARATE command so a crash between the two does not
+/// swallow the notes.
+#[tauri::command]
+pub async fn pending_release_notes(state: State<'_, AppState>) -> Result<Option<ReleaseNotes>, String> {
+    let current = app_version();
+    let seen = { state.settings.lock().await.last_seen_version.clone() };
+    let Some(previous) = seen.filter(|v| !v.trim().is_empty()) else {
+        // Fresh install: record the version so the NEXT update shows notes.
+        let mut s = state.settings.lock().await;
+        s.last_seen_version = Some(current);
+        let _ = s.save(&state.codex_home);
+        return Ok(None);
+    };
+    if previous == current {
+        return Ok(None);
+    }
+    let notes = changelog_section(CHANGELOG, &current);
+    if notes.is_empty() {
+        // No section for this build (a local dev build between releases):
+        // nothing useful to show, so don't nag.
+        let mut s = state.settings.lock().await;
+        s.last_seen_version = Some(current);
+        let _ = s.save(&state.codex_home);
+        return Ok(None);
+    }
+    Ok(Some(ReleaseNotes { version: current, notes, previous }))
+}
+
+/// Mark this version's notes as seen (called once the user has them on screen).
+#[tauri::command]
+pub async fn ack_version(state: State<'_, AppState>) -> Result<(), String> {
+    let mut s = state.settings.lock().await;
+    s.last_seen_version = Some(app_version());
+    s.save(&state.codex_home).map_err(|e| e.to_string())
+}
+
+/// This build's own release notes, for the "What's new" button in Settings.
+#[tauri::command]
+pub fn current_release_notes() -> ReleaseNotes {
+    let current = app_version();
+    ReleaseNotes {
+        notes: changelog_section(CHANGELOG, &current),
+        version: current,
+        previous: String::new(),
+    }
+}
+
 /// Recent OpenCodex request records (from `~/.opencodex/usage.jsonl`), newest
 /// last. Each record has the authoritative served model/provider, the requested
 /// model, HTTP status, duration and token usage — used by the per-answer Info
@@ -3262,6 +3495,77 @@ mod transcript_tests {
         let (out, code) = parse_exec_output(raw);
         assert_eq!(out, "bishop\n");
         assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn version_compare_only_claims_a_real_upgrade() {
+        assert!(version_newer("1.7.0", "1.6.0"));
+        assert!(version_newer("v1.7.0", "1.6.0"));   // tags carry a leading v
+        assert!(version_newer("1.6.1", "1.6.0"));
+        assert!(version_newer("2.0.0", "1.99.99"));
+        assert!(version_newer("1.10.0", "1.9.0"));   // not a string compare
+        assert!(!version_newer("1.6.0", "1.6.0"));
+        assert!(!version_newer("1.5.3", "1.6.0"));   // never downgrade
+        assert!(!version_newer("1.6.0-beta.1", "1.6.0")); // pre-release of the same
+        // An unreadable feed must never look like an update.
+        for junk in ["", "latest", "nightly", "v", "x.y.z"] {
+            assert!(!version_newer(junk, "1.6.0"), "{junk}");
+        }
+    }
+
+    #[test]
+    fn changelog_section_is_cut_at_the_next_release() {
+        // Verbatim shape of what semantic-release writes: `#` for a minor,
+        // `##` for a patch.
+        let log = "\
+# [1.6.0](https://x/compare/v1.5.3...v1.6.0) (2026-10-18)\n\
+\n\
+\n\
+### Bug Fixes\n\
+\n\
+* **ui:** highlight restored messages up front ([d043172](https://x))\n\
+\n\
+\n\
+### Features\n\
+\n\
+* **branch:** branch a chat at one message ([124733b](https://x))\n\
+\n\
+## [1.5.3](https://x/compare/v1.5.2...v1.5.3) (2026-10-13)\n\
+\n\
+### Bug Fixes\n\
+\n\
+* **models:** list ocx's direct upstreams ([5b72446](https://x))\n";
+        let s = changelog_section(log, "1.6.0");
+        assert!(s.starts_with("# [1.6.0]"));
+        assert!(s.contains("**branch:**"));
+        // The previous release must NOT bleed in. (Its version string DOES
+        // appear in this heading's own compare URL, so check for its heading
+        // and its entries rather than the bare number.)
+        assert!(!s.contains("## [1.5.3]"), "{s}");
+        assert!(!s.contains("list ocx's direct upstreams"));
+
+        // A patch section works the same way, and is bounded below.
+        let p = changelog_section(log, "1.5.3");
+        assert!(p.starts_with("## [1.5.3]"));
+        assert!(p.contains("list ocx's direct upstreams"));
+        assert!(!p.contains("# [1.6.0]"));
+        assert!(!p.contains("**branch:**"));
+
+        // A version with no section (a dev build between releases) is empty, so
+        // the first-run modal stays quiet instead of showing the wrong notes.
+        assert_eq!(changelog_section(log, "9.9.9"), "");
+        assert_eq!(changelog_section("", "1.6.0"), "");
+    }
+
+    #[test]
+    fn the_shipped_changelog_has_a_section_for_this_build() {
+        // Guards the release wiring: the bundle jobs check out the tag
+        // semantic-release made, so a shipped binary must contain its own
+        // notes. If this fails, "what's new" would come up empty for users.
+        let v = app_version();
+        let s = changelog_section(CHANGELOG, &v);
+        assert!(!s.is_empty(), "CHANGELOG.md has no section for {v}");
+        assert!(s.contains(&v), "the {v} section does not name its version");
     }
 
     #[test]
