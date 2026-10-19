@@ -1,3 +1,10 @@
+# [1.8.0](https://github.com/louislafosse/hacksor/compare/v1.7.0...v1.8.0) (2026-10-19)
+
+
+### Features
+
+* **updates:** show the version, check for a newer one, and what changed ([a7e7102](https://github.com/louislafosse/hacksor/commit/a7e7102aa66dac708fe23250f8207154af498523))
+
 # [1.7.0](https://github.com/louislafosse/hacksor/compare/v1.6.0...v1.7.0) (2026-10-19)
 
 
