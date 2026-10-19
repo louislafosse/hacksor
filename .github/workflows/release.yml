@@ -121,12 +121,34 @@ jobs:
           # tag is a multi-arch manifest (amd64 + arm64), so every platform pulls
           # its native arch. A local build stays the automatic fallback.
           HACKSOR_RUNTIME_IMAGE: ghcr.io/louislafosse/hacksor-runtime:latest
-        # macOS/Windows builds are UNSIGNED by default (first-run warning on the
-        # user's machine). To enable Apple signing + notarization, add a separate
-        # step that sets APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
-        # APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID from
-        # secrets ONLY when they exist. Passing them here empty makes the bundler
-        # try (and fail) to import an empty certificate.
+          # Ad-hoc sign the macOS bundles.
+          #
+          # Without this the .app carries only the linker's stub signature: a
+          # hash-based identifier and NO sealed resources, which spctl rejects
+          # with "code has no resources but signature indicates they must be
+          # present". Combined with the browser's quarantine flag, macOS turns
+          # that into "Hacksor.app is damaged and can't be opened. You should
+          # move it to the Bin" - a dead end, with no way to open it.
+          #
+          # "-" is codesign's ad-hoc pseudo-identity, which Tauri's bundler
+          # applies DURING bundling, so the signature is inside the dmg rather
+          # than something the user has to repair afterwards. The result is a
+          # valid signature (Identifier=dev.hacksor.app, Sealed Resources v2)
+          # that passes `codesign --verify --deep --strict`.
+          #
+          # This does NOT remove Gatekeeper: an ad-hoc signature is not a
+          # Developer ID, so a downloaded build still has to be approved
+          # (right-click > Open, or Privacy & Security). It turns a fatal
+          # "damaged" error into an approvable prompt. Empty on non-macOS
+          # runners, where the bundler ignores it.
+          APPLE_SIGNING_IDENTITY: ${{ startsWith(matrix.platform, 'macos') && '-' || '' }}
+        # For a CLEAN double-click with no approval step, real signing +
+        # notarization is the only route: add a step that sets
+        # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
+        # APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
+        # from secrets ONLY when they exist (a real identity overrides the "-"
+        # above). Passing them here empty makes the bundler try - and fail - to
+        # import an empty certificate, which is why they are not listed.
         with:
           # Attach to the release semantic-release already created for this tag.
           tagName: v${{ needs.release.outputs.version }}
