@@ -1,3 +1,10 @@
+## [1.9.1](https://github.com/louislafosse/hacksor/compare/v1.9.0...v1.9.1) (2026-10-19)
+
+
+### Bug Fixes
+
+* **release:** ad-hoc sign the macOS bundles so they stop reporting "damaged" ([b105a03](https://github.com/louislafosse/hacksor/commit/b105a03a96d216a3f55a82a61b22f2a7a065c4fc))
+
 # [1.9.0](https://github.com/louislafosse/hacksor/compare/v1.8.0...v1.9.0) (2026-10-19)
 
 
