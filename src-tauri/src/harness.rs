@@ -682,6 +682,9 @@ fn write_context_window(codex_home: &std::path::Path, window: u64) {
 /// providers use the OpenAI-compatible `responses` wire API.
 fn write_provider_config(codex_home: &PathBuf, is_docker: bool) -> Result<()> {
     std::fs::create_dir_all(codex_home)?;
+    // Carried over from the last session: codex reads this file once, at
+    // startup, so a window discovered mid-session only takes effect now.
+    let carried = crate::settings::Settings::load(codex_home).model_context_window;
     let mut toml = String::from(
         "# Managed by Hacksor. Do not edit the provider blocks by hand.\n\
 # Every provider routes through the local OpenCodex proxy; the upstream is\n\
@@ -696,7 +699,14 @@ project_doc_max_bytes = 0\n\
 # has compacted once sits near the threshold forever, so it compacts again on\n\
 # almost every turn. Valid values are `total` and `body_after_prefix` (checked\n\
 # against app-server 0.162.1; anything else makes codex refuse to start).\n\
-model_auto_compact_token_limit_scope = \"body_after_prefix\"\n\
+model_auto_compact_token_limit_scope = \"body_after_prefix\"\n",
+    );
+    if let Some(win) = carried.filter(|w| *w > 0) {
+        // Top-level, so it must precede every [table] below.
+        toml.push_str(&format!("model_context_window = {win}\n"));
+    }
+    toml.push_str(
+        "\
 # codex 0.152+ ships update_plan disabled by default (it must be opted back in\n\
 # per-session); without this the model has no plan/todo tool and any attempt\n\
 # to call update_plan fails with \"unsupported call\". The persona explicitly\n\

@@ -1382,6 +1382,19 @@ pub async fn start_chat(
                 .and_then(|m| m.context_length)
         });
 
+    // Persist it: codex reads config.toml once, when the app-server starts, so
+    // a window found now cannot reach the running server — it is written for
+    // the next launch. The in-session write in start_thread keeps the file
+    // itself current in the meantime.
+    if let Some(win) = context_window.filter(|w| *w > 0) {
+        let effective = (win as f64 * 0.9) as u64;
+        let mut s = state.settings.lock().await;
+        if s.model_context_window != Some(effective) {
+            s.model_context_window = Some(effective);
+            let _ = s.save(&state.codex_home);
+        }
+    }
+
     harness
         .start_thread(StartParams {
             provider,
