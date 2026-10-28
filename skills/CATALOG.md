@@ -2,6 +2,18 @@
 
 Methodology only (no tools/scope). Read a skill file before testing that class: `cat <SKILLS_DIR>/<id>.md`
 
+## Reading these in Hacksor
+
+These are vendored from upstream Strix unchanged, so they occasionally name tools from that harness. Translate as you read:
+
+- `exec_command(...)` — just run it in your shell.
+- `create_finding(...)`, `create_dependency_report(...)` — record it with `hacksor-findings add` instead, and regenerate the report from that store.
+- `create_agent(..., skills=...)` — you read skills yourself with `cat`; to fan work out, use `hacksor-subagent`.
+- Caido / `caido_api` — not installed. The intercepting proxy here is `hacksor-proxy`.
+- `hurl` — not installed; `tooling/hurl` is still useful as method, but reach for curl or python.
+
+Anything else a skill assumes: confirm with `command -v <tool>` before concluding it is missing, and prefer the specialist tool over hand-rolled curl when it is there.
+
 ## analysis
 - `analysis/counterevidence` — Closure discipline for security findings — what counts as proof of safety, what does not, and how to record an unresolved candidate instead of silently dropping it
 - `analysis/fix_verification` — How to verify a proposed code fix before shipping it — the ordered gates, what disqualifies a fix, and when to withhold the suggestion instead
@@ -53,6 +65,21 @@ Methodology only (no tools/scope). Read a skill file before testing that class: 
 - `technologies/llm_applications` — End-to-end security testing for LLM, RAG, embedding, agent, and model-serving applications. Covers the OWASP Top 10 for LLM Applications 2026 (LLM01-LLM10): prompt injection, sensitive disclosure, excessive agency, supply chain, data/model poisoning, unbounded consumption, misinformation, hidden context exposure, vector weaknesses, and improper output handling. Use for architecture mapping, source review, black-box testing, and complete LLM application assessments.
 - `technologies/supabase` — Supabase security testing covering Row Level Security, PostgREST, Edge Functions, and service key exposure
 
+## tooling
+- `tooling/agent_browser` — agent-browser CLI for headless Chrome via shell. Snapshot-and-ref workflow, click/fill/extract, screenshots, multi-tab, multi-session, network mocking. Pre-installed in the sandbox; invoke via exec_command.
+- `tooling/ffuf` — ffuf fuzzing syntax with matcher/filter strategy and non-interactive defaults.
+- `tooling/httpx` — ProjectDiscovery httpx probing syntax, exact probe flags, and automation-safe output patterns.
+- `tooling/hurl` — Reproducible, reviewable HTTP request chains and response assertions with Hurl for authorized multi-step security validation, vulnerable-versus-fixed regression cases, captured values, and low-rate semantic oracles
+- `tooling/hypothesis` — Property-based local differential testing with Hypothesis for parsers, canonicalizers, serializers, validators, routers, and other pure functions, emphasizing explicit invariants, shrinking, reproducibility, and bounded resource use
+- `tooling/katana` — Katana crawler syntax, depth/js/known-files behavior, and stable concurrency controls.
+- `tooling/naabu` — Naabu port-scanning syntax with host input, scan-type, verification, and rate controls.
+- `tooling/nmap` — Canonical Nmap CLI syntax, two-pass scanning workflow, and sandbox-safe bounded scan patterns.
+- `tooling/nuclei` — Exact Nuclei command structure, template selection, and bounded high-throughput execution controls.
+- `tooling/python` — Run Python through exec_command in the SDK sandbox. Use the image-baked caido_api module for Caido proxy automation from Python scripts.
+- `tooling/semgrep` — Exact Semgrep CLI structure, metrics-off scanning, scoped ruleset selection, and automation-safe output patterns.
+- `tooling/sqlmap` — sqlmap target syntax, non-interactive execution, and common validation/enumeration workflows.
+- `tooling/subfinder` — Subfinder passive subdomain enumeration syntax, source controls, and pipeline-ready output patterns.
+
 ## vulnerabilities
 - `vulnerabilities/agentic_system_security` — Security testing for authorized AI agents and MCP-style tool ecosystems, covering effective authority, tool/resource/prompt inventory, confused-deputy behavior, side-effect authorization, cross-tenant isolation, executable component supply chain, shadow integrations, and repeatable safety regression
 - `vulnerabilities/argument_injection` — Test shell-free command argument injection across argv builders and CLI parsers, including option smuggling, response/config-file parsing, argument-boundary reparsing, and Windows Unicode-to-ANSI Best-Fit transformations
@@ -81,6 +108,5 @@ Methodology only (no tools/scope). Read a skill file before testing that class: 
 - `vulnerabilities/ssti` — Server-side template injection across Jinja / Mako / Velocity / Freemarker / Thymeleaf / Twig / Handlebars / EJS / ERB with engine fingerprinting, sandbox escape, and RCE gadget chains
 - `vulnerabilities/subdomain_takeover` — Subdomain takeover testing for dangling DNS records and unclaimed cloud resources
 - `vulnerabilities/weak_password_detection` — Weak password detection, credential stuffing, and brute-force testing using common passwords, system-generated credentials, and HTTP fuzzing / NSE brute-force tooling
-- `vulnerabilities/xss` — XSS testing covering reflected, stored, and DOM-based vectors with CSP bypass techniques
+- `vulnerabilities/xss` — XSS and HTML injection testing covering reflected, stored, DOM-based, and normalization-dependent vectors
 - `vulnerabilities/xxe` — XXE testing for external entity injection, file disclosure, and SSRF via XML parsers
-

@@ -16,6 +16,18 @@ pub fn extract_skills(codex_home: &Path) -> PathBuf {
     dst
 }
 
+/// How many skill files are bundled, counted from the embedded directory.
+fn skill_count() -> usize {
+    fn walk(d: &Dir) -> usize {
+        d.files().filter(|f| f.path().extension().is_some_and(|e| e == "md")).count()
+            + d.dirs().map(walk).sum::<usize>()
+    }
+    // CATALOG.md and README.md sit at the root and are not skills.
+    walk(&SKILLS).saturating_sub(
+        SKILLS.files().filter(|f| f.path().extension().is_some_and(|e| e == "md")).count(),
+    )
+}
+
 /// Common security tools worth advertising when present locally.
 const TOOLS: &[&str] = &[
     "nmap", "naabu", "httpx", "subfinder", "dnsrecon", "dnsenum", "whois", "gospider", "katana",
@@ -40,6 +52,9 @@ pub fn detect_tools() -> Vec<&'static str> {
 /// where the skills + notes live, and which security tools are present locally.
 pub fn env_note(skills_dir: &Path, notes_dir: &Path) -> String {
     let dir = skills_dir.to_string_lossy();
+    // Counted, not written down: the figure was stated as 62 and stayed 62
+    // through a refresh that brought the collection to 75.
+    let count = skill_count();
     let notes = notes_dir.to_string_lossy();
     let tools = detect_tools();
     let host_line = if tools.is_empty() {
@@ -55,10 +70,45 @@ pub fn env_note(skills_dir: &Path, notes_dir: &Path) -> String {
         "{host_line} NOTE: this scan is informational only and does NOT reflect the container you actually run in during Docker runtime mode — there the FULL specialist toolset (nmap, naabu, masscan, nuclei, httpx, subfinder, katana, ffuf, feroxbuster, sqlmap, dalfox, hydra, amass, hakrawler, gau, arjun, testssl.sh, interactsh, mitmproxy, agent-browser, …) is installed and on PATH. Always confirm a tool with `command -v <tool>` before deciding it is unavailable, and PREFER the specialist tool over hand-rolled curl.");
     format!(
         "<environment_capabilities>\n\
-Specialist methodology skills (62, methodology only — no tools or scope) are on disk at {dir}. \
+Specialist methodology skills ({count}, methodology only — no tools or scope) are on disk at {dir}. \
 Browse them with `cat {dir}/CATALOG.md` or `ls -R {dir}`, then read the relevant one before testing that vuln class: `cat {dir}/<id>.md` (e.g. `cat {dir}/vulnerabilities/ssrf.md`).\n\
 Persistent findings notes live in {notes} (Markdown files). Record important findings, methodology, and to-dos there so they persist across chats, and read them back when relevant.\n\
 {tools_line}\n\
 </environment_capabilities>"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_bundled_skill_is_in_the_catalog() {
+        // The catalog is the only index the agent reads before choosing a
+        // skill, so a skill missing from it is a skill that never gets used.
+        let catalog = SKILLS
+            .get_file("CATALOG.md")
+            .expect("skills/CATALOG.md is bundled")
+            .contents_utf8()
+            .expect("catalog is utf-8");
+        let mut missing = Vec::new();
+        fn walk(d: &Dir, catalog: &str, missing: &mut Vec<String>) {
+            for f in d.files() {
+                let p = f.path();
+                if p.extension().is_some_and(|e| e == "md") && p.parent().is_some_and(|x| !x.as_os_str().is_empty()) {
+                    let id = p.with_extension("");
+                    let id = id.to_string_lossy().to_string();
+                    if !catalog.contains(&format!("`{id}`")) {
+                        missing.push(id);
+                    }
+                }
+            }
+            for sub in d.dirs() {
+                walk(sub, catalog, missing);
+            }
+        }
+        walk(&SKILLS, catalog, &mut missing);
+        assert!(missing.is_empty(), "not listed in CATALOG.md: {missing:?}");
+        assert!(skill_count() >= 75, "expected the full collection, got {}", skill_count());
+    }
 }
