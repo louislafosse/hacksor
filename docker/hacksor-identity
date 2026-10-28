@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""hacksor-identity: throwaway inboxes for authorized engagement sign-ups.
+
+Registering on a target is part of many engagements, and the operator's real
+address must never be the one that lands there (see <operational_anonymity> in
+the persona). This creates disposable inboxes and reads them, so a verification
+link or code can be followed without using anything attributable.
+
+Backend: mail.tm's public REST API, used as documented. Inboxes are PRIVATE
+(token auth), unlike the public-inbox services where anyone can read the mail.
+
+Store: JSON, resolved in order: --store, $HACKSOR_IDENTITY_STORE,
+./identities.json if one already exists in the CWD, else ~/.hacksor/identities.json.
+
+Usage:
+  hacksor-identity new [--label signup]        create an inbox, print the address
+  hacksor-identity list                        inboxes created so far
+  hacksor-identity inbox <address>             list messages (newest first)
+  hacksor-identity read <address> <id>         one message, full text
+  hacksor-identity wait <address> [--timeout 180] [--code]
+                                               block until mail arrives;
+                                               --code prints the verification code only
+  hacksor-identity forget <address>            drop it from the store
+
+Note: mail.tm's domains are on the usual disposable-address blocklists, so a
+target that filters them will reject the address. That is a property of every
+free public service, not of this tool; use a catch-all on a domain you own when
+the target filters.
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import string
+import sys
+import time
+import urllib.error
+import urllib.request
+
+API = "https://api.mail.tm"
+UA = "hacksor-identity/1.0"
+
+
+def store_path(explicit=None):
+    if explicit:
+        return explicit
+    env = os.environ.get("HACKSOR_IDENTITY_STORE")
+    if env:
+        return env
+    if os.path.exists("identities.json"):
+        return "identities.json"
+    return os.path.expanduser("~/.hacksor/identities.json")
+
+
+def load(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save(path, data):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def api(method, route, body=None, token=None, timeout=25):
+    headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": UA}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(API + route, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+            return r.status, (json.loads(raw) if raw.strip() else {})
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, {"message": raw[:300]}
+    except Exception as e:
+        return 0, {"message": str(e)[:300]}
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def rand(n, pool=string.ascii_lowercase + string.digits):
+    return "".join(random.choices(pool, k=n))
+
+
+def members_of(payload):
+    """mail.tm answers /domains as a bare JSON array when asked for
+    application/json and as a hydra envelope otherwise. Accept both rather than
+    depending on which content type the server feels like honouring."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        return payload.get("hydra:member") or payload.get("member") or []
+    return []
+
+
+def cmd_new(a):
+    st, doms = api("GET", "/domains")
+    members = members_of(doms)
+    if st != 200 or not members:
+        die(f"could not read mail.tm domains (http {st})")
+    domain = members[0]["domain"]
+    # A forgettable mailbox name: no "pentest", no "test", nothing that reads as
+    # a security exercise, and nothing derived from the operator.
+    address = f"{rand(2, string.ascii_lowercase)}.{rand(6)}{random.randint(10, 99)}@{domain}"
+    password = rand(20, string.ascii_letters + string.digits)
+    st, acc = api("POST", "/accounts", {"address": address, "password": password})
+    if st not in (200, 201):
+        die(f"could not create the inbox (http {st}): {acc.get('message') or acc}")
+    st, tok = api("POST", "/token", {"address": address, "password": password})
+    if st != 200 or not tok.get("token"):
+        die(f"created {address} but could not get a token (http {st})")
+    p = store_path(a.store)
+    data = load(p)
+    data[address] = {
+        "password": password,
+        "token": tok["token"],
+        "id": acc.get("id", ""),
+        "label": a.label or "",
+        "created": int(time.time()),
+    }
+    save(p, data)
+    print(address)
+
+
+def entry(a, address):
+    data = load(store_path(a.store))
+    e = data.get(address)
+    if not e:
+        die(f"{address} is not in the store — create it with `hacksor-identity new`")
+    return e
+
+
+def refresh_token(a, address, e):
+    st, tok = api("POST", "/token", {"address": address, "password": e["password"]})
+    if st == 200 and tok.get("token"):
+        e["token"] = tok["token"]
+        p = store_path(a.store)
+        data = load(p)
+        data[address] = e
+        save(p, data)
+    return e["token"]
+
+
+def fetch_messages(a, address):
+    e = entry(a, address)
+    st, msgs = api("GET", "/messages", token=e["token"])
+    if st in (401, 403):  # tokens expire; one silent retry
+        st, msgs = api("GET", "/messages", token=refresh_token(a, address, e))
+    if st != 200:
+        die(f"could not read {address} (http {st})")
+    return members_of(msgs)
+
+
+def cmd_list(a):
+    data = load(store_path(a.store))
+    if not data:
+        print("(no inboxes yet)")
+        return
+    for addr, e in sorted(data.items(), key=lambda kv: kv[1].get("created", 0)):
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.get("created", 0)))
+        print(f"{addr:44} {when}  {e.get('label','')}")
+
+
+def cmd_inbox(a):
+    msgs = fetch_messages(a, a.address)
+    if not msgs:
+        print("(empty)")
+        return
+    for m in msgs:
+        frm = (m.get("from") or {}).get("address", "?")
+        print(f"{m.get('id','?')[:12]:14} {frm:34} {m.get('subject','')[:60]}")
+
+
+def message_text(a, address, mid):
+    e = entry(a, address)
+    st, m = api("GET", f"/messages/{mid}", token=e["token"])
+    if st in (401, 403):
+        st, m = api("GET", f"/messages/{mid}", token=refresh_token(a, address, e))
+    if st != 200:
+        die(f"could not read message {mid} (http {st})")
+    body = m.get("text") or ""
+    if not body:
+        html = " ".join(m.get("html") or [])
+        body = re.sub(r"<[^>]+>", " ", html)
+    return m, re.sub(r"[ \t]+", " ", body).strip()
+
+
+def cmd_read(a):
+    m, body = message_text(a, a.address, a.id)
+    print(f"from:    {(m.get('from') or {}).get('address','?')}")
+    print(f"subject: {m.get('subject','')}")
+    print()
+    print(body)
+
+
+# A verification code is almost always 4-8 digits standing on its own. Prefer one
+# that sits near a word like "code", and fall back to the first standalone run.
+CODE_NEAR = re.compile(r"(?:code|otp|pin|verification|verify)\D{0,24}(\d{4,8})", re.I)
+CODE_ANY = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
+
+
+def extract_code(text):
+    m = CODE_NEAR.search(text)
+    if m:
+        return m.group(1)
+    m = CODE_ANY.search(text)
+    return m.group(1) if m else ""
+
+
+def extract_link(text):
+    m = re.search(r"https?://\S{10,}", text)
+    return m.group(0).rstrip(').,"\'>') if m else ""
+
+
+def cmd_wait(a):
+    seen = {m.get("id") for m in fetch_messages(a, a.address)} if a.skip_existing else set()
+    deadline = time.time() + a.timeout
+    while time.time() < deadline:
+        for m in fetch_messages(a, a.address):
+            if m.get("id") in seen:
+                continue
+            full, body = message_text(a, a.address, m["id"])
+            if a.code:
+                code = extract_code(f"{full.get('subject','')} {body}")
+                if not code:
+                    continue  # a message, but not the one carrying the code
+                print(code)
+                return
+            if a.link:
+                link = extract_link(body)
+                if not link:
+                    continue
+                print(link)
+                return
+            print(f"from:    {(full.get('from') or {}).get('address','?')}")
+            print(f"subject: {full.get('subject','')}")
+            print()
+            print(body)
+            return
+        time.sleep(a.interval)
+    die(f"nothing arrived for {a.address} within {a.timeout}s", 2)
+
+
+def cmd_forget(a):
+    p = store_path(a.store)
+    data = load(p)
+    if data.pop(a.address, None) is None:
+        die(f"{a.address} was not in the store")
+    save(p, data)
+    print(f"forgot {a.address}")
+
+
+# ---------------------------------------------------------------- SMS (browser)
+#
+# Public SMS inbox sites publish their numbers and messages for anyone to read,
+# but they render with JavaScript, so a plain fetch returns an empty shell.
+# Hacksor already ships Camoufox for exactly this, and it is driven here through
+# its MCP interface rather than its private HTTP API, because MCP is the
+# supported surface and does not move between releases.
+#
+# Be a decent client: one page load per call, a polling floor, and no retry
+# storms. These are free services.
+
+CAMOFOX_MCP = os.environ.get("HACKSOR_CAMOFOX_MCP", "camofox-mcp")
+CAMOFOX_URL = os.environ.get("CAMOFOX_URL", "http://127.0.0.1:9377")
+
+# Where to read from. `numbers` lists the available numbers; `inbox` is the page
+# for one number, with {n} replaced by it.
+# Where to read from. The listing page of these sites is a country chooser with
+# no numbers on it — that is why `sms numbers` came back empty — so the country
+# is part of the URL and `--country` is required in practice.
+SMS_SOURCES = {
+    "quackr": {
+        "numbers": "https://quackr.io/temporary-numbers/{country}",
+        "inbox": "https://quackr.io/temporary-numbers/{country}/{n}",
+        "countries": {
+            "uk": "united-kingdom", "gb": "united-kingdom",
+            "us": "united-states", "ca": "canada", "fr": "france",
+            "de": "germany", "nl": "netherlands", "se": "sweden",
+            "pl": "poland", "es": "spain", "it": "italy", "fi": "finland",
+        },
+        "default": "united-kingdom",
+    },
+    "receivesms": {
+        "numbers": "https://www.receivesms.co/{country}-phone-numbers/",
+        "inbox": "https://www.receivesms.co/sms/{n}/",
+        "countries": {
+            "uk": "british", "gb": "british", "us": "usa", "ca": "canadian",
+            "fr": "french", "de": "german", "nl": "dutch", "au": "australian",
+            "br": "brazilian", "cn": "chinese",
+        },
+        "default": "british",
+    },
+}
+
+
+def source_for(name, country):
+    """Resolve a source and a country slug, or exit with what IS available."""
+    src = SMS_SOURCES.get(name)
+    if not src:
+        die(f"unknown source {name} (have: {', '.join(SMS_SOURCES)})")
+    if not country:
+        return src, src["default"]
+    key = country.strip().lower()
+    slug = src["countries"].get(key)
+    if not slug:
+        # Accept the site's own slug too, so an unlisted country still works.
+        slug = key if "-" in key or len(key) > 3 else None
+    if not slug:
+        die(f"unknown country {country} for {name} "
+            f"(known: {', '.join(sorted(src['countries']))}; or pass the site's own slug)")
+    return src, slug
+
+
+class Mcp:
+    """A minimal MCP stdio client, enough to drive the browser tools."""
+
+    def __init__(self, cmd):
+        import subprocess
+        import threading
+        self.p = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1, env={**os.environ, "CAMOFOX_URL": CAMOFOX_URL},
+        )
+        self.res = {}
+        self.n = 0
+        threading.Thread(target=self._read, daemon=True).start()
+        self.call("initialize", {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "hacksor-identity", "version": "1.0"},
+        }, timeout=120)
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+
+    def _read(self):
+        for line in self.p.stdout:
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if "id" in o:
+                self.res[o["id"]] = o
+
+    def _send(self, obj):
+        self.p.stdin.write(json.dumps(obj) + "\n")
+        self.p.stdin.flush()
+
+    def call(self, method, params=None, timeout=120):
+        self.n += 1
+        i = self.n
+        self._send({"jsonrpc": "2.0", "id": i, "method": method, "params": params or {}})
+        end = time.time() + timeout
+        while time.time() < end:
+            if i in self.res:
+                return self.res.pop(i)
+            if self.p.poll() is not None:
+                return {"error": {"message": "camofox-mcp exited"}}
+            time.sleep(0.05)
+        return {"error": {"message": f"timeout after {timeout}s"}}
+
+    def tool(self, name, args, timeout=120):
+        r = self.call("tools/call", {"name": name, "arguments": args}, timeout)
+        if "error" in r:
+            raise RuntimeError(r["error"].get("message", "mcp error"))
+        res = r.get("result") or {}
+        text = " ".join(c.get("text", "") for c in (res.get("content") or []) if c.get("type") == "text")
+        if res.get("isError"):
+            raise RuntimeError(text[:300])
+        return text
+
+    def close(self):
+        try:
+            self.p.kill()
+        except Exception:
+            pass
+
+
+def page_text(url, timeout=120):
+    """Render a page with Camoufox and return its visible text."""
+    m = Mcp([CAMOFOX_MCP])
+    try:
+        out = m.tool("create_tab", {})
+        tab = (re.search(r'"tabId"\s*:\s*"([^"]+)"', out) or [None, None])[1]
+        if not tab:
+            raise RuntimeError("camoufox did not return a tab (is the browser daemon up?)")
+        m.tool("navigate_and_snapshot", {"tabId": tab, "url": url, "timeout": 60000}, timeout=timeout)
+        body = m.tool("camofox_evaluate_js", {"tabId": tab, "expression": "document.body.innerText"})
+        try:
+            m.tool("camofox_close_session", {"tabId": tab}, timeout=30)
+        except Exception:
+            pass
+        mm = re.search(r'"result"\s*:\s*"(.*)"\s*,\s*"resultType"', body, re.S) or re.search(r'"result"\s*:\s*"(.*)"', body, re.S)
+        raw = mm.group(1) if mm else body
+        return raw.encode().decode("unicode_escape", "replace")
+    finally:
+        m.close()
+
+
+PHONE = re.compile(r"\+?\d[\d \-()]{7,17}\d")
+
+
+def cmd_sms_numbers(a):
+    src, country = source_for(a.source, a.country)
+    text = page_text(src["numbers"].format(country=country))
+    seen, out = set(), []
+    for cand in PHONE.findall(text):
+        n = re.sub(r"\D", "", cand)
+        if 8 <= len(n) <= 15 and n not in seen:
+            seen.add(n)
+            out.append(n)
+    # 15551234567 and friends are documentation placeholders the US pages show
+    # instead of a real list; reporting them as numbers wastes an SMS wait.
+    out = [n for n in out if not re.match(r"^1?555\d{7}$", n)]
+    if not out:
+        die(f"no numbers listed for {country} on {a.source} — try another country "
+            f"(--country) or source (--source)", 2)
+    for n in out[: a.limit]:
+        print(n)
+
+
+def sms_messages(a, number):
+    src, country = source_for(a.source, a.country)
+    text = page_text(src["inbox"].format(n=re.sub(r"\D", "", number), country=country))
+    # Keep lines that look like message rows; the pages wrap them in tables whose
+    # markup differs per site, so work from the rendered text instead.
+    return [l.strip() for l in text.splitlines() if len(l.strip()) > 12]
+
+
+def cmd_sms_inbox(a):
+    for line in sms_messages(a, a.number)[: a.limit]:
+        print(line)
+
+
+def cmd_sms_wait(a):
+    before = set(sms_messages(a, a.number)) if a.skip_existing else set()
+    deadline = time.time() + a.timeout
+    interval = max(a.interval, 10)  # a floor: these are free services
+    while time.time() < deadline:
+        time.sleep(interval)
+        for line in sms_messages(a, a.number):
+            if line in before:
+                continue
+            if a.code:
+                code = extract_code(line)
+                if not code:
+                    continue
+                print(code)
+                return
+            print(line)
+            return
+    die(f"nothing arrived for {a.number} within {a.timeout}s", 2)
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(description="Throwaway inboxes for authorized engagement sign-ups.")
+    ap.add_argument("--store", help="identities JSON (default: $HACKSOR_IDENTITY_STORE or ~/.hacksor/identities.json)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("new", help="create an inbox and print its address")
+    p.add_argument("--label", help="what it is for, e.g. the target or the flow")
+    p.set_defaults(fn=cmd_new)
+
+    p = sub.add_parser("list", help="inboxes created so far")
+    p.set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("inbox", help="list messages, newest first")
+    p.add_argument("address")
+    p.set_defaults(fn=cmd_inbox)
+
+    p = sub.add_parser("read", help="print one message in full")
+    p.add_argument("address")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_read)
+
+    p = sub.add_parser("wait", help="block until mail arrives")
+    p.add_argument("address")
+    p.add_argument("--timeout", type=int, default=180)
+    p.add_argument("--interval", type=int, default=3)
+    p.add_argument("--code", action="store_true", help="print only the verification code")
+    p.add_argument("--link", action="store_true", help="print only the first link")
+    p.add_argument("--skip-existing", action="store_true", default=True,
+                   help="ignore mail already in the box (default)")
+    p.set_defaults(fn=cmd_wait)
+
+    p = sub.add_parser("forget", help="remove an inbox from the store")
+    p.add_argument("address")
+    p.set_defaults(fn=cmd_forget)
+
+    # --- SMS, read through the browser (the pages are JavaScript-rendered) ---
+    sms = sub.add_parser("sms", help="public SMS inboxes, read with Camoufox").add_subparsers(dest="smscmd", required=True)
+
+    p = sms.add_parser("numbers", help="list the numbers a source is offering")
+    p.add_argument("--country", help="uk, us, fr, de … (default: the source's own)")
+    p.add_argument("--source", default="quackr", choices=sorted(SMS_SOURCES))
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(fn=cmd_sms_numbers)
+
+    p = sms.add_parser("inbox", help="recent messages for one number")
+    p.add_argument("--country", help="uk, us, fr, de … (default: the source's own)")
+    p.add_argument("number")
+    p.add_argument("--source", default="quackr", choices=sorted(SMS_SOURCES))
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(fn=cmd_sms_inbox)
+
+    p = sms.add_parser("wait", help="poll until a new message appears")
+    p.add_argument("--country", help="uk, us, fr, de … (default: the source's own)")
+    p.add_argument("number")
+    p.add_argument("--source", default="quackr", choices=sorted(SMS_SOURCES))
+    p.add_argument("--timeout", type=int, default=300)
+    p.add_argument("--interval", type=int, default=15)
+    p.add_argument("--code", action="store_true", help="print only the verification code")
+    p.add_argument("--skip-existing", action="store_true", default=True)
+    p.set_defaults(fn=cmd_sms_wait)
+    return ap
+
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
+    args.fn(args)
