@@ -312,6 +312,9 @@ const IC = (path: string) =>
   `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${path}</svg>`;
 const SEARCH_ICON = IC('<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>');
 const ATTACH_ICON = IC('<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>');
+const FOLDER_ICON =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>';
 const NOTES_ICON = IC('<path d="M15 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M15 3v5h5"/><path d="M9 13h6"/><path d="M9 17h4"/>');
 const SETTINGS_ICON = IC('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>');
 
@@ -625,6 +628,7 @@ app.innerHTML = `
           <button class="tchip ctx" id="ctxchip" hidden title="Context used">0%</button>
           <div id="moremount" class="more-wrap"></div>
           <div class="grow"></div>
+          <button class="icon-btn eng" id="engagementbtn" hidden title="Findings, report and artifacts for this engagement">${FOLDER_ICON}</button>
           <button class="icon-btn attach" id="attach" title="Attach files">${ATTACH_ICON}</button>
           <button class="send" id="send" title="Send">↑</button>
         </div>
@@ -861,6 +865,7 @@ document.getElementById("newchat")!.addEventListener("click", () => newSession()
 document.getElementById("catadd")!.addEventListener("click", () => openCategoryDialog());
 document.getElementById("settingsbtn")!.addEventListener("click", () => openSettings());
 document.getElementById("notesbtn")!.addEventListener("click", () => openNotes());
+document.getElementById("engagementbtn")!.addEventListener("click", () => openEngagement());
 document.getElementById("searchbtn")!.addEventListener("click", () => openSearch());
 document.getElementById("td-close")!.addEventListener("click", closeToolDrawer);
 // The command is one ellipsised line so the header stays compact, but a tool
@@ -1021,6 +1026,10 @@ function updateChips() {
   // The meter measures against the CURRENT model's window, so repaint it
   // whenever the chips change — switching model, Auto, or session.
   renderContextMeter(activeSession());
+  // Only offer the engagement view when there is an engagement: on an ordinary
+  // chat the button would open nothing and just add noise to the toolbar.
+  const engBtn = document.getElementById("engagementbtn");
+  if (engBtn) engBtn.hidden = !(activeSession()?.ledgerHostDir || activeSession()?.ledgerDir);
   renderComposerMenu();
   // Effort is auto-managed while Auto is on, so hide the (non-interactive) chip.
   renderContextMeter(activeSession());
@@ -3029,8 +3038,10 @@ function addAutoNote(session: Session, model: string, phase?: AutoPhase) {
   note.innerHTML = html;
   session.turnsEl.appendChild(note);
 }
-function addAutoNoteText(session: Session, text: string) {
-  session.turnsEl.appendChild(el("div", "auto-note", escapeHtml(text)));
+function addAutoNoteText(session: Session, text: string): HTMLElement {
+  const node = el("div", "auto-note", escapeHtml(text));
+  session.turnsEl.appendChild(node);
+  return node;
 }
 
 // A model that WRITES its tool call into the message body instead of calling
@@ -3180,9 +3191,15 @@ async function openLedger(session: Session, firstPrompt: string): Promise<string
     session.ledgerFindings = l.findings;
     session.ledgerNotes = l.notes;
     persistOpenChats();
-    addAutoNoteText(session, l.created
+    const note = addAutoNoteText(session, l.created
       ? `📁 Engagement directory: ${l.host_dir}`
       : `📁 Continuing the existing engagement: ${l.host_dir}`);
+    // The note names the directory, so it may as well open it.
+    if (note) {
+      note.classList.add("clickable");
+      note.title = "Open findings, report and artifacts";
+      note.addEventListener("click", () => void openEngagement());
+    }
     return [
       "<engagement_ledger>",
       `This session's engagement directory is ${l.dir}. It is the record of this`,
@@ -4408,6 +4425,61 @@ async function vpnGate(): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------- settings
+
+type EngagementViewData = {
+  dir: string;
+  findings: {
+    id: string; title: string; severity: string; cvss: string; cvss_vector: string;
+    owasp: string; url: string; description: string; evidence: string;
+    remediation: string; status: string;
+  }[];
+  files: { rel: string; size: number; modified: number; dir: boolean }[];
+  has_notes: boolean; has_report: boolean; has_residual: boolean; total_bytes: number;
+};
+
+// ----------------------------------------------------------- engagement view
+
+// Show the engagement directory: findings, the report, the evidence.
+//
+// All of it already sat on disk, but reading any of it meant leaving the app
+// for a file manager — which is exactly when you stop checking that the report
+// still matches the work.
+async function openEngagement() {
+  const session = activeSession();
+  const dir = session?.ledgerHostDir || session?.ledgerDir;
+  if (!dir) {
+    alert("This chat has no engagement directory.\n\nOne is created when a chat starts a pentest against a named target.");
+    return;
+  }
+  let view: EngagementViewData;
+  try {
+    view = await invoke<EngagementViewData>("engagement_view", { dir });
+  } catch (e) {
+    alert(String(e));
+    return;
+  }
+  const [{ mountOverlay }, { createElement }, { EngagementPanel }] = await Promise.all([
+    import("./react/mount"),
+    import("react"),
+    import("./react/EngagementPanel"),
+  ]);
+  mountOverlay((done) =>
+    createElement(
+      "div",
+      { className: "modal-bg", onMouseDown: (e: MouseEvent) => { if (e.target === e.currentTarget) done(); } },
+      createElement(
+        "div",
+        { className: "engagement-shell" },
+        createElement(EngagementPanel, {
+          view,
+          onOpenFile: (rel: string) => invoke<string>("engagement_file", { dir, rel }),
+          onReveal: (rel?: string) => void invoke("engagement_reveal", { dir, rel: rel ?? null }).catch((e) => alert(String(e))),
+          onClose: done,
+        }),
+      ),
+    ),
+  );
+}
 
 // ---------------------------------------------------------------- notes
 

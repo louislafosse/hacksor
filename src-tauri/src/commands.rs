@@ -4192,6 +4192,222 @@ pub async fn vpn_status() -> Result<VpnStatus, String> {
     Ok(st)
 }
 
+/// One finding as `hacksor-findings` stores it (JSONL, one object per line).
+#[derive(serde::Serialize, Default)]
+pub struct Finding {
+    pub id: String,
+    pub title: String,
+    pub severity: String,
+    pub cvss: String,
+    pub cvss_vector: String,
+    pub owasp: String,
+    pub url: String,
+    pub description: String,
+    pub evidence: String,
+    pub remediation: String,
+    pub status: String,
+}
+
+/// A file inside the engagement directory, for the browser.
+#[derive(serde::Serialize)]
+pub struct EngagementFile {
+    /// Path relative to the engagement root, which is also the key used to read it.
+    pub rel: String,
+    pub size: u64,
+    /// Seconds since the epoch, for sorting by recency.
+    pub modified: u64,
+    pub dir: bool,
+}
+
+/// Everything the UI needs to show one engagement at a glance.
+#[derive(serde::Serialize, Default)]
+pub struct EngagementView {
+    pub dir: String,
+    pub findings: Vec<Finding>,
+    pub files: Vec<EngagementFile>,
+    /// Present-and-readable markers for the documents the panel links to.
+    pub has_notes: bool,
+    pub has_report: bool,
+    pub has_residual: bool,
+    pub total_bytes: u64,
+}
+
+fn as_str(v: &serde_json::Value, k: &str) -> String {
+    v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+}
+
+/// Rank for sorting: the worst finding should be the first one read.
+fn severity_rank(s: &str) -> u8 {
+    match s.to_ascii_lowercase().as_str() {
+        "critical" => 0,
+        "high" => 1,
+        "medium" => 2,
+        "low" => 3,
+        _ => 4,
+    }
+}
+
+/// Resolve `rel` inside `root`, refusing anything that escapes it.
+///
+/// The panel passes paths that came from a listing, but a bug or a crafted
+/// name must not turn a read of the engagement directory into a read of the
+/// whole disk — so both sides are canonicalised and the result has to still
+/// be under the root.
+fn engagement_path(root: &std::path::Path, rel: &str) -> Option<PathBuf> {
+    let root = root.canonicalize().ok()?;
+    let joined = root.join(rel).canonicalize().ok()?;
+    joined.starts_with(&root).then_some(joined)
+}
+
+/// Walk the engagement directory, newest first, bounded so a 60k-file tree
+/// cannot stall the UI.
+fn walk_engagement(root: &std::path::Path, out: &mut Vec<EngagementFile>, total: &mut u64, budget: &mut usize) {
+    let Ok(rd) = std::fs::read_dir(root) else { return };
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        if *budget == 0 {
+            return;
+        }
+        let path = e.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            walk_engagement(&path, out, total, budget);
+            continue;
+        }
+        *budget -= 1;
+        *total += meta.len();
+        out.push(EngagementFile {
+            rel: String::new(), // filled by the caller, which knows the root
+            size: meta.len(),
+            modified: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            dir: false,
+        });
+        // Store the path separately so `rel` can be computed once below.
+        out.last_mut().unwrap().rel = path.to_string_lossy().into_owned();
+    }
+}
+
+/// How many files the browser lists. An engagement can hold tens of thousands
+/// (one here holds 60,798); the panel is for navigating the work, not for
+/// mirroring the filesystem.
+const ENGAGEMENT_FILE_CAP: usize = 4000;
+
+#[tauri::command]
+pub async fn engagement_view(dir: String) -> Result<EngagementView, String> {
+    tokio::task::spawn_blocking(move || {
+        let root = PathBuf::from(&dir);
+        if !root.is_dir() {
+            return Err(format!("{} is not a directory", root.display()));
+        }
+        let mut view = EngagementView { dir: dir.clone(), ..Default::default() };
+
+        // Findings: JSONL, newest store wins, worst severity first.
+        for name in ["findings.json", "findings.jsonl"] {
+            let p = root.join(name);
+            let Ok(text) = std::fs::read_to_string(&p) else { continue };
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                view.findings.push(Finding {
+                    id: as_str(&v, "id"),
+                    title: as_str(&v, "title"),
+                    severity: as_str(&v, "severity"),
+                    cvss: as_str(&v, "cvss"),
+                    cvss_vector: as_str(&v, "cvss_vector"),
+                    owasp: as_str(&v, "owasp"),
+                    url: as_str(&v, "url"),
+                    description: as_str(&v, "description"),
+                    evidence: as_str(&v, "evidence"),
+                    remediation: as_str(&v, "remediation"),
+                    status: as_str(&v, "status"),
+                });
+            }
+            if !view.findings.is_empty() {
+                break;
+            }
+        }
+        view.findings.sort_by_key(|f| severity_rank(&f.severity));
+
+        view.has_notes = root.join("ENGAGEMENT_NOTES.md").is_file();
+        view.has_report = root.join("deliverables/report.md").is_file();
+        view.has_residual = root.join("RESIDUAL_STATE.md").is_file();
+
+        let mut files = Vec::new();
+        let mut budget = ENGAGEMENT_FILE_CAP;
+        walk_engagement(&root, &mut files, &mut view.total_bytes, &mut budget);
+        let prefix = format!("{}/", root.to_string_lossy());
+        for f in &mut files {
+            if let Some(stripped) = f.rel.strip_prefix(&prefix) {
+                f.rel = stripped.to_string();
+            }
+        }
+        files.sort_by(|a, b| b.modified.cmp(&a.modified));
+        view.files = files;
+        Ok(view)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Read one file from the engagement directory for preview.
+/// Open the engagement directory, or one file in it, in the OS file manager.
+///
+/// The panel reads text; evidence is also packet captures, screenshots and
+/// binaries it will not preview, and a report is often the thing you want to
+/// hand to someone. Rather than reimplement a file manager, hand off to the
+/// one the machine already has.
+#[tauri::command]
+pub async fn engagement_reveal(dir: String, rel: Option<String>) -> Result<(), String> {
+    let root = PathBuf::from(&dir);
+    if !root.is_dir() {
+        return Err(format!("{} is not a directory", root.display()));
+    }
+    // A relative path still has to resolve inside the engagement: this opens
+    // things with the desktop's own handlers, so it must not be steerable.
+    let target = match rel.as_deref().filter(|r| !r.is_empty()) {
+        Some(r) => engagement_path(&root, r)
+            .ok_or_else(|| "that path is outside the engagement directory".to_string())?,
+        None => root.canonicalize().map_err(|e| e.to_string())?,
+    };
+    platform::open_url(&target.to_string_lossy()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn engagement_file(dir: String, rel: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let root = PathBuf::from(&dir);
+        let Some(path) = engagement_path(&root, &rel) else {
+            return Err("that path is outside the engagement directory".to_string());
+        };
+        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        // Artifacts include packet captures and binaries; the panel previews
+        // text, and says so rather than hanging on a 200 MB file.
+        const PREVIEW_MAX: u64 = 2 * 1024 * 1024;
+        if meta.len() > PREVIEW_MAX {
+            return Err(format!(
+                "{} is {:.1} MB — too large to preview; open it from the engagement directory",
+                rel,
+                meta.len() as f64 / 1_048_576.0
+            ));
+        }
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        if bytes.contains(&0) {
+            return Err(format!("{rel} looks binary"));
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn notes_dir(state: &AppState) -> PathBuf {
     state.codex_home.join("notes")
 }
@@ -4502,6 +4718,34 @@ mod transcript_tests {
         assert_eq!(std::fs::read_to_string(dir.join("ENGAGEMENT_NOTES.md")).unwrap(), "REAL WORK");
         assert!(std::fs::read_to_string(dir.join("findings.jsonl")).unwrap().contains(r#""id""#));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_engagement_read_cannot_escape_its_directory() {
+        let root = std::env::temp_dir().join(format!("hacksor-eng-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("artifacts")).unwrap();
+        std::fs::write(root.join("artifacts/scan.txt"), "ok").unwrap();
+        // A secret OUTSIDE the engagement, which the panel must never reach.
+        std::fs::write(root.parent().unwrap().join("outside.txt"), "secret").unwrap();
+
+        assert!(engagement_path(&root, "artifacts/scan.txt").is_some());
+        for escape in ["../outside.txt", "artifacts/../../outside.txt", "/etc/hosts"] {
+            assert!(
+                engagement_path(&root, escape).is_none(),
+                "{escape} should not resolve inside the engagement"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn findings_are_ordered_worst_first() {
+        let mut v = ["low", "critical", "info", "high", "medium"];
+        v.sort_by_key(|s| severity_rank(s));
+        assert_eq!(v, ["critical", "high", "medium", "low", "info"]);
+        // An unknown severity sorts last rather than first.
+        assert!(severity_rank("banana") >= severity_rank("low"));
     }
 
     #[test]

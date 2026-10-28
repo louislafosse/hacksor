@@ -1535,7 +1535,7 @@ input[type="checkbox"]:disabled { opacity: .4; cursor: default; }
    there is nothing to say a menu is behind them — which is part of why the
    effort control read as dead. The context chip is excluded: it opens a
    read-only detail panel, not a choice. */
-.toolbar .tchip:not(.ctx):not(.more)::after,
+.toolbar .tchip:not(.ctx):not(.more):not(.eng)::after,
 .more-menu .tchip::after {
   content: "";
   display: inline-block;
@@ -1679,3 +1679,40 @@ input[type="checkbox"]:disabled { opacity: .4; cursor: default; }
    more presence than the surrounding panels. */
 .composer { border-radius: 18px; }
 .composer .toolbar { gap: 7px; }
+
+/* The engagement panel fills most of the window: it is a working view of the
+   whole directory, not a dialog to glance at. */
+.engagement-shell {
+  width: min(1080px, 92vw);
+  height: min(760px, 86vh);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+}
+
+/* ---- engagement entry points ----
+   Beside the attachment button rather than among the chips: those set how the
+   turn runs, this opens the work. It stays hidden until the chat has an
+   engagement, so an ordinary chat is not offered a button to nowhere. */
+.icon-btn.eng svg { width: 17px; height: 17px; }
+.icon-btn.eng:hover { color: var(--foreground); background: var(--accent); }
+/* The note that announces the directory opens it. */
+.auto-note.clickable { cursor: pointer; }
+.auto-note.clickable:hover { color: var(--foreground); text-decoration: underline; text-underline-offset: 3px; }
+
+/* ---- engagement file preview ----
+   Markdown reuses the transcript's own `.bubble` rules, so notes and the
+   report read exactly as an answer does. Code keeps the same highlight theme
+   as fenced blocks in chat. */
+.pv-body .pv-code {
+  margin: 0;
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  overflow-x: auto;
+}
+.pv-body .pv-code code { font-family: var(--font-mono); font-size: 12px; line-height: 1.55; }
+.pv-body.bubble { font-size: 13.5px; line-height: 1.6; }
+.pv-body.bubble > :first-child { margin-top: 0; }
