@@ -1,3 +1,17 @@
+# [1.13.0](https://github.com/louislafosse/hacksor/compare/v1.12.0...v1.13.0) (2026-10-28)
+
+
+### Bug Fixes
+
+* **chat:** stop responds immediately instead of waiting out the turn ([c5ad6ca](https://github.com/louislafosse/hacksor/commit/c5ad6ca0a55a3126c2212bca30f09693b0a2e3fa))
+* **engagement:** re-attach a chat to its engagement directory ([cf2c0ad](https://github.com/louislafosse/hacksor/commit/cf2c0aded60948fc09bbd110b40fabf42bfbf548))
+
+
+### Features
+
+* **categories:** pick any emoji, by name ([7d59115](https://github.com/louislafosse/hacksor/commit/7d591153ee9ad472b751ea832bb2fa73a316095e))
+* **engagement:** a view of the findings, report and evidence in the app ([a4c5364](https://github.com/louislafosse/hacksor/commit/a4c5364eb21c73a4604a7f92c8e023c01d9f27d5))
+
 # [1.12.0](https://github.com/louislafosse/hacksor/compare/v1.11.0...v1.12.0) (2026-10-28)
 
 
