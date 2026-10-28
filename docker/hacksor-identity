@@ -68,6 +68,32 @@ def save(path, data):
         json.dump(data, f, indent=2)
 
 
+def get_token(address, password, tries=5):
+    """Ask for a token, retrying while the account settles.
+
+    mail.tm answers /token with 401 for a short window after /accounts has
+    already returned 201: the account exists but is not yet usable. A single
+    attempt therefore throws away a mailbox that would have worked a second
+    later. Backs off 0.6s, 1.2s, 2.4s, 4.8s — about nine seconds in all, which
+    covers what has been observed without hanging a turn.
+    """
+    delay = 0.6
+    last = (0, {})
+    for n in range(tries):
+        st, tok = api("POST", "/token", {"address": address, "password": password})
+        if st == 200 and tok.get("token"):
+            return st, tok
+        last = (st, tok)
+        # 429 is rate limiting rather than settling: the same backoff applies,
+        # but anything other than these two is a real failure, so stop.
+        if st not in (401, 429):
+            break
+        if n < tries - 1:
+            time.sleep(delay)
+            delay *= 2
+    return last
+
+
 def api(method, route, body=None, token=None, timeout=25):
     headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": UA}
     if token:
@@ -116,25 +142,46 @@ def cmd_new(a):
     domain = members[0]["domain"]
     # A forgettable mailbox name: no "pentest", no "test", nothing that reads as
     # a security exercise, and nothing derived from the operator.
-    address = f"{rand(2, string.ascii_lowercase)}.{rand(6)}{random.randint(10, 99)}@{domain}"
+    # No dot in the local part: mail.tm strips dots when it stores the address,
+    # so "ab.cdef12@..." becomes "abcdef12@..." and every later login with the
+    # dotted form came back "Invalid credentials" — a working mailbox that
+    # looked broken from the first request.
+    address = f"{rand(2, string.ascii_lowercase)}{rand(6)}{random.randint(10, 99)}@{domain}"
     password = rand(20, string.ascii_letters + string.digits)
     st, acc = api("POST", "/accounts", {"address": address, "password": password})
     if st not in (200, 201):
         die(f"could not create the inbox (http {st}): {acc.get('message') or acc}")
-    st, tok = api("POST", "/token", {"address": address, "password": password})
-    if st != 200 or not tok.get("token"):
-        die(f"created {address} but could not get a token (http {st})")
+    if os.environ.get("HACKSOR_IDENTITY_DEBUG"):
+        print(f"debug: POST /accounts -> {st} {json.dumps(acc)[:400]}", file=sys.stderr)
+    # Authenticate against the address the SERVER recorded, not the one asked
+    # for: if it normalises the address at all, logging in with ours fails with
+    # a flat "Invalid credentials" and the mailbox looks broken.
+    if isinstance(acc.get("address"), str) and acc["address"] and acc["address"] != address:
+        print(f"note: server stored {acc['address']} (asked for {address})", file=sys.stderr)
+        address = acc["address"]
+    st, tok = get_token(address, password)
+    # Record the mailbox even without a token. It exists on the server either
+    # way, and the password is the only thing that can ever reach it again —
+    # dying here was losing a real inbox over a transient 401.
     p = store_path(a.store)
     data = load(p)
     data[address] = {
         "password": password,
-        "token": tok["token"],
+        "token": tok.get("token", ""),
         "id": acc.get("id", ""),
         "label": a.label or "",
         "created": int(time.time()),
     }
     save(p, data)
     print(address)
+    if not tok.get("token"):
+        # Not fatal: the address is saved and `inbox` re-authenticates. Say so
+        # on stderr so the address stays the only thing on stdout.
+        print(
+            f"note: no token yet (http {st}); the inbox is saved and will "
+            f"authenticate on first use",
+            file=sys.stderr,
+        )
 
 
 def entry(a, address):
@@ -146,7 +193,7 @@ def entry(a, address):
 
 
 def refresh_token(a, address, e):
-    st, tok = api("POST", "/token", {"address": address, "password": e["password"]})
+    st, tok = get_token(address, e["password"])
     if st == 200 and tok.get("token"):
         e["token"] = tok["token"]
         p = store_path(a.store)
