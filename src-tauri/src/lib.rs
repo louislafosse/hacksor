@@ -35,6 +35,12 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        // Self-update. The updater is only CONFIGURED in CI builds
+        // (src-tauri/tauri.updater.conf.json), so in a local build the plugin
+        // is present but inert and the frontend falls back to opening the
+        // release page.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let codex_home = app
                 .path()
@@ -67,6 +73,11 @@ pub fn run() {
             commands::verify_turn,
             commands::judge_phase,
             commands::suggest_title,
+            commands::ledger_init,
+            commands::suggest_target,
+            commands::purge_thread,
+            commands::vpn_status,
+            commands::vpn_route,
             commands::review_action,
             commands::list_models,
             commands::get_settings,

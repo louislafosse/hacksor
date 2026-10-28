@@ -227,6 +227,10 @@ pub struct RunSpec {
     pub name: String,
     pub host_home: String,      // bind mount source (host path)
     pub container_home: String, // bind mount target + HOME + workdir
+    /// Extra `host:container` binds, used when the mount is narrowed to the
+    /// working directory: the codex home lives outside it and the harness
+    /// cannot run without it.
+    pub extra_binds: Vec<String>,
     /// Use host networking + full caps + tun. True only on REAL rootful Linux:
     /// Docker Desktop has no host networking, and rootless Docker's "host" is
     /// RootlessKit's namespace (not the real host) and can't grant SYS_ADMIN/tun.
@@ -284,6 +288,10 @@ pub async fn create_and_start(spec: &RunSpec) -> Result<(), String> {
     }
     args.push("-v".into());
     args.push(binds);
+    for b in &spec.extra_binds {
+        args.push("-v".into());
+        args.push(b.clone());
+    }
     args.push("-e".into());
     args.push(home_env);
     args.push("-w".into());
@@ -517,6 +525,7 @@ mod tests {
             name: "hacksor-runtime-test".into(),
             host_home: home.clone(),
             container_home: home.clone(),
+            extra_binds: vec![],
             host_net: cfg!(target_os = "linux"),
             tun: tun_present(),
             publish_ports: vec![],

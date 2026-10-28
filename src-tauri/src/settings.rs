@@ -57,6 +57,22 @@ pub struct Settings {
     /// "what changed" is meaningless before there is a previous version.
     #[serde(default)]
     pub last_seen_version: Option<String>,
+    /// Warn before sending in Agent mode when the traffic is not leaving
+    /// through a tunnel. ON by default: reaching a target from the operator's
+    /// own address is the kind of mistake that is only noticed afterwards, and
+    /// the warning is one dialog that can be turned off in Settings.
+    #[serde(default = "default_true")]
+    pub warn_without_vpn: bool,
+    /// Mount only the working directory (plus Hacksor's own codex home) into
+    /// the runtime instead of the whole home directory. Off by default: it is
+    /// a real restriction and an engagement that reads files from elsewhere in
+    /// $HOME would start failing without warning.
+    #[serde(default)]
+    pub limit_runtime_mount: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_services_mode() -> String {
@@ -97,6 +113,8 @@ impl Default for Settings {
             cloudflare_email: None,
             cloudflare_account_id: None,
             last_seen_version: None,
+            warn_without_vpn: true,
+            limit_runtime_mount: false,
         }
     }
 }

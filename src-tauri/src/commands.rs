@@ -172,7 +172,11 @@ async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
         // upstreams, then (re)start ocx in-container so it picks up the config.
         // Services pre-start is handled by ensure_runtime_ready; here we only need
         // the container up for ocx, so don't force the browser/proxy to start.
-        start_runtime(&state.codex_home, false).await?;
+        let (narrow, work) = {
+            let s = state.settings.lock().await;
+            (s.limit_runtime_mount, s.working_dir.clone())
+        };
+        start_runtime(&state.codex_home, false, narrow, &work).await?;
         configure_ocx_upstreams(state).await;
         // Start ocx detached, keeping its output so a crash can be reported
         // instead of surfacing only as "didn't become ready" (ocx exits with a
@@ -232,6 +236,41 @@ async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
         .map(|(out, _)| out)
         .unwrap_or_default();
         let detail = log.trim();
+        // A leftover ocx from a previous run refuses to start a new one ("Proxy
+        // already running… Use 'ocx stop' first") — and if that old process is
+        // not actually reachable, nothing recovers on its own: the model list
+        // never loads and the composer sits on a placeholder until the user
+        // works out what to do. Clear it and try once more.
+        if detail.to_lowercase().contains("already running") {
+            let _ = runtime::exec_output(
+                RUNTIME_CONTAINER,
+                vec!["sh".into(), "-c".into(),
+                     "ocx stop >/dev/null 2>&1; pkill -f 'ocx start' >/dev/null 2>&1; true".into()],
+                exec_user(),
+                None,
+            )
+            .await;
+            let _ = runtime::exec_detached(
+                RUNTIME_CONTAINER,
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!(
+                        "mkdir -p {home} && export CODEX_HOME={home}; exec ocx start --port {port} > {OCX_START_LOG} 2>&1",
+                        home = ocx_codex_home(true),
+                        port = models::OPENCODEX_PORT
+                    ),
+                ],
+                exec_user(),
+            )
+            .await;
+            for _ in 0..24 {
+                if opencodex_up().await {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
         if detail.is_empty() {
             return Err("OpenCodex proxy in the runtime container didn't become ready.".into());
         }
@@ -299,9 +338,29 @@ pub fn open_opencodex_setup() -> Result<(), String> {
     platform::open_url(&url).map_err(|e| e.to_string())
 }
 
+/// Providers to offer in the composer.
+///
+/// The niche gateways are only useful once they have a key, and an entry that
+/// cannot answer is worse than no entry: it looks like a choice. They appear
+/// as soon as a key is saved in Settings, and the provider in use is always
+/// listed so a saved session never points at something that is not there.
 #[tauri::command]
-pub fn list_providers() -> Vec<ProviderInfo> {
-    models::provider_list()
+pub async fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderInfo>, String> {
+    let settings = state.settings.lock().await;
+    let current = models::Provider::parse(&settings.provider);
+    Ok(models::provider_list()
+        .into_iter()
+        .filter(|p| {
+            let provider = models::Provider::parse(p.id);
+            if !matches!(
+                provider,
+                models::Provider::CheaperInference | models::Provider::Abliteration
+            ) {
+                return true;
+            }
+            provider == current || settings.key_for(provider).is_some()
+        })
+        .collect())
 }
 
 // ---- OpenCodex provider wrapper: set up any upstream provider from the UI ----
@@ -1069,6 +1128,8 @@ pub struct SettingsView {
     pub kali_mode: bool,
     pub runtime: String,
     pub services_mode: String,
+    pub warn_without_vpn: bool,
+    pub limit_runtime_mount: bool,
     pub has_cloudflare: bool,
     pub cloudflare_email: Option<String>,
     pub cloudflare_account_id: Option<String>,
@@ -1089,6 +1150,8 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<SettingsView, St
         kali_mode: s.kali_mode,
         runtime: s.runtime.clone(),
         services_mode: s.services_mode.clone(),
+        warn_without_vpn: s.warn_without_vpn,
+        limit_runtime_mount: s.limit_runtime_mount,
         has_cloudflare: s.cloudflare_api_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false),
         cloudflare_email: s.cloudflare_email.clone(),
         cloudflare_account_id: s.cloudflare_account_id.clone(),
@@ -1108,6 +1171,8 @@ pub struct SaveSettingsArgs {
     pub kali_mode: Option<bool>,
     pub runtime: Option<String>,
     pub services_mode: Option<String>,
+    pub warn_without_vpn: Option<bool>,
+    pub limit_runtime_mount: Option<bool>,
     pub cloudflare_api_key: Option<String>,
     pub cloudflare_email: Option<String>,
     pub cloudflare_account_id: Option<String>,
@@ -1182,6 +1247,13 @@ pub async fn save_settings(
     if let Some(m) = args.services_mode {
         // No harness restart: this only changes what the NEXT runtime prep starts.
         s.services_mode = m;
+    }
+    if let Some(v) = args.warn_without_vpn {
+        s.warn_without_vpn = v;
+    }
+    if let Some(v) = args.limit_runtime_mount {
+        // Takes effect when the container is next created, not mid-session.
+        s.limit_runtime_mount = v;
     }
     // Cloudflare creds for the `cloudfish` recon tool. Empty string clears. No
     // harness restart — they're just mirrored to ~/.cloudflare on save() below.
@@ -1488,7 +1560,10 @@ pub async fn read_transcript(
             return Ok(Transcript::default());
         };
         let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        Ok(slice_transcript(parse_rollout(&text), limit))
+        let tokens = last_context_tokens(&text);
+        let mut tr = slice_transcript(parse_rollout(&text), limit);
+        tr.tokens = tokens;
+        Ok(tr)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1506,6 +1581,13 @@ pub struct Transcript {
     pub items: Vec<serde_json::Value>,
     pub total: usize,
     pub prompts: Vec<String>,
+    /// Characters across the WHOLE conversation, counted before the tail is
+    /// sliced off. Only used when `tokens` is absent.
+    pub chars: usize,
+    /// Real context occupancy from the rollout's last `token_usage_record`,
+    /// when there is one. Exact, and already reflects any compaction, so it is
+    /// preferred over the character estimate.
+    pub tokens: Option<u64>,
 }
 
 /// Keep only the tail the UI renders, while reporting the true total and the
@@ -1515,8 +1597,61 @@ pub struct Transcript {
 /// prompts that scrolled off the top, and they are never truncated (a recalled
 /// prompt must be exactly what was sent). That costs almost nothing: user text
 /// measured 3-74 KB per chat against a 12 MB transcript.
+/// Roughly how much of the context window one transcript record occupies.
+///
+/// Walks the fields that actually carry conversation — message text, reasoning,
+/// a command and its output — rather than the whole record, so ids, timestamps
+/// and other metadata are not counted as tokens.
+/// Context occupancy at the last turn, from the rollout.
+///
+/// codex writes a `token_usage_record` per response but never sends the
+/// matching notification over the app-server on every provider path, so the
+/// live meter had nothing to show. The file has it: the LAST record's
+/// `usage.total_tokens` is what the model was handed for that turn, which is
+/// the context size — and because it is the last one it already accounts for
+/// any compaction along the way.
+///
+/// Note `turn_token_usage` is cumulative across the whole session (millions of
+/// tokens on a long engagement) and is NOT the context size.
+fn last_context_tokens(text: &str) -> Option<u64> {
+    let mut last = None;
+    for line in text.lines() {
+        if !line.contains("\"token_usage_record\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let usage = &v["payload"]["usage"];
+        if let Some(total) = usage["total_tokens"].as_u64() {
+            last = Some(total);
+        } else if let Some(input) = usage["input_tokens"].as_u64() {
+            last = Some(input + usage["output_tokens"].as_u64().unwrap_or(0));
+        }
+    }
+    last
+}
+
+fn transcript_item_chars(item: &serde_json::Value) -> usize {
+    let mut n = 0usize;
+    for key in ["text", "command", "output", "aggregated_output", "summary"] {
+        if let Some(v) = item.get(key).and_then(|v| v.as_str()) {
+            n += v.len();
+        }
+    }
+    if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
+        for p in parts {
+            if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                n += t.len();
+            } else if let Some(t) = p.as_str() {
+                n += t.len();
+            }
+        }
+    }
+    n
+}
+
 fn slice_transcript(mut items: Vec<serde_json::Value>, limit: Option<usize>) -> Transcript {
     let total = items.len();
+    let chars: usize = items.iter().map(transcript_item_chars).sum();
     let mut prompts: Vec<String> = items
         .iter()
         .filter(|i| i["type"] == "userMessage")
@@ -1531,7 +1666,7 @@ fn slice_transcript(mut items: Vec<serde_json::Value>, limit: Option<usize>) -> 
     if let Some(n) = limit.filter(|n| *n > 0 && *n < total) {
         items.drain(..total - n);
     }
-    Transcript { items, total, prompts }
+    Transcript { items, total, prompts, chars, tokens: None }
 }
 
 /// The provider a thread was CREATED under, read from the rollout's
@@ -2857,6 +2992,13 @@ async fn ensure_runtime_ready(state: &State<'_, AppState>, app: &AppHandle) -> R
     if let Some(reason) = runtime::docker_unavailable_reason().await {
         return Err(reason);
     }
+    // Is there anything to do at all? This runs on EVERY message and every
+    // chat switch (ensure_harness calls it), and it used to announce
+    // "Starting runtime container…" then "Runtime ready." unconditionally — so
+    // the banner flashed on a container and proxy that had been up for hours.
+    // The steps below are all idempotent and stay in place; only the
+    // announcements are now conditional on work actually being needed.
+    let already_up = runtime_container_running().await && opencodex_up().await;
     if !runtime_image_exists().await {
         provision_runtime_image(state, app).await?;
     } else {
@@ -2903,19 +3045,27 @@ async fn ensure_runtime_ready(state: &State<'_, AppState>, app: &AppHandle) -> R
             }
         });
     }
-    let _ = app.emit("hacksor://runtime", serde_json::json!({ "phase": "starting", "message": "Starting runtime container…" }));
+    if !already_up {
+        let _ = app.emit("hacksor://runtime", serde_json::json!({ "phase": "starting", "message": "Starting runtime container…" }));
+    }
     // On-demand (default): don't pre-start the heavy proxy/browser — the agent's
     // `hacksor-proxy start` and the patched camofox-mcp client bring them up when
     // actually used, saving RAM. Always-on: pre-start both to avoid warm-up.
-    let always_on = { state.settings.lock().await.services_mode == "always_on" };
-    start_runtime(&state.codex_home, always_on).await?;
+    let (always_on, narrow, work) = {
+        let s = state.settings.lock().await;
+        (s.services_mode == "always_on", s.limit_runtime_mount, s.working_dir.clone())
+    };
+    start_runtime(&state.codex_home, always_on, narrow, &work).await?;
     if always_on {
         autostart_proxy_docker(&state.codex_home).await;
     } else {
         prepare_proxy_docker(&state.codex_home).await; // write CLI + wrapper so the agent can start it
     }
     ensure_opencodex(state).await?;
-    let _ = app.emit("hacksor://runtime", serde_json::json!({ "phase": "ready", "message": "Runtime ready." }));
+    // Only resolve a banner we actually raised: a silent no-op must stay silent.
+    if !already_up {
+        let _ = app.emit("hacksor://runtime", serde_json::json!({ "phase": "ready", "message": "Runtime ready." }));
+    }
     Ok(())
 }
 
@@ -2957,7 +3107,38 @@ fn exec_user() -> Option<String> {
 /// network and runs as the host uid:gid (mounting $HOME at its real path). On
 /// macOS / Windows (Docker Desktop VM) and under rootless Docker it publishes
 /// ports instead and runs as root (ownership is mapped for us).
-async fn start_runtime(codex_home: &std::path::Path, services_always_on: bool) -> Result<(), String> {
+/// What to bind-mount into the runtime.
+///
+/// Normally the whole home directory, which is what an engagement usually
+/// needs. When the mount is narrowed, only the working directory and Hacksor's
+/// own codex home go in — the codex home is NOT optional: the harness reads its
+/// config, skills and rollouts from there, and it lives outside any working
+/// directory, so mounting the working directory alone would break the agent
+/// rather than contain it.
+///
+/// Both are mounted at their real host paths so every path the agent is told
+/// about resolves the same inside and out.
+fn runtime_binds(codex_home: &std::path::Path, working_dir: &str, narrow: bool) -> (String, String, Vec<String>) {
+    let (host_home, container_home) = platform::home_mount();
+    if !narrow {
+        return (host_home, container_home, vec![]);
+    }
+    let work = working_dir.trim();
+    if work.is_empty() || !std::path::Path::new(work).is_dir() {
+        // Nothing sane to narrow to; the whole home is better than no mount.
+        return (host_home, container_home, vec![]);
+    }
+    let home = platform::to_container_path(codex_home);
+    let work_c = platform::to_container_path(std::path::Path::new(work));
+    (work.to_string(), work_c, vec![format!("{}:{}", codex_home.display(), home)])
+}
+
+async fn start_runtime(
+    codex_home: &std::path::Path,
+    services_always_on: bool,
+    narrow_mount: bool,
+    working_dir: &str,
+) -> Result<(), String> {
     if let Some(reason) = runtime::docker_unavailable_reason().await {
         return Err(reason);
     }
@@ -2965,12 +3146,14 @@ async fn start_runtime(codex_home: &std::path::Path, services_always_on: bool) -
         return Err("Runtime image not available yet — it downloads/builds on first use.".into());
     }
     if !runtime_container_running().await {
-        let (host_home, container_home) = platform::home_mount();
+        let (host_home, container_home, extra_binds) =
+            runtime_binds(codex_home, working_dir, narrow_mount);
         let spec = runtime::RunSpec {
             image: RUNTIME_IMAGE.to_string(),
             name: RUNTIME_CONTAINER.to_string(),
             host_home,
             container_home,
+            extra_binds,
             host_net: rootful_linux(),
             tun: runtime::tun_present(),
             // Without host networking (Docker Desktop VM, or rootless Docker's
@@ -3143,6 +3326,11 @@ pub async fn refresh_intel(state: State<'_, AppState>) -> Result<String, String>
 // container share it over the bind mount.
 const PROXY_CLI: &str = include_str!("../../docker/hacksor-proxy");
 
+/// `hacksor-identity`: throwaway inboxes for sign-ups during an engagement.
+/// Shipped like the proxy CLI — written into the codex home and put on the
+/// container's PATH — so a runtime image rebuild is not needed to update it.
+const IDENTITY_CLI: &str = include_str!("../../docker/hacksor-identity");
+
 /// Status of the runtime's background services, surfaced read-only in Settings
 /// (the intercepting proxy + the Camoufox stealth browser). Both autostart in
 /// the container; there are no controls, just visibility.
@@ -3185,6 +3373,41 @@ fn write_proxy_cli(codex_home: &std::path::Path) -> std::io::Result<(std::path::
 /// an older build, and install the `hacksor-proxy` PATH wrapper — WITHOUT starting
 /// mitmdump. This makes the CLI available so the agent can `hacksor-proxy start`
 /// on demand (on-demand mode), and is a prerequisite for the actual start.
+/// Write `hacksor-identity` into the codex home and put it on the container's
+/// PATH. The identities file lives beside it, so the addresses created for an
+/// engagement survive a container restart.
+async fn install_identity_cli(codex_home: &std::path::Path) {
+    let dir = codex_home.join("tools");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let script = dir.join("hacksor-identity");
+    let store = dir.join("identities.json");
+    if std::fs::write(&script, IDENTITY_CLI).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+    }
+    let wrapper = format!(
+        "#!/bin/sh\nexec env HACKSOR_IDENTITY_STORE='{store}' python3 '{script}' \"$@\"\n",
+        store = platform::to_container_path(&store),
+        script = platform::to_container_path(&script),
+    );
+    let cmd = format!(
+        "cat > /usr/local/bin/hacksor-identity <<'HXEOF'\n{wrapper}HXEOF\nchmod +x /usr/local/bin/hacksor-identity"
+    );
+    let _ = runtime::exec_output(
+        RUNTIME_CONTAINER,
+        vec!["sh".into(), "-c".into(), cmd],
+        Some("0".into()),
+        None,
+    )
+    .await;
+}
+
 async fn prepare_proxy_docker(codex_home: &std::path::Path) {
     let (script, log, _rules) = match write_proxy_cli(codex_home) {
         Ok(p) => p,
@@ -3205,6 +3428,7 @@ async fn prepare_proxy_docker(codex_home: &std::path::Path) {
         let _ = std::fs::write(&log, "");
     }
     install_proxy_wrapper(codex_home).await; // `hacksor-proxy` on PATH for the agent
+    install_identity_cli(codex_home).await; // `hacksor-identity` likewise
 }
 
 /// Best-effort: start mitmdump inside the runtime container if not already up
@@ -3399,6 +3623,7 @@ pub async fn start_kali(working_dir: String) -> Result<String, String> {
         name: KALI_CONTAINER.into(),
         host_home: wd.clone(),
         container_home: wd,
+        extra_binds: vec![],
         host_net: rootful_linux(),
         tun: runtime::tun_present(),
         publish_ports: vec![],
@@ -3412,7 +3637,560 @@ pub async fn stop_kali() -> Result<(), String> {
     Ok(())
 }
 
+// ---- session ledger ----
+
+/// Where a session records what it learns.
+#[derive(Serialize, Default)]
+pub struct SessionLedger {
+    /// Root of the engagement directory, as the AGENT sees it.
+    pub dir: String,
+    /// The same path on the host, for the UI.
+    pub host_dir: String,
+    /// The findings store `hacksor-findings --file` writes to.
+    pub findings: String,
+    /// The running narrative the agent keeps current.
+    pub notes: String,
+    /// Where the generated report lands.
+    pub report: String,
+    /// False when the directory already existed, so a resumed session reuses it.
+    pub created: bool,
+}
+
+/// Ask the model what this engagement is against.
+///
+/// The first message is not a target: "scan 10.0.0.5 and tell me what is
+/// running" names one, "hey how are u" does not. Taking the opening words
+/// produced directories like `hey-how-are-u`, so the naming is a judgement and
+/// the model makes it — including the judgement that there is nothing to name.
+#[tauri::command]
+pub async fn suggest_target(state: State<'_, AppState>, args: TitleArgs) -> Result<String, String> {
+    let sys = "Decide whether this first message STARTS A PENETRATION TEST, and if so name its target.\n\
+\n\
+Reply with ONLY the target — a hostname, domain, IP, application or organisation name. No path, no scheme, \
+no prose, no quotes, no explanation.\n\
+\n\
+Reply with exactly `none` unless the user is asking you to TEST, ATTACK, ASSESS, SCAN, EXPLOIT or AUDIT a \
+specific target of their own. `none` is the right answer for all of these, even when a host or product is \
+mentioned by name:\n\
+- greetings, small talk, questions about you or your tools;\n\
+- how something works, what a vulnerability class is, how to use a tool;\n\
+- writing, reviewing, explaining or debugging code;\n\
+- a one-off command or lookup with no engagement behind it;\n\
+- anything where the user is asking ABOUT a thing rather than asking you to go after it.\n\
+\n\
+Naming a host is not enough on its own. When in doubt, answer `none`: a directory that should not exist is \
+worse than one created a message later.";
+    let user = format!("First message:\n\n{}", truncate(args.text.trim(), 1500));
+    let Some(raw) = judge_call(&state, &args.provider, &args.model, sys, &user).await else {
+        return Ok(String::new());
+    };
+    Ok(clean_target(&raw))
+}
+
+/// Reduce the model's answer to a target, or "" for "this is not an engagement".
+fn clean_target(raw: &str) -> String {
+    let line = raw.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let line = line.trim_matches(|c| c == '"' || c == '\'' || c == '`' || c == '.').trim();
+    let lower = line.to_lowercase();
+    // The model is told to answer "none"; it sometimes says it in a sentence.
+    if lower.is_empty()
+        || lower == "none"
+        || lower.starts_with("none")
+        || lower.contains("no target")
+        || lower.contains("not an engagement")
+    {
+        return String::new();
+    }
+    // A target is a name, not a sentence: anything long is the model ignoring
+    // the instruction, and a bad directory name is worse than none.
+    if line.split_whitespace().count() > 5 || line.chars().count() > 60 {
+        return String::new();
+    }
+    line.to_string()
+}
+
+/// An engagement directory already under `root` for this target, if one exists.
+///
+/// Re-testing the same target, branching a chat, or simply starting again must
+/// land in the SAME directory: a second `host-2` beside `host` splits the
+/// record of one engagement in half. Only directories that actually look like
+/// engagements (they carry the notes file) are candidates, so an unrelated
+/// folder with a similar name is never adopted.
+fn find_existing_engagement(root: &std::path::Path, slug: &str) -> Option<std::path::PathBuf> {
+    let key = |s: &str| -> String {
+        s.trim_start_matches("www.")
+            .split('.')
+            .next()
+            .unwrap_or(s)
+            .replace(['-', '_'], "")
+            .to_lowercase()
+    };
+    let want = key(slug);
+    if want.is_empty() {
+        return None;
+    }
+    let mut best: Option<std::path::PathBuf> = None;
+    for e in std::fs::read_dir(root).ok()?.flatten() {
+        let p = e.path();
+        if !p.is_dir() || !p.join("ENGAGEMENT_NOTES.md").is_file() {
+            continue;
+        }
+        let name = p.file_name()?.to_string_lossy().to_string();
+        if name.eq_ignore_ascii_case(slug) {
+            return Some(p); // exact beats everything
+        }
+        if key(&name) == want {
+            best = Some(p);
+        }
+    }
+    best
+}
+
+/// A directory name for a target.
+///
+/// Targets arrive as whatever the user typed: a URL, a host, a company name, a
+/// sentence. Strip a scheme and a path, keep what a person would recognise, and
+/// never produce something that escapes the engagement root.
+fn target_slug(raw: &str) -> String {
+    let mut t = raw.trim().to_lowercase();
+    for p in ["https://", "http://", "ssh://", "ftp://"] {
+        if let Some(rest) = t.strip_prefix(p) {
+            t = rest.to_string();
+        }
+    }
+    // A URL's path, query or port is noise in a directory name.
+    t = t.split(['/', '?', '#']).next().unwrap_or("").to_string();
+    if let Some((host, _port)) = t.rsplit_once(':') {
+        if t.rsplit_once(':').map(|(_, p)| p.chars().all(|c| c.is_ascii_digit())).unwrap_or(false) {
+            t = host.to_string();
+        }
+    }
+    let mut out = String::new();
+    let mut last_dash = false;
+    for c in t.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' {
+            out.push(c);
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let out = out.trim_matches(['-', '.']).to_string();
+    let out: String = out.chars().take(48).collect();
+    let out = out.trim_matches(['-', '.']).to_string();
+    if out.is_empty() {
+        return format!("session-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+    }
+    // Windows refuses to create a file or directory whose name — up to the
+    // first dot — is a reserved device name, so `nul` and `nul.example.com`
+    // are both rejected there. The same engagement must land in the same
+    // directory on every platform, so rename it everywhere, not only on
+    // Windows.
+    const RESERVED: [&str; 22] = [
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
+        "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    // It is the stem that must change: `nul.example.com-target` still begins
+    // with `nul` up to the first dot, so Windows would reject it too.
+    let (stem, rest) = out.split_once('.').unwrap_or((out.as_str(), ""));
+    if RESERVED.contains(&stem) {
+        return if rest.is_empty() {
+            format!("{stem}-target")
+        } else {
+            format!("{stem}-target.{rest}")
+        };
+    }
+    out
+}
+
+/// The files a fresh engagement directory starts with.
+///
+/// The layout follows a real engagement tree: evidence under `artifacts/` by
+/// workstream, what ships under `deliverables/`, what must NOT ship under
+/// `_quarantine_not_in_delivery/`, and two living documents at the root. The
+/// notes file is the one that matters for continuity: it is what the agent
+/// re-reads after a compaction, when its own context no longer holds the
+/// engagement.
+fn ledger_skeleton(target: &str) -> Vec<(&'static str, String)> {
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    vec![
+        (
+            "ENGAGEMENT_NOTES.md",
+            format!(
+                "# Engagement notes: {target}\n\n\
+                 Started {today}. This file is the engagement's memory. The context window is\n\
+                 not: it compacts, and everything not written down here is gone when it does.\n\
+                 Keep it current as you work, not at the end.\n\n\
+                 ## Scope\n\n\
+                 <!-- in-scope hosts, apps, accounts, and the explicit boundaries -->\n\n\
+                 ## Current state\n\n\
+                 <!-- REWRITE this section as it changes: what is established, what is being\n\
+                 tested right now, and the single next action. First thing to read on resume. -->\n\n\
+                 ## Access and credentials\n\n\
+                 <!-- what access exists and how it was obtained (reference the ledger entry) -->\n\n\
+                 ## Map\n\n\
+                 <!-- hosts, endpoints, parameters, versions worth remembering -->\n\n\
+                 ## Open leads\n\n\
+                 <!-- what is worth trying next, each with why -->\n\n\
+                 ## Ruled out\n\n\
+                 <!-- what was tested and did NOT work, with the boundary that stopped it.\n\
+                 This prevents re-running the same dead end after a compaction. -->\n"
+            ),
+        ),
+        (
+            "RESIDUAL_STATE.md",
+            format!(
+                "# Residual state: {target}\n\n\
+                 Everything created on the target that does not belong there: accounts,\n\
+                 uploads, webhooks, registrations, files, scheduled jobs. Append on creation,\n\
+                 not from memory at the end.\n\n\
+                 | created | what | where | removed |\n\
+                 |---|---|---|---|\n"
+            ),
+        ),
+        (
+            "ledger/index.md",
+            format!(
+                "# Ledger index: {target}\n\n\
+                 One line per entry, newest last. The entries themselves live in\n\
+                 `ledger/entries/` and are read on demand: this index is what stays cheap\n\
+                 enough to keep in context.\n\n\
+                 | id | kind | status | one line |\n\
+                 |---|---|---|---|\n"
+            ),
+        ),
+        (
+            "README.md",
+            format!(
+                "# {target}\n\n\
+                 Engagement workspace, created by Hacksor on {today}.\n\n\
+                 | path | what goes here |\n\
+                 |---|---|\n\
+                 | `ENGAGEMENT_NOTES.md` | scope, current state, map, open leads, ruled out |\n\
+                 | `RESIDUAL_STATE.md` | anything created on the target that must be removed |\n\
+                 | `findings.jsonl` | the findings store (`hacksor-findings --file`) |\n\
+                 | `ledger/index.md` | one line per ledger entry |\n\
+                 | `ledger/entries/` | one card per finding, lead, negative, decision or blocker |\n\
+                 | `artifacts/<workstream>/` | evidence: scans, captures, PoCs, decompiles |\n\
+                 | `deliverables/` | the report and anything else handed over |\n\
+                 | `_quarantine_not_in_delivery/` | kept for the record, never shipped |\n"
+            ),
+        ),
+    ]
+}
+
+/// Lay out an engagement directory. Never overwrites: a resumed engagement
+/// keeps every note and finding it already wrote.
+fn create_ledger_tree(dir: &std::path::Path, slug: &str) -> std::io::Result<()> {
+    for sub in ["artifacts", "deliverables", "_quarantine_not_in_delivery", "ledger/entries"] {
+        std::fs::create_dir_all(dir.join(sub))?;
+    }
+    for (name, body) in ledger_skeleton(slug) {
+        let f = dir.join(name);
+        if !f.exists() {
+            std::fs::write(&f, body)?;
+        }
+    }
+    let findings = dir.join("findings.jsonl");
+    if !findings.exists() {
+        std::fs::write(&findings, "")?;
+    }
+    Ok(())
+}
+
+/// Create (or adopt) the engagement directory for a session.
+///
+/// Idempotent: an existing directory is reused and no file is overwritten, so
+/// resuming a session keeps everything already recorded.
+#[tauri::command]
+pub async fn ledger_init(
+    state: State<'_, AppState>,
+    working_dir: String,
+    target: String,
+) -> Result<SessionLedger, String> {
+    let docker = docker_runtime(&state).await;
+    let root = std::path::PathBuf::from(if working_dir.trim().is_empty() {
+        state.settings.lock().await.working_dir.clone()
+    } else {
+        working_dir
+    });
+    let slug = target_slug(&target);
+    let dir = find_existing_engagement(&root, &slug).unwrap_or_else(|| root.join(&slug));
+    let created = !dir.exists();
+    create_ledger_tree(&dir, &slug).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let findings = dir.join("findings.jsonl");
+    // The agent sees container paths in Docker mode; the UI shows host paths.
+    let seen = |p: &std::path::Path| -> String {
+        if docker { crate::platform::to_container_path(p) } else { p.to_string_lossy().into_owned() }
+    };
+    Ok(SessionLedger {
+        dir: seen(&dir),
+        host_dir: dir.to_string_lossy().into_owned(),
+        findings: seen(&findings),
+        notes: seen(&dir.join("ENGAGEMENT_NOTES.md")),
+        report: seen(&dir.join("deliverables").join("report.md")),
+        created,
+    })
+}
+
 // ---- findings notes (shared with the agent via codex_home/notes) ----
+
+/// What a purge actually removed, so the UI can say it plainly.
+#[derive(serde::Serialize, Default)]
+pub struct PurgeReport {
+    pub rollout: bool,
+    pub engagement: bool,
+    pub notes: bool,
+    /// Anything that was asked for and could not be removed.
+    pub errors: Vec<String>,
+}
+
+/// Delete the traces of one engagement: the stored conversation, the
+/// engagement directory, and the chat's note.
+///
+/// Archiving only hides a chat. When an engagement ends — or a client asks for
+/// their data gone — the transcript on disk, the reports and the note have to
+/// go too, and hunting them down by hand is how one gets left behind. Each part
+/// is opt-in: the caller says what to remove and this reports what it did.
+///
+/// A delete here is not recoverable, so the paths are checked before they are
+/// touched: the engagement directory must be a directory that actually carries
+/// `ENGAGEMENT_NOTES.md`, which keeps a mistyped or stale path from taking an
+/// unrelated folder with it.
+#[tauri::command]
+pub fn purge_thread(
+    state: State<'_, AppState>,
+    thread_id: Option<String>,
+    engagement_dir: Option<String>,
+    notes_path: Option<String>,
+    delete_rollout: bool,
+    delete_engagement: bool,
+    delete_notes: bool,
+) -> Result<PurgeReport, String> {
+    let mut out = PurgeReport::default();
+
+    if delete_rollout {
+        match thread_id.as_deref().filter(|t| !t.is_empty()) {
+            None => out.errors.push("this chat has no stored conversation yet".into()),
+            Some(tid) => {
+                match find_rollout(&state.codex_home, tid) {
+                    None => out.errors.push("no stored conversation found on disk".into()),
+                    Some(path) => match std::fs::remove_file(&path) {
+                        Ok(()) => out.rollout = true,
+                        Err(e) => out.errors.push(format!("conversation: {e}")),
+                    },
+                }
+            }
+        }
+    }
+
+    if delete_engagement {
+        match engagement_dir.as_deref().filter(|d| !d.is_empty()) {
+            None => out.errors.push("this chat has no engagement directory".into()),
+            Some(dir) => {
+                let path = PathBuf::from(dir);
+                if !path.is_dir() {
+                    out.errors.push("the engagement directory is already gone".into());
+                } else if !path.join("ENGAGEMENT_NOTES.md").is_file() {
+                    // Refuse rather than recurse into something that was never ours.
+                    out.errors.push(
+                        "refused: that directory does not look like an engagement (no ENGAGEMENT_NOTES.md)".into(),
+                    );
+                } else {
+                    match std::fs::remove_dir_all(&path) {
+                        Ok(()) => out.engagement = true,
+                        Err(e) => out.errors.push(format!("engagement directory: {e}")),
+                    }
+                }
+            }
+        }
+    }
+
+    if delete_notes {
+        // The chat's note is the ledger's ENGAGEMENT_NOTES.md. Deleting the
+        // whole directory covers it; this is for keeping the evidence while
+        // dropping the running narrative.
+        match notes_path.as_deref().filter(|n| !n.is_empty()) {
+            None => out.errors.push("this chat has no engagement notes".into()),
+            Some(raw) => {
+                let path = PathBuf::from(raw);
+                if path.file_name().and_then(|n| n.to_str()) != Some("ENGAGEMENT_NOTES.md") {
+                    out.errors.push("refused: that is not an engagement notes file".into());
+                } else if !path.is_file() {
+                    out.errors.push("the engagement notes are already gone".into());
+                } else {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => out.notes = true,
+                        Err(e) => out.errors.push(format!("notes: {e}")),
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// What the egress looks like right now.
+#[derive(serde::Serialize, Default, Clone)]
+pub struct VpnStatus {
+    /// The default route leaves through a tunnel interface.
+    pub tunnel: bool,
+    /// Name of the interface carrying the default route (en0, utun3, …).
+    pub iface: String,
+    /// Public address as seen from outside, "" when the lookup failed.
+    pub ip: String,
+    pub country: String,
+    pub isp: String,
+    /// The lookup service flags the address as a proxy/VPN exit.
+    pub proxy: bool,
+    /// The address belongs to a hosting provider, which is what a cheap VPS
+    /// exit looks like from outside.
+    pub hosting: bool,
+    /// True when nothing suggests the traffic is leaving through anything but
+    /// the plain home connection.
+    pub exposed: bool,
+    /// Set when the public lookup could not be done; `exposed` then rests on
+    /// the local check alone.
+    pub lookup_error: String,
+}
+
+/// Which interface carries the default route.
+///
+/// Presence of a tunnel interface proves nothing: macOS keeps utun0-utun5 up
+/// for its own services whether or not a VPN is connected. What matters is
+/// whether the DEFAULT ROUTE goes through one.
+fn default_route_iface() -> String {
+    #[cfg(target_os = "macos")]
+    let out = std::process::Command::new("route").args(["-n", "get", "default"]).output();
+    #[cfg(target_os = "linux")]
+    let out = std::process::Command::new("ip").args(["route", "show", "default"]).output();
+    #[cfg(target_os = "windows")]
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command",
+               "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).InterfaceAlias"])
+        .output();
+
+    let Ok(o) = out else { return String::new() };
+    let text = String::from_utf8_lossy(&o.stdout).to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        for line in text.lines() {
+            if let Some(v) = line.trim().strip_prefix("interface:") {
+                return v.trim().to_string();
+            }
+        }
+        String::new()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // "default via 10.0.0.1 dev wg0 proto static"
+        let mut it = text.split_whitespace();
+        while let Some(tok) = it.next() {
+            if tok == "dev" {
+                return it.next().unwrap_or("").to_string();
+            }
+        }
+        String::new()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        text.trim().to_string()
+    }
+}
+
+/// Does this interface name look like a tunnel?
+fn is_tunnel_iface(name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    if n.is_empty() {
+        return false;
+    }
+    const PREFIXES: [&str; 7] = ["utun", "tun", "tap", "wg", "ipsec", "ppp", "nordlynx"];
+    if PREFIXES.iter().any(|p| n.starts_with(p)) {
+        return true;
+    }
+    // Windows reports friendly names rather than device names.
+    ["vpn", "wireguard", "openvpn", "tailscale", "mullvad", "proton"]
+        .iter()
+        .any(|p| n.contains(p))
+}
+
+/// Is the agent about to talk to the target from the operator's own address?
+///
+/// Two independent signals, because either alone misleads: the default route's
+/// interface (local, instant, but blind to a proxy set per-application) and a
+/// public lookup (authoritative about what the target would see, but needs the
+/// network and tells a third party this address asked).
+/// The LOCAL half only: which interface carries the default route.
+///
+/// Instant — no network. The gate asks this first so the warning can appear the
+/// moment Send is pressed; waiting on the public lookup put a multi-second
+/// stall between the keystroke and the dialog.
+#[tauri::command]
+pub fn vpn_route() -> VpnStatus {
+    let iface = default_route_iface();
+    let tunnel = is_tunnel_iface(&iface);
+    VpnStatus { tunnel, iface, exposed: !tunnel, ..Default::default() }
+}
+
+/// Cache the public lookup: a few sends in a row should not each wait on (and
+/// re-tell) a third party. The egress rarely changes within a few minutes.
+static IP_CACHE: Mutex<Option<(std::time::Instant, VpnStatus)>> = Mutex::const_new(None);
+const IP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[tauri::command]
+pub async fn vpn_status() -> Result<VpnStatus, String> {
+    let iface = default_route_iface();
+    let tunnel = is_tunnel_iface(&iface);
+    // Leaving through a tunnel is already the answer; do not tell a third
+    // party about an address that is not even exposed.
+    if tunnel {
+        return Ok(VpnStatus { tunnel, iface, exposed: false, ..Default::default() });
+    }
+    if let Some((at, cached)) = IP_CACHE.lock().await.as_ref() {
+        if at.elapsed() < IP_CACHE_TTL {
+            let mut st = VpnStatus { tunnel, iface, ..cached.clone() };
+            st.exposed = !(st.tunnel || st.proxy || st.hosting);
+            return Ok(st);
+        }
+    }
+    let mut st = VpnStatus { tunnel, iface, ..Default::default() };
+
+    let url = "http://ip-api.com/json/?fields=status,message,country,isp,proxy,hosting,query";
+    match reqwest::Client::new()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(4))
+        .send()
+        .await
+    {
+        Ok(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) if v.get("status").and_then(|s| s.as_str()) == Some("success") => {
+                st.ip = v.get("query").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                st.country = v.get("country").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                st.isp = v.get("isp").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                st.proxy = v.get("proxy").and_then(|x| x.as_bool()).unwrap_or(false);
+                st.hosting = v.get("hosting").and_then(|x| x.as_bool()).unwrap_or(false);
+            }
+            Ok(v) => {
+                st.lookup_error = v
+                    .get("message")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("lookup refused")
+                    .to_string();
+            }
+            Err(e) => st.lookup_error = e.to_string(),
+        },
+        Err(e) => st.lookup_error = e.to_string(),
+    }
+
+    st.exposed = !(st.tunnel || st.proxy || st.hosting);
+    if st.lookup_error.is_empty() {
+        *IP_CACHE.lock().await = Some((std::time::Instant::now(), st.clone()));
+    }
+    Ok(st)
+}
 
 fn notes_dir(state: &AppState) -> PathBuf {
     state.codex_home.join("notes")
@@ -3703,6 +4481,182 @@ mod transcript_tests {
         let (out, code) = parse_exec_output(raw);
         assert_eq!(out, "bishop\n");
         assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn the_engagement_tree_is_laid_out_and_never_clobbered() {
+        let root = std::env::temp_dir().join(format!("hacksor-ledger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("target.example.com");
+        create_ledger_tree(&dir, "target.example.com").unwrap();
+        for sub in ["artifacts", "deliverables", "_quarantine_not_in_delivery", "ledger/entries"] {
+            assert!(dir.join(sub).is_dir(), "missing {sub}");
+        }
+        for f in ["ENGAGEMENT_NOTES.md", "RESIDUAL_STATE.md", "ledger/index.md", "README.md", "findings.jsonl"] {
+            assert!(dir.join(f).is_file(), "missing {f}");
+        }
+        // Resuming must not wipe what the engagement already recorded.
+        std::fs::write(dir.join("ENGAGEMENT_NOTES.md"), "REAL WORK").unwrap();
+        std::fs::write(dir.join("findings.jsonl"), r#"{"id":"x"}"#).unwrap();
+        create_ledger_tree(&dir, "target.example.com").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("ENGAGEMENT_NOTES.md")).unwrap(), "REAL WORK");
+        assert!(std::fs::read_to_string(dir.join("findings.jsonl")).unwrap().contains(r#""id""#));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn narrowing_the_mount_keeps_the_codex_home() {
+        let tmp = std::env::temp_dir().join(format!("hacksor-mount-{}", std::process::id()));
+        let work = tmp.join("engagement");
+        let home = tmp.join("codex-home");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        // Off: the whole home, one bind, exactly as before.
+        let (h, _c, extra) = runtime_binds(&home, work.to_str().unwrap(), false);
+        assert!(extra.is_empty(), "the default must not add binds");
+        assert_eq!(h, crate::platform::home_mount().0);
+
+        // On: the working directory, PLUS the codex home — without it the
+        // harness cannot read its own config and the agent simply breaks.
+        let (h, _c, extra) = runtime_binds(&home, work.to_str().unwrap(), true);
+        assert_eq!(h, work.to_str().unwrap());
+        assert_eq!(extra.len(), 1, "the codex home must still be mounted");
+        assert!(extra[0].starts_with(&home.display().to_string()));
+
+        // On, but the working directory does not exist: fall back rather than
+        // start a container the agent cannot work in.
+        let (h, _c, extra) = runtime_binds(&home, "/no/such/dir", true);
+        assert_eq!(h, crate::platform::home_mount().0);
+        assert!(extra.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn context_size_comes_from_the_last_usage_record_not_the_running_total() {
+        // `turn_token_usage` accumulates over the whole session and reached
+        // millions on a real engagement; `usage` is the single response, and
+        // the last one is the current context size.
+        let roll = concat!(
+            r#"{"type":"token_usage_record","payload":{"usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010},"turn_token_usage":{"input_tokens":1000}}}"#, "\n",
+            r#"{"type":"response_item","payload":{"text":"noise"}}"#, "\n",
+            r#"{"type":"token_usage_record","payload":{"usage":{"input_tokens":188911,"output_tokens":1049,"total_tokens":189960},"turn_token_usage":{"input_tokens":6297861}}}"#, "\n",
+        );
+        assert_eq!(last_context_tokens(roll), Some(189_960));
+        // No records at all: the caller falls back to the character estimate.
+        assert_eq!(last_context_tokens(r#"{"type":"response_item"}"#), None);
+        // total_tokens missing: derive it from the parts.
+        let parts = r#"{"type":"token_usage_record","payload":{"usage":{"input_tokens":700,"output_tokens":42}}}"#;
+        assert_eq!(last_context_tokens(parts), Some(742));
+    }
+
+    #[test]
+    fn a_windows_reserved_device_name_never_becomes_a_directory() {
+        // Windows rejects these up to the first dot; renaming only there would
+        // put the same engagement in two different directories per platform.
+        for raw in ["nul", "CON", "https://nul.example.com", "com1", "lpt9.target.test"] {
+            let slug = target_slug(raw);
+            let stem = slug.split('.').next().unwrap_or(&slug);
+            assert!(
+                !["con", "prn", "aux", "nul", "com1", "lpt9"].contains(&stem),
+                "{raw} produced the reserved name {slug}"
+            );
+            assert!(!slug.is_empty());
+        }
+        // Ordinary targets are untouched.
+        assert_eq!(target_slug("conference.example.com"), "conference.example.com");
+        assert_eq!(target_slug("https://nul.example.com"), "nul-target.example.com");
+        assert_eq!(target_slug("nul"), "nul-target");
+    }
+
+    #[test]
+    fn only_a_tunnel_on_the_default_route_counts_as_vpn() {
+        // macOS keeps utun0-5 up for its own services, so the NAME matters only
+        // because we ask it of the default route, never of the interface list.
+        for yes in ["utun3", "tun0", "wg0", "ipsec1", "ppp0", "NordLynx",
+                    "Mullvad VPN", "ProtonVPN TUN", "tailscale0"] {
+            assert!(is_tunnel_iface(yes), "{yes} should read as a tunnel");
+        }
+        for no in ["en0", "eth0", "wlan0", "bridge100", "lo0", "Ethernet", "Wi-Fi", ""] {
+            assert!(!is_tunnel_iface(no), "{no} should NOT read as a tunnel");
+        }
+    }
+
+    #[test]
+    fn a_non_engagement_first_message_names_no_target() {
+        // The case that produced a `hey-how-are-u` directory.
+        for none in ["none", "None", "none.", "None — this is a greeting", "no target named", ""] {
+            assert_eq!(clean_target(none), "", "{none:?}");
+        }
+        // A sentence is the model ignoring the instruction; better no directory
+        // than a bad one.
+        assert_eq!(clean_target("The user appears to be asking about a scan of their staging host"), "");
+        assert_eq!(clean_target(&"x".repeat(80)), "");
+        // Real answers survive, including the decoration models add.
+        assert_eq!(clean_target("app.example.com"), "app.example.com");
+        assert_eq!(clean_target("\"target\""), "target");
+        assert_eq!(clean_target("10.0.0.5"), "10.0.0.5");
+        assert_eq!(clean_target("Example Org"), "Example Org");
+    }
+
+    #[test]
+    fn an_existing_engagement_is_reused_not_duplicated() {
+        let root = std::env::temp_dir().join(format!("hacksor-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // One real engagement, plus a lookalike directory that is NOT one.
+        let real = root.join("target");
+        create_ledger_tree(&real, "target").unwrap();
+        std::fs::create_dir_all(root.join("target-notes")).unwrap();
+
+        // The same target again, however it is spelled, lands in the same place.
+        for again in ["target", "Target", "target.example", "www.target.example", "tar-get"] {
+            let slug = target_slug(again);
+            let found = find_existing_engagement(&root, &slug);
+            assert_eq!(found.as_deref(), Some(real.as_path()), "{again} did not reuse the engagement");
+        }
+        // An unrelated target still gets its own directory.
+        assert!(find_existing_engagement(&root, &target_slug("other-target.example")).is_none());
+        // A directory without the notes file is not an engagement.
+        assert!(find_existing_engagement(&root, "target-notes").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_target_becomes_a_safe_directory_name() {
+        assert_eq!(target_slug("https://app.example.com/login?next=/x"), "app.example.com");
+        assert_eq!(target_slug("HTTP://Example.COM"), "example.com");
+        assert_eq!(target_slug("10.48.184.199:9001"), "10.48.184.199");
+        assert_eq!(target_slug("  Example Org  "), "example-org");
+        assert_eq!(target_slug("example.test"), "example.test");
+        // Separators never collapse into something that climbs out of the root.
+        for nasty in ["../../etc", "..", "/", "../x", "a/../b"] {
+            let s = target_slug(nasty);
+            assert!(!s.contains(".."), "{nasty} -> {s}");
+            assert!(!s.contains('/'), "{nasty} -> {s}");
+            assert!(!s.starts_with('.'), "{nasty} -> {s}");
+        }
+        // Empty or unusable input still names a directory.
+        for empty in ["", "   ", "???", "///"] {
+            assert!(target_slug(empty).starts_with("session-"), "{empty}");
+        }
+        // Long targets are bounded.
+        assert!(target_slug(&"a".repeat(200)).chars().count() <= 48);
+    }
+
+    #[test]
+    fn the_engagement_skeleton_names_what_each_file_is_for() {
+        let files = ledger_skeleton("target.example.com");
+        let names: Vec<&str> = files.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["ENGAGEMENT_NOTES.md", "RESIDUAL_STATE.md", "ledger/index.md", "README.md"]);
+        for (name, body) in &files {
+            assert!(body.contains("target.example.com"), "{name} does not name the target");
+            assert!(!body.is_empty());
+        }
+        // The notes file carries the two sections that survive a compaction.
+        let notes = &files[0].1;
+        assert!(notes.contains("## Current state"));
+        assert!(notes.contains("## Ruled out"));
     }
 
     #[test]
