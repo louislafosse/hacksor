@@ -19,3 +19,11 @@ __pycache__/
 !.env.example
 ROADMAP.md
 notes.txt
+
+# Local-only reference material and engagement data. Never publish these:
+# they carry client names and real findings.
+/hackerai/
+/tui-analysis/
+*.mp4
+identities.json
+/dist-rendertest/
