@@ -2979,6 +2979,25 @@ async function branchSession(session: Session, msgEl: HTMLElement, isAssistant: 
     const ns = makeSession();
     ns.title = session.title.replace(/ \(branch\)$/, "") + " (branch)";
     ns.workingDir = session.workingDir;
+    // A branch is the SAME engagement: same target, same directory, same
+    // findings store. Without this the branch had no engagement at all — no
+    // button, and an agent with no idea the record existed, quietly writing
+    // findings nowhere. The directory is inherited rather than created, so
+    // nothing is duplicated on disk.
+    ns.ledgerDir = session.ledgerDir;
+    ns.ledgerHostDir = session.ledgerHostDir;
+    ns.ledgerFindings = session.ledgerFindings;
+    ns.ledgerNotes = session.ledgerNotes;
+    // It is a fresh codex thread, so it has never seen the ledger
+    // instructions. They ride out with its first message, the same way a new
+    // engagement's do.
+    if (ns.ledgerDir && ns.ledgerFindings && ns.ledgerNotes) {
+      ns.pendingLedgerPreamble = ledgerPreamble({
+        dir: ns.ledgerDir,
+        findings: ns.ledgerFindings,
+        notes: ns.ledgerNotes,
+      });
+    }
     // A FRESH thread, not a codex fork. Forking copies the whole thread with no
     // way to cut it at a message, so a forked chat carried the messages below
     // the branch point as context — the thing a branch exists to avoid. The
@@ -3199,6 +3218,30 @@ async function targetForSession(session: Session, text: string): Promise<string>
 //
 // Only sessions started from now on get one. A chat restored from before has
 // no ledgerDir, receives no injection, and behaves exactly as it always did.
+/// The engagement instructions injected into a thread that has a ledger.
+///
+/// Shared because a BRANCH is a fresh codex thread: it inherits the
+/// engagement directory but knows nothing about it until it is told, and a
+/// branch that silently stops recording findings is worse than no branch.
+function ledgerPreamble(l: { dir: string; findings: string; notes: string }): string {
+  return [
+    "<engagement_ledger>",
+    `This session's engagement directory is ${l.dir}. It is the record of this`,
+    "engagement and it outlives your context window, which WILL compact and take",
+    "the rest with it. Keep it current as you work, not at the end.",
+    "",
+    `- Findings: \`hacksor-findings add --file ${l.findings} -t "<title>" -s <severity> --cvss <n> -u <url> -d "<what>" -e "<evidence>"\`, the moment one is confirmed.`,
+    `- The report is generated from that store: \`hacksor-findings report --file ${l.findings} -o ${l.dir}/deliverables/report.md\`. Regenerate it whenever you add or change a finding, so the deliverable is never behind the work.`,
+    `- ${l.notes}: rewrite "Current state" as it changes, and append to "Open leads" and "Ruled out". A negative with its boundary is as valuable as a finding: it is what stops the next pass from re-running a dead end.`,
+    `- Evidence goes under ${l.dir}/artifacts/<workstream>/ (one directory per workstream: recon, a host, a PoC, a decompile). Anything that must not ship goes to ${l.dir}/_quarantine_not_in_delivery/.`,
+    `- Anything you create on the target (accounts, uploads, webhooks, registrations) is appended to ${l.dir}/RESIDUAL_STATE.md when you create it.`,
+    "",
+    "If you have lost the thread — after a compaction, or on resume — READ the notes",
+    "file first and continue from its Current state rather than guessing or starting over.",
+    "</engagement_ledger>",
+  ].join("\n");
+}
+
 async function openLedger(session: Session, firstPrompt: string): Promise<string> {
   if (session.ledgerDir) return "";
   try {
@@ -3225,22 +3268,7 @@ async function openLedger(session: Session, firstPrompt: string): Promise<string
       note.title = "Open findings, report and artifacts";
       note.addEventListener("click", () => void openEngagement());
     }
-    return [
-      "<engagement_ledger>",
-      `This session's engagement directory is ${l.dir}. It is the record of this`,
-      "engagement and it outlives your context window, which WILL compact and take",
-      "the rest with it. Keep it current as you work, not at the end.",
-      "",
-      `- Findings: \`hacksor-findings add --file ${l.findings} -t "<title>" -s <severity> --cvss <n> -u <url> -d "<what>" -e "<evidence>"\`, the moment one is confirmed.`,
-      `- The report is generated from that store: \`hacksor-findings report --file ${l.findings} -o ${l.dir}/deliverables/report.md\`. Regenerate it whenever you add or change a finding, so the deliverable is never behind the work.`,
-      `- ${l.notes}: rewrite "Current state" as it changes, and append to "Open leads" and "Ruled out". A negative with its boundary is as valuable as a finding: it is what stops the next pass from re-running a dead end.`,
-      `- Evidence goes under ${l.dir}/artifacts/<workstream>/ (one directory per workstream: recon, a host, a PoC, a decompile). Anything that must not ship goes to ${l.dir}/_quarantine_not_in_delivery/.`,
-      `- Anything you create on the target (accounts, uploads, webhooks, registrations) is appended to ${l.dir}/RESIDUAL_STATE.md when you create it.`,
-      "",
-      "If you have lost the thread — after a compaction, or on resume — READ the notes",
-      "file first and continue from its Current state rather than guessing or starting over.",
-      "</engagement_ledger>",
-    ].join("\n");
+    return ledgerPreamble(l);
   } catch {
     return ""; // the engagement proceeds without a ledger rather than failing
   }
