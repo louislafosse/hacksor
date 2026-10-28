@@ -1,3 +1,15 @@
+# [1.15.0](https://github.com/louislafosse/hacksor/compare/v1.14.0...v1.15.0) (2026-10-28)
+
+
+### Bug Fixes
+
+* **loop:** warn about a repeated command, never stop the run ([c6b51c3](https://github.com/louislafosse/hacksor/commit/c6b51c381871f101784416f2652f6713a3df71e3))
+
+
+### Features
+
+* **persona:** give the end of a turn a fixed shape ([6ddf5de](https://github.com/louislafosse/hacksor/commit/6ddf5deeb392d2ca5f2a339de1e4237a82a51193))
+
 # [1.14.0](https://github.com/louislafosse/hacksor/compare/v1.13.4...v1.14.0) (2026-10-28)
 
 
