@@ -2646,24 +2646,19 @@ async function steerNow(session: Session, text: string, auto = false) {
   }
 }
 
-// Doom-loop guard: if the agent runs the SAME command many times in a row it is
-// almost certainly stuck. Warn at 4, and interrupt the turn at 6 (ported idea
-// from HackerAI's doom-loop detection).
+// Doom-loop guard: if the agent runs the SAME command many times in a row it
+// may be stuck. This only ever WARNS — it never interrupts the turn. A repeated
+// command is often legitimate (polling a scan, retrying a flaky host, walking a
+// wordlist), and stopping the run on a guess cost more than it saved. The
+// warning repeats every 4 so a genuine loop keeps being visible.
 function checkDoomLoop(session: Session, command: string) {
   const sig = command.trim();
   if (!sig) return;
   if (sig === session.cmdSig) session.cmdRepeat = (session.cmdRepeat ?? 1) + 1;
   else { session.cmdSig = sig; session.cmdRepeat = 1; }
   const n = session.cmdRepeat ?? 1;
-  if (n === 4) {
+  if (n >= 4 && n % 4 === 0) {
     session.turnsEl.appendChild(el("div", "errbar warn", `⚠ The agent has run the same command ${n} times — it may be stuck in a loop.`));
-    scrollToBottom();
-  }
-  if (n >= 6 && session.threadId) {
-    invoke("interrupt", { threadId: session.threadId }).catch(() => {});
-    setSessionRunning(session, false);
-    session.cmdRepeat = 0;
-    session.turnsEl.appendChild(el("div", "errbar", "⛔ Stopped: the agent was repeating the same command (possible loop). Send a new instruction to continue."));
     scrollToBottom();
   }
 }
