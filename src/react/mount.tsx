@@ -13,7 +13,11 @@ export function mountOverlay(render: (close: () => void) => ReactElement): () =>
   const host = document.createElement("div");
   document.body.appendChild(host);
   const root: Root = createRoot(host);
+  let closed = false;
   const close = () => {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener("keydown", onKey, true);
     // Unmount on a later tick: React forbids unmounting while it is rendering,
     // and close() is usually called from inside an event handler it owns.
     setTimeout(() => {
@@ -21,6 +25,21 @@ export function mountOverlay(render: (close: () => void) => ReactElement): () =>
       host.remove();
     }, 0);
   };
+  // Escape closes any overlay mounted this way. Captured, so it fires even
+  // while a field inside has focus — an overlay you cannot dismiss from the
+  // keyboard is the one you end up clicking around.
+  //
+  // Only the TOPMOST overlay closes: a dialog opened over another handles the
+  // key and stops it, instead of tearing down the whole stack at once.
+  function onKey(e: KeyboardEvent) {
+    if (e.key !== "Escape" || e.defaultPrevented) return;
+    const last = document.body.lastElementChild;
+    if (last !== host) return;
+    e.preventDefault();
+    e.stopPropagation();
+    close();
+  }
+  document.addEventListener("keydown", onKey, true);
   root.render(render(close));
   return close;
 }
