@@ -49,12 +49,16 @@ extendedKeyUsage = critical,codeSigning
 EOF
   openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
     -keyout "$tmp/k.pem" -out "$tmp/c.pem" -config "$tmp/cert.cnf" 2>/dev/null
+  # A real password, not an empty one: LibreSSL and Apple's importer disagree
+  # about how an empty PKCS#12 password is MAC'd, and the import fails with
+  # "MAC verification failed". The password only protects this temporary file.
+  pw="hacksor-local-signing"
   openssl pkcs12 -export -out "$tmp/i.p12" -inkey "$tmp/k.pem" -in "$tmp/c.pem" \
-    -passout pass: -name "$IDENTITY" 2>/dev/null
+    -passout "pass:$pw" -name "$IDENTITY" 2>/dev/null
   # -T lets codesign use the key without prompting for the keychain password
   # on every build; the key never leaves the login keychain.
   security import "$tmp/i.p12" -k "$HOME/Library/Keychains/login.keychain-db" \
-    -P "" -T /usr/bin/codesign -T /usr/bin/security
+    -P "$pw" -T /usr/bin/codesign -T /usr/bin/security
   # Without this, macOS still prompts the first time codesign reads the key.
   security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
     -k "" "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1 || true
