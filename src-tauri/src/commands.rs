@@ -3914,17 +3914,25 @@ pub async fn ledger_recover(
 ) -> Result<Option<SessionLedger>, String> {
     let Some(path) = find_rollout(&state.codex_home, &thread_id) else { return Ok(None) };
     let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let Some(dir) = engagement_dir_in_rollout(&text) else { return Ok(None) };
+    // The rollout records paths as the AGENT saw them, which under Docker are
+    // container paths. Map back before touching the filesystem.
+    let as_host = |d: &str| std::path::PathBuf::from(crate::platform::from_container_path(d));
+    let is_engagement = |p: &std::path::Path| p.join("ENGAGEMENT_NOTES.md").is_file();
 
-    // The rollout records the path the AGENT saw, which under Docker is a
-    // container path. Map it back before touching the filesystem.
-    let host = crate::platform::from_container_path(&dir);
-    let host_dir = std::path::PathBuf::from(&host);
-    if !host_dir.join("ENGAGEMENT_NOTES.md").is_file() {
-        // The directory was renamed or removed; offering a view of it would
-        // only produce errors.
-        return Ok(None);
-    }
+    let direct = engagement_dir_in_rollout(&text).map(|d| as_host(&d));
+    let host_dir = match direct {
+        // The preamble or the cwd named it outright.
+        Some(d) if is_engagement(&d) => d,
+        // The cwd is often the directory engagements live UNDER rather than an
+        // engagement itself: the agent opens the chat in ~/sec and cd's into
+        // the target per command. Look one level down and take the engagement
+        // the thread actually worked in.
+        Some(parent) => match engagement_worked_in(&parent, &text) {
+            Some(d) => d,
+            None => return Ok(None),
+        },
+        None => return Ok(None),
+    };
     let docker = docker_runtime(&state).await;
     let seen = |p: &std::path::Path| -> String {
         if docker { crate::platform::to_container_path(p) } else { p.to_string_lossy().into_owned() }
@@ -3976,6 +3984,37 @@ fn engagement_dir_in_rollout(text: &str) -> Option<String> {
         .or_else(|| v.pointer("/cwd"))
         .and_then(|c| c.as_str())?;
     (!cwd.is_empty()).then(|| cwd.to_string())
+}
+
+/// Of the engagements directly under `root`, the one this rollout worked in.
+///
+/// Picked by how often each directory's name occurs in the thread, so a
+/// session that touched one engagement in passing does not outvote the one it
+/// actually ran. Ties and zero mentions return nothing rather than a guess:
+/// opening the wrong engagement is worse than offering no button.
+fn engagement_worked_in(root: &std::path::Path, text: &str) -> Option<std::path::PathBuf> {
+    let mut best: Option<(usize, std::path::PathBuf)> = None;
+    let mut tied = false;
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let p = entry.path();
+        if !p.join("ENGAGEMENT_NOTES.md").is_file() {
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+        let hits = text.matches(name).count();
+        if hits == 0 {
+            continue;
+        }
+        match &best {
+            Some((n, _)) if hits < *n => {}
+            Some((n, _)) if hits == *n => tied = true,
+            _ => {
+                best = Some((hits, p));
+                tied = false;
+            }
+        }
+    }
+    if tied { None } else { best.map(|(_, p)| p) }
 }
 
 /// Create (or adopt) the engagement directory for a session.
@@ -5215,6 +5254,35 @@ mod transcript_tests {
         assert!(!md.contains("internal"));
         // With no compaction there is no notice to explain.
         assert!(!branch_markdown(&items, 0).contains("compacted"));
+    }
+
+    #[test]
+    fn the_engagement_a_thread_worked_in_is_picked_by_mentions() {
+        let root = std::env::temp_dir().join(format!("hacksor-eng-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["alpha.example.com", "beta.example.com", "notes-only"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        // Only the first two are engagements.
+        for name in ["alpha.example.com", "beta.example.com"] {
+            std::fs::write(root.join(name).join("ENGAGEMENT_NOTES.md"), "x").unwrap();
+        }
+
+        // The thread ran in beta and only glanced at alpha.
+        let text = "cd beta.example.com; nmap beta.example.com; curl beta.example.com; see alpha.example.com";
+        assert_eq!(
+            engagement_worked_in(&root, text).unwrap().file_name().unwrap(),
+            std::ffi::OsStr::new("beta.example.com")
+        );
+
+        // A tie is not a guess.
+        assert!(engagement_worked_in(&root, "alpha.example.com beta.example.com").is_none());
+        // Neither is silence.
+        assert!(engagement_worked_in(&root, "nothing relevant here").is_none());
+        // A plain directory with no notes file is not an engagement.
+        assert!(engagement_worked_in(&root, "notes-only notes-only notes-only").is_none());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

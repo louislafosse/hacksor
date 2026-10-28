@@ -314,9 +314,15 @@ const IC = (path: string) =>
   `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${path}</svg>`;
 const SEARCH_ICON = IC('<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>');
 const ATTACH_ICON = IC('<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>');
-const FOLDER_ICON =
-  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
-  '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>';
+// A document with a sparkle: the engagement view is the written record —
+// findings, notes, the report — and the sparkle marks it as the one the agent
+// keeps for you. Monochrome like the rest of the toolbar, and the sparkle is
+// kept clear of the page edge: at 17px anything touching it reads as a smudge.
+const ENGAGEMENT_ICON = IC(
+  '<path d="M5 5h8a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"/>' +
+  '<path d="M6 10h6"/><path d="M6 13.5h6"/><path d="M6 17h3.5"/>' +
+  '<path d="M19 3.8c.7 1.6.9 1.8 2.5 2.5-1.6.7-1.8.9-2.5 2.5-.7-1.6-.9-1.8-2.5-2.5 1.6-.7 1.8-.9 2.5-2.5z"/>',
+);
 const NOTES_ICON = IC('<path d="M15 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M15 3v5h5"/><path d="M9 13h6"/><path d="M9 17h4"/>');
 const SETTINGS_ICON = IC('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>');
 
@@ -630,7 +636,7 @@ app.innerHTML = `
           <button class="tchip ctx" id="ctxchip" hidden title="Context used">0%</button>
           <div id="moremount" class="more-wrap"></div>
           <div class="grow"></div>
-          <button class="icon-btn eng" id="engagementbtn" hidden title="Findings, report and artifacts for this engagement">${FOLDER_ICON}</button>
+          <button class="icon-btn eng" id="engagementbtn" hidden title="Findings, report and artifacts for this engagement">${ENGAGEMENT_ICON}</button>
           <button class="icon-btn attach" id="attach" title="Attach files">${ATTACH_ICON}</button>
           <button class="send" id="send" title="Send">↑</button>
         </div>
