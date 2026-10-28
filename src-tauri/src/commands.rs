@@ -386,7 +386,7 @@ const OCX_CODEX_HOME_CONTAINER: &str = "/tmp/hacksor-ocx-codex";
 /// (`/tmp`), so it cannot touch the host at all; on the host it is a per-user
 /// Hacksor directory. Either way it is never `~/.codex`, and never the codex
 /// home the harness uses.
-fn ocx_codex_home(docker: bool) -> String {
+pub fn ocx_codex_home(docker: bool) -> String {
     if docker {
         return OCX_CODEX_HOME_CONTAINER.to_string();
     }
@@ -1369,32 +1369,6 @@ pub async fn start_chat(
         custom.as_deref(),
     );
 
-    // What the live catalog says this model's window is. codex otherwise
-    // assumes its own default for anything it does not recognise, which is how
-    // a 1M model was compacting at 258_400.
-    let context_window = read_live_catalog(&state, provider, docker_runtime(&state).await)
-        .await
-        .ok()
-        .and_then(|models| {
-            models
-                .into_iter()
-                .find(|m| m.id == args.model)
-                .and_then(|m| m.context_length)
-        });
-
-    // Persist it: codex reads config.toml once, when the app-server starts, so
-    // a window found now cannot reach the running server — it is written for
-    // the next launch. The in-session write in start_thread keeps the file
-    // itself current in the meantime.
-    if let Some(win) = context_window.filter(|w| *w > 0) {
-        let effective = (win as f64 * 0.9) as u64;
-        let mut s = state.settings.lock().await;
-        if s.model_context_window != Some(effective) {
-            s.model_context_window = Some(effective);
-            let _ = s.save(&state.codex_home);
-        }
-    }
-
     harness
         .start_thread(StartParams {
             provider,
@@ -1402,7 +1376,6 @@ pub async fn start_chat(
             cwd,
             permission,
             developer_instructions,
-            context_window,
         })
         .await
         .map_err(|e| e.to_string())

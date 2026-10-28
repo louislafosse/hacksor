@@ -69,14 +69,6 @@ pub struct Settings {
     /// $HOME would start failing without warning.
     #[serde(default)]
     pub limit_runtime_mount: bool,
-    /// Context window of the last model a thread was started with, already
-    /// reduced for headroom.
-    ///
-    /// codex reads config.toml ONCE, when the app-server starts, so a value
-    /// discovered later in the session cannot reach it — it has to survive to
-    /// the next launch. Persisting it here is what makes that happen.
-    #[serde(default)]
-    pub model_context_window: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -123,7 +115,6 @@ impl Default for Settings {
             last_seen_version: None,
             warn_without_vpn: true,
             limit_runtime_mount: false,
-            model_context_window: None,
         }
     }
 }

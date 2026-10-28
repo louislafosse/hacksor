@@ -82,14 +82,6 @@ pub struct StartParams {
     pub cwd: PathBuf,
     pub permission: Permission,
     pub developer_instructions: String,
-    /// What the model's context window really is, when the catalog knows.
-    ///
-    /// codex falls back to its own default (272_000) for a model it does not
-    /// recognise, and the catalog's `effective_context_window_percent` is then
-    /// applied to THAT — which is how a 1M model ends up compacting at 258_400
-    /// (272_000 x 0.95). Passing the real figure stops codex compacting at a
-    /// quarter of the window it actually has.
-    pub context_window: Option<u64>,
 }
 
 /// Per-turn overrides passed on `turn/start`.
@@ -430,13 +422,10 @@ impl Harness {
         if !params.developer_instructions.is_empty() {
             p["developerInstructions"] = json!(params.developer_instructions);
         }
-        // The window is NOT a thread/start parameter: `modelContextWindow` is
+        // The window is deliberately NOT sent here. `modelContextWindow` is
         // something the app-server REPORTS in token-usage events, not
-        // something it accepts. It goes through config.toml, refreshed here so
-        // it tracks the model this thread is about to use.
-        if let Some(win) = params.context_window {
-            write_context_window(&self.codex_home, win);
-        }
+        // something it accepts, and codex gets the real figure from the model
+        // catalog that write_provider_config points it at.
         let res = self.request("thread/start", p).await.map_err(|e| anyhow!(e))?;
         let thread_id = res
             .get("thread")
@@ -630,61 +619,10 @@ fn codex_binary() -> String {
     "codex".to_string()
 }
 
-/// Record a model's real context window in `codex_home/config.toml`.
-///
-/// codex falls back to its own built-in default (272_000) for any model it
-/// does not recognise, and the catalog's `effective_context_window_percent`
-/// is applied to THAT — which is how a 1M model ends up compacting at 258_400
-/// (272_000 x 0.95), a quarter of the context it actually has.
-///
-/// Ten percent is held back. A catalog can be optimistic about a window,
-/// and overshooting the REAL limit fails the request outright, where
-/// compacting a little early only costs some context.
-///
-/// Written per thread rather than once at startup, because the value belongs
-/// to the model and the model is chosen per chat. The line is rewritten in
-/// place so the file does not grow.
-fn write_context_window(codex_home: &std::path::Path, window: u64) {
-    const KEY: &str = "model_context_window";
-    let path = codex_home.join("config.toml");
-    let Ok(current) = std::fs::read_to_string(&path) else { return };
-    let effective = (window as f64 * 0.9) as u64;
-    let line = format!("{KEY} = {effective}");
-    if current.lines().any(|l| l.trim() == line) {
-        return; // already correct for this model
-    }
-    let mut out = String::with_capacity(current.len() + line.len() + 1);
-    let mut replaced = false;
-    for l in current.lines() {
-        if l.trim_start().starts_with(KEY) && l.contains('=') {
-            if !replaced {
-                out.push_str(&line);
-                out.push('\n');
-                replaced = true;
-            }
-            continue;
-        }
-        out.push_str(l);
-        out.push('\n');
-    }
-    if !replaced {
-        // Must land before the first [table], or TOML reads it as a member of
-        // that table instead of a top-level key.
-        match out.find("\n[") {
-            Some(at) => out.insert_str(at + 1, &format!("{line}\n")),
-            None => out.push_str(&line),
-        }
-    }
-    let _ = std::fs::write(&path, out);
-}
-
 /// Write every supported provider block into `codex_home/config.toml`. All
 /// providers use the OpenAI-compatible `responses` wire API.
 fn write_provider_config(codex_home: &PathBuf, is_docker: bool) -> Result<()> {
     std::fs::create_dir_all(codex_home)?;
-    // Carried over from the last session: codex reads this file once, at
-    // startup, so a window discovered mid-session only takes effect now.
-    let carried = crate::settings::Settings::load(codex_home).model_context_window;
     let mut toml = String::from(
         "# Managed by Hacksor. Do not edit the provider blocks by hand.\n\
 # Every provider routes through the local OpenCodex proxy; the upstream is\n\
@@ -701,10 +639,21 @@ project_doc_max_bytes = 0\n\
 # against app-server 0.162.1; anything else makes codex refuse to start).\n\
 model_auto_compact_token_limit_scope = \"body_after_prefix\"\n",
     );
-    if let Some(win) = carried.filter(|w| *w > 0) {
-        // Top-level, so it must precede every [table] below.
-        toml.push_str(&format!("model_context_window = {win}\n"));
-    }
+    // Point codex at OpenCodex's model catalog.
+    //
+    // Without it codex knows nothing about these models and falls back to its
+    // own built-in default window — 272_000, and 95% of that is the 258_400 a
+    // 1M-context Opus was compacting at. ocx writes this line into its OWN
+    // codex home, which is not the one the app-server runs with, so codex
+    // never saw it.
+    //
+    // The catalog carries a real window per model, so this fixes every model
+    // at once instead of forcing one global number that would be wrong for
+    // the 128k ones.
+    toml.push_str(&format!(
+        "model_catalog_json = \"{}/opencodex-catalog.json\"\n",
+        crate::commands::ocx_codex_home(is_docker)
+    ));
     toml.push_str(
         "\
 # codex 0.152+ ships update_plan disabled by default (it must be opted back in\n\
@@ -768,28 +717,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_context_window_lands_before_any_table_and_is_replaced_in_place() {
-        let dir = std::env::temp_dir().join(format!("hacksor-ctxwin-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        std::fs::write(&path, "model_provider = \"opencodex\"\n[tools.update_plan]\nenabled = true\n").unwrap();
-
-        write_context_window(&dir, 1_000_000);
-        let out = std::fs::read_to_string(&path).unwrap();
-        // 10% held back against an optimistic catalog.
-        assert!(out.contains("model_context_window = 900000"), "{out}");
-        // Above the first table, or TOML reads it as a key OF that table.
-        let key_at = out.find("model_context_window").unwrap();
-        let table_at = out.find("[tools.update_plan]").unwrap();
-        assert!(key_at < table_at, "key must precede the table:\n{out}");
-        assert!(out.contains("enabled = true"), "existing config survives:\n{out}");
-
-        // Switching model rewrites in place instead of appending a second one.
-        write_context_window(&dir, 200_000);
-        let out = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(out.matches("model_context_window").count(), 1, "{out}");
-        assert!(out.contains("model_context_window = 180000"), "{out}");
-
+    fn config_points_codex_at_the_model_catalog() {
+        // Without this codex knows nothing about these models and uses its own
+        // default window (272_000), 95% of which is the 258_400 a 1M-context
+        // model was compacting at.
+        let dir = std::env::temp_dir().join(format!("hacksor-cat-{}", std::process::id()));
+        write_provider_config(&dir, true).unwrap();
+        let toml = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+        assert!(
+            toml.contains("model_catalog_json = \"/tmp/hacksor-ocx-codex/opencodex-catalog.json\""),
+            "catalog pointer missing:\n{toml}"
+        );
+        // Top-level keys must precede the first table or TOML reads them as
+        // members of it.
+        let key = toml.find("model_catalog_json").unwrap();
+        if let Some(table) = toml.find("\n[") {
+            assert!(key < table, "catalog pointer fell inside a table:\n{toml}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
