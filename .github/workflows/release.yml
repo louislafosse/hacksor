@@ -142,6 +142,12 @@ jobs:
           # "damaged" error into an approvable prompt. Empty on non-macOS
           # runners, where the bundler ignores it.
           APPLE_SIGNING_IDENTITY: ${{ startsWith(matrix.platform, 'macos') && '-' || '' }}
+          # Sign the update artifacts. The PUBLIC half is committed in
+          # src-tauri/tauri.updater.conf.json; the private half lives only in
+          # this secret. Without it tauri-action cannot produce latest.json and
+          # the in-app updater has nothing to verify against.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         # For a CLEAN double-click with no approval step, real signing +
         # notarization is the only route: add a step that sets
         # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
@@ -152,4 +158,7 @@ jobs:
         with:
           # Attach to the release semantic-release already created for this tag.
           tagName: v${{ needs.release.outputs.version }}
-          args: ${{ matrix.args }}
+          # The updater config is applied HERE rather than in tauri.conf.json so
+          # a local `pnpm build` still works without a signing key.
+          args: ${{ matrix.args }} --config src-tauri/tauri.updater.conf.json
+          includeUpdaterJson: true
