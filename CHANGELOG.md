@@ -1,3 +1,10 @@
+## [1.13.1](https://github.com/louislafosse/hacksor/compare/v1.13.0...v1.13.1) (2026-10-28)
+
+
+### Bug Fixes
+
+* **engagement:** find the engagement when the chat opens above it ([2608ee2](https://github.com/louislafosse/hacksor/commit/2608ee2d04420212cc853422445e26d348792d92))
+
 # [1.13.0](https://github.com/louislafosse/hacksor/compare/v1.12.0...v1.13.0) (2026-10-28)
 
 
