@@ -5258,7 +5258,10 @@ mod transcript_tests {
 
     #[test]
     fn the_engagement_a_thread_worked_in_is_picked_by_mentions() {
-        let root = std::env::temp_dir().join(format!("hacksor-eng-{}", std::process::id()));
+        // Named for THIS test: tests share a process, so a directory keyed only
+        // by pid is shared with every other test that does the same, and the
+        // first one to finish deletes the others' fixtures mid-run.
+        let root = std::env::temp_dir().join(format!("hacksor-worked-in-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for name in ["alpha.example.com", "beta.example.com", "notes-only"] {
             std::fs::create_dir_all(root.join(name)).unwrap();
