@@ -3899,6 +3899,85 @@ fn create_ledger_tree(dir: &std::path::Path, slug: &str) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Recover which engagement directory a thread belongs to, by reading its
+/// rollout.
+///
+/// The link normally lives in the chat record, but chats created before that
+/// field was persisted have no directory recorded and would never show the
+/// engagement view again — the work exists on disk with nothing pointing at
+/// it. The preamble injected at the start of an engagement names the path, so
+/// the rollout is an authoritative record of it.
+#[tauri::command]
+pub async fn ledger_recover(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<Option<SessionLedger>, String> {
+    let Some(path) = find_rollout(&state.codex_home, &thread_id) else { return Ok(None) };
+    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let Some(dir) = engagement_dir_in_rollout(&text) else { return Ok(None) };
+
+    // The rollout records the path the AGENT saw, which under Docker is a
+    // container path. Map it back before touching the filesystem.
+    let host = crate::platform::from_container_path(&dir);
+    let host_dir = std::path::PathBuf::from(&host);
+    if !host_dir.join("ENGAGEMENT_NOTES.md").is_file() {
+        // The directory was renamed or removed; offering a view of it would
+        // only produce errors.
+        return Ok(None);
+    }
+    let docker = docker_runtime(&state).await;
+    let seen = |p: &std::path::Path| -> String {
+        if docker { crate::platform::to_container_path(p) } else { p.to_string_lossy().into_owned() }
+    };
+    Ok(Some(SessionLedger {
+        dir: seen(&host_dir),
+        host_dir: host_dir.to_string_lossy().into_owned(),
+        findings: seen(&host_dir.join("findings.jsonl")),
+        notes: seen(&host_dir.join("ENGAGEMENT_NOTES.md")),
+        report: seen(&host_dir.join("deliverables").join("report.md")),
+        created: false,
+    }))
+}
+
+/// Find the engagement directory a rollout belongs to.
+///
+/// Two signals, best first:
+///
+/// 1. The preamble line, when the session got one — it names the directory
+///    outright.
+/// 2. The thread's recorded `cwd`. A session opened on an engagement runs in
+///    it, so the working directory IS the engagement. This is the one that
+///    actually fires in practice: threads whose preamble was skipped (it rides
+///    on the second message, and a turn can end before that) still record a
+///    cwd on the very first line.
+///
+/// Either way the caller checks the directory really is an engagement before
+/// offering it, so a plain cwd on an ordinary chat is harmless.
+fn engagement_dir_in_rollout(text: &str) -> Option<String> {
+    const MARK: &str = "This session's engagement directory is ";
+    // Last match wins: a thread that moved to another engagement should
+    // recover the one it is actually on.
+    if let Some(at) = text.rfind(MARK).map(|i| i + MARK.len()) {
+        let rest = &text[at..];
+        let end = rest
+            .find(". It is the record")
+            .or_else(|| rest.find("\\n"))
+            .unwrap_or(rest.len());
+        let dir = rest[..end].trim().trim_end_matches('.').trim();
+        if !dir.is_empty() {
+            return Some(dir.to_string());
+        }
+    }
+    // The session meta is the first line of the rollout.
+    let first = text.lines().next()?;
+    let v: serde_json::Value = serde_json::from_str(first).ok()?;
+    let cwd = v
+        .pointer("/payload/cwd")
+        .or_else(|| v.pointer("/cwd"))
+        .and_then(|c| c.as_str())?;
+    (!cwd.is_empty()).then(|| cwd.to_string())
+}
+
 /// Create (or adopt) the engagement directory for a session.
 ///
 /// Idempotent: an existing directory is reused and no file is overwritten, so
@@ -5136,6 +5215,35 @@ mod transcript_tests {
         assert!(!md.contains("internal"));
         // With no compaction there is no notice to explain.
         assert!(!branch_markdown(&items, 0).contains("compacted"));
+    }
+
+    #[test]
+    fn engagement_dir_recovered_from_preamble_or_cwd() {
+        // 1. The preamble names it outright.
+        let roll = r#"{"payload":{"content":"<engagement_ledger>\nThis session's engagement directory is /Users/op/sec/target.example.com. It is the record of this\nengagement"}}"#;
+        assert_eq!(
+            engagement_dir_in_rollout(roll).as_deref(),
+            Some("/Users/op/sec/target.example.com")
+        );
+
+        // A thread that moved on recovers the engagement it is actually on.
+        let two = format!("{roll}\n{}", roll.replace("target.example.com", "second.example.com"));
+        assert_eq!(
+            engagement_dir_in_rollout(&two).as_deref(),
+            Some("/Users/op/sec/second.example.com")
+        );
+
+        // 2. No preamble — fall back to the cwd on the session-meta line. This
+        //    is the case that actually occurs: the preamble rides on the second
+        //    message and a thread can end before sending one.
+        let meta = "{\"payload\":{\"cwd\":\"/Users/op/sec/third.example.com\"}}\n{\"payload\":{\"content\":\"hi\"}}";
+        assert_eq!(
+            engagement_dir_in_rollout(meta).as_deref(),
+            Some("/Users/op/sec/third.example.com")
+        );
+
+        // Nothing to go on.
+        assert_eq!(engagement_dir_in_rollout(r#"{"payload":{"content":"hello"}}"#), None);
     }
 
     #[test]

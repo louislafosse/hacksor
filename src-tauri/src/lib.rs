@@ -74,6 +74,7 @@ pub fn run() {
             commands::judge_phase,
             commands::suggest_title,
             commands::ledger_init,
+            commands::ledger_recover,
             commands::suggest_target,
             commands::purge_thread,
             commands::vpn_status,

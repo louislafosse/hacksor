@@ -204,6 +204,8 @@ interface Session {
   /// Ledger instructions waiting to ride out with the next message.
   pendingLedgerPreamble?: string;
   ledgerDir?: string;
+  /// Set once a rollout lookup has been attempted, so it runs at most once.
+  ledgerRecovered?: boolean;
   /// The same directory as the HOST sees it, for display and deletion.
   ledgerHostDir?: string;
   ledgerFindings?: string;
@@ -1281,6 +1283,9 @@ function selectSession(id: string) {
     input.style.height = Math.min(input.scrollHeight, 220) + "px";
     updateChips();
     if (providerChanged) loadModels();
+    // A chat stored before the directory was persisted still has the work on
+    // disk; find it so the engagement view is reachable again.
+    void recoverLedger(active);
 
     // Lazily resume a restored chat's transcript on first open.
     if (active.started && active.threadId && !active.resumed && active.turnsEl.children.length === 0) {
@@ -2018,6 +2023,10 @@ async function boot() {
   updateChips();
   updateHint();
   renderSidebar();
+  // The chat open at startup never goes through selectSession, so recover its
+  // engagement here too.
+  const restored = activeSession();
+  if (restored) void recoverLedger(restored);
   // Recents FIRST, and deliberately not awaited: list_recents only reads the
   // rollouts on disk, so it has no dependency on the runtime. It used to sit
   // behind `await loadModels()`, which waits out ensure_opencodex (container
@@ -3219,6 +3228,31 @@ async function openLedger(session: Session, firstPrompt: string): Promise<string
   } catch {
     return ""; // the engagement proceeds without a ledger rather than failing
   }
+}
+
+// Re-attach a chat to its engagement directory when the record has lost it.
+//
+// The directory is stored with the chat now, but chats that predate that are
+// left pointing at nothing: the findings and the report sit on disk with no
+// way back to them. The preamble sent at the start of an engagement names the
+// path, so the thread's own rollout can be read for it.
+//
+// Advisory and quiet: a chat with no engagement, or one whose directory has
+// since been moved, simply keeps no button.
+async function recoverLedger(session: Session) {
+  if (session.ledgerDir || session.ledgerHostDir || !session.threadId) return;
+  if (session.ledgerRecovered) return;
+  session.ledgerRecovered = true;
+  try {
+    const l = await invoke<SessionLedger | null>("ledger_recover", { threadId: session.threadId });
+    if (!l?.dir) return;
+    session.ledgerDir = l.dir;
+    session.ledgerHostDir = l.host_dir;
+    session.ledgerFindings = l.findings;
+    session.ledgerNotes = l.notes;
+    persistOpenChats();
+    if (session === activeSession()) updateChips();
+  } catch { /* the chat is fine without it */ }
 }
 
 // Name a new chat from its first message.

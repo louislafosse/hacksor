@@ -186,6 +186,24 @@ pub fn to_container_path(p: &Path) -> String {
     }
 }
 
+/// Inverse of `to_container_path`: a path as the agent saw it, back on the host.
+///
+/// Identity everywhere but Windows, where the home directory is bind-mounted
+/// at a fixed location inside the container and a recorded path carries that
+/// prefix rather than a drive letter.
+pub fn from_container_path(p: &str) -> String {
+    if !IS_WINDOWS {
+        return p.to_string();
+    }
+    match p.strip_prefix(WIN_HOME) {
+        Some(rest) => home_dir()
+            .join(rest.trim_start_matches('/').replace('/', "\\"))
+            .to_string_lossy()
+            .into_owned(),
+        None => p.to_string(),
+    }
+}
+
 /// Container path for the bind-mounted codex-home.
 pub fn container_codex_home(codex_home: &Path) -> String {
     to_container_path(codex_home)
