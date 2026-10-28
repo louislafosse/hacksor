@@ -24,3 +24,12 @@ B=$(shasum -a 256 "$INSTALLED" | cut -c1-16)
 [ "$A" = "$B" ] || { echo "MISMATCH: built=$A installed=$B"; exit 1; }
 
 echo "OK: installed binary matches the build ($A)"
+
+# Re-sign with the stable local identity when one exists, so macOS keeps the
+# file-access grants it was given instead of re-asking after every rebuild.
+# Silent no-op until ./scripts-sign-local.sh has been run once.
+if security find-identity -v -p codesigning 2>/dev/null | grep -qF "Hacksor Local Signing"; then
+  ./scripts-sign-local.sh /Applications/Hacksor.app >/dev/null 2>&1 \
+    && echo "OK: re-signed with the local identity" \
+    || echo "WARN: re-signing failed; macOS will ask for file access again"
+fi
