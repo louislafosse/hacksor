@@ -1,3 +1,11 @@
+## [1.13.3](https://github.com/louislafosse/hacksor/compare/v1.13.2...v1.13.3) (2026-10-28)
+
+
+### Bug Fixes
+
+* **identity:** throwaway inboxes were unusable from the first request ([bab3496](https://github.com/louislafosse/hacksor/commit/bab34967457291d58235560da34be82a6659f951))
+* **runtime:** unbreak the image build on the certifi conflict ([02662d6](https://github.com/louislafosse/hacksor/commit/02662d65e2de784bb2d842c7a44e398f1610a3d1))
+
 ## [1.13.2](https://github.com/louislafosse/hacksor/compare/v1.13.1...v1.13.2) (2026-10-28)
 
 
