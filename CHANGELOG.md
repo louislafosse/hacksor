@@ -1,3 +1,11 @@
+## [1.13.4](https://github.com/louislafosse/hacksor/compare/v1.13.3...v1.13.4) (2026-10-28)
+
+
+### Bug Fixes
+
+* **chat:** a steer is editable again, and the context meter moves ([ef0be4d](https://github.com/louislafosse/hacksor/commit/ef0be4de6cd5da4d89d7e0c31da3ceab51fc9f20))
+* **runtime:** the native-deps guard failed on a package that works ([cecdbbd](https://github.com/louislafosse/hacksor/commit/cecdbbd1a48c1cd3b3ea02abb924efc0c767a46b))
+
 ## [1.13.3](https://github.com/louislafosse/hacksor/compare/v1.13.2...v1.13.3) (2026-10-28)
 
 
