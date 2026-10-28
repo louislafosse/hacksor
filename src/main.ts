@@ -2655,10 +2655,16 @@ function setSendButton(r: boolean) {
   sendBtn.classList.toggle("stop", r);
   sendBtn.onclick = r ? stopRun : onSend;
 }
-async function stopRun() {
+function stopRun() {
   const s = activeSession();
-  if (s?.threadId) await invoke("interrupt", { threadId: s.threadId }).catch(() => {});
-  if (s) setSessionRunning(s, false);
+  if (!s) return;
+  // Flip the UI first. The interrupt itself can take as long as whatever the
+  // turn is blocked on, and awaiting it left the button looking stuck for the
+  // duration of the thing being stopped.
+  setSessionRunning(s, false);
+  removeThinking(s);
+  addAutoNoteText(s, "⏹ Stopped.");
+  if (s.threadId) void invoke("interrupt", { threadId: s.threadId }).catch(() => {});
 }
 
 function addUserMessage(session: Session, text: string, atts: { name: string; isImage: boolean }[] = [], steer = false) {

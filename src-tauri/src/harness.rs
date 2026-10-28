@@ -545,14 +545,24 @@ impl Harness {
         self.send_message(thread_id, text, turn, images).await
     }
 
+    /// Ask codex to stop the current turn.
+    ///
+    /// Sent WITHOUT waiting for the reply. codex only answers `turn/interrupt`
+    /// once the turn has actually unwound, and a turn blocked on a long tool
+    /// call — a full-port nmap, a slow fetch — can take a minute to get there.
+    /// Awaiting it made the stop button appear frozen for exactly as long as
+    /// the thing being stopped. The reply is ignored either way, since a turn
+    /// that has already finished is not an error.
     pub async fn interrupt(&self, thread_id: &str) -> Result<()> {
         let turn_id = self.turns.lock().await.get(thread_id).cloned();
         let mut params = json!({ "threadId": thread_id });
         if let Some(turn) = turn_id {
             params["turnId"] = json!(turn);
         }
-        // Ignore errors: the turn may already be finished.
-        let _ = self.request("turn/interrupt", params).await;
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        // No entry in `pending`: nothing is waiting, and the reader drops a
+        // response it cannot match.
+        let _ = self.write(&json!({ "id": id, "method": "turn/interrupt", "params": params })).await;
         Ok(())
     }
 
