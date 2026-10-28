@@ -4,6 +4,7 @@ import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 import { previewFile } from "@/react/previewFile";
+import { FileTree } from "@/react/FileTree";
 
 export type Finding = {
   id: string; title: string; severity: string; cvss: string; cvss_vector: string;
@@ -205,20 +206,18 @@ export function EngagementPanel({
             {files.length === 0 ? (
               <Empty>No files match.</Empty>
             ) : (
-              files.slice(0, 500).map((f) => (
-                <button
-                  key={f.rel}
-                  onClick={() => setOpen(f.rel)}
-                  className={cn(
-                    "flex items-center gap-3 border-b px-4 py-2 text-left hover:bg-accent/50",
-                    open === f.rel && "bg-accent/60",
-                  )}
-                >
-                  <span className="min-w-0 flex-1 truncate font-mono text-[12px]">{f.rel}</span>
-                  <span className="shrink-0 text-[11px] text-muted-foreground">{bytes(f.size)}</span>
-                  <span className="shrink-0 text-[11px] text-muted-foreground">{ago(f.modified)}</span>
-                </button>
-              ))
+              // A tree, not a flat list: an engagement's evidence is organised
+              // by workstream, and a few hundred full paths hide that. Folders
+              // carry their totals so a closed one still tells you what is in
+              // it, and newest-first ordering puts the live workstream on top.
+              <FileTree
+                entries={files.slice(0, 2000)}
+                open={open}
+                onOpen={setOpen}
+                bytes={bytes}
+                ago={ago}
+                filtering={!!q.trim()}
+              />
             )}
             <Preview rel={open} body={body} err={err} onReveal={onReveal} />
           </div>

@@ -204,6 +204,10 @@ interface Session {
   /// Ledger instructions waiting to ride out with the next message.
   pendingLedgerPreamble?: string;
   ledgerDir?: string;
+  /// Interval that refreshes the context meter during a turn.
+  ctxPoll?: number;
+  /// Bounds how long a queued steer waits when no item completes.
+  queueTimer?: number;
   /// Set once a rollout lookup has been attempted, so it runs at most once.
   ledgerRecovered?: boolean;
   /// The same directory as the HOST sees it, for display and deletion.
@@ -2360,28 +2364,32 @@ async function onSend() {
   if (!text || !session) return;
   // Agent mode reaches the target from this machine; check the way out first.
   if (!(await vpnGate())) return;
-  // A turn is in flight. Steer it NOW rather than queueing.
+  // A turn is in flight: queue the message and let the drain send it at the
+  // next boundary.
   //
-  // This used to always queue, and the queue only drained when a shell command
-  // completed or the turn ended. An MCP tool call is not a commandExecution,
-  // so a steer sent during one sat in the queue until the model happened to run
-  // a shell command — which is why a correction could take minutes to land, or
-  // never land until the turn was over. codex accepts mid-turn input on a
-  // running thread, so send it straight through.
+  // It is deliberately NOT sent straight through. A queued steer is still
+  // yours — it shows as a chip and ArrowUp pulls it back into the composer to
+  // edit — and dispatching on keypress took that away: the correction was
+  // already with the server before you could fix a typo in it.
   //
-  // Queue only when there is genuinely nothing to steer into: the thread is
-  // still being created (`starting`), or codex refuses the steer (a compacting
-  // turn cannot take one) — see the fallback in steerNow.
-  if (session.running && session.threadId && !session.starting) {
-    const steerText = text;
-    input.value = ""; session.draft = ""; persistDraft(session); input.style.height = "auto";
-    void steerNow(session, steerText);
-    return;
-  }
+  // What made queueing feel broken was the drain, which only ran when a SHELL
+  // command finished. An MCP tool call is not a commandExecution, so a steer
+  // sent during one waited minutes, or until the turn ended. The drain now
+  // runs at the end of any item, with a timer behind it for a turn that is
+  // thinking rather than acting.
   if (session.running || session.starting) {
     session.queue.push(text);
     input.value = ""; session.draft = ""; persistDraft(session); input.style.height = "auto";
     renderQueue(session);
+    // A turn that is thinking rather than acting completes no items, so the
+    // drain has nothing to hang off and the steer would sit there. Bound the
+    // wait: long enough to edit what you just typed, short enough that a
+    // correction still arrives while it matters.
+    if (session.queueTimer) clearTimeout(session.queueTimer);
+    session.queueTimer = window.setTimeout(() => {
+      session.queueTimer = undefined;
+      if (session.queue.length && session.running && !session.starting) drainQueue(session);
+    }, 12_000);
     return;
   }
   if (!hasKeyFor(state.provider)) return openSettings(true);
@@ -2589,6 +2597,7 @@ function drainQueue(session: Session) {
   renderQueue(session);
   if (session.starting || !session.queue.length) return;
   const next = session.queue.shift()!;
+  if (session.queueTimer) { clearTimeout(session.queueTimer); session.queueTimer = undefined; }
   renderQueue(session);
   if (session.running) {
     steerNow(session, next); // inject into the running turn
@@ -2663,6 +2672,7 @@ function setSessionRunning(session: Session, r: boolean) {
   session.running = r;
   if (r) { session.unread = false; session.cmdSig = undefined; session.cmdRepeat = 0; }
   if (r) startIdleWatch(session); else stopIdleWatch(session);
+  if (r) startContextPoll(session); else stopContextPoll(session);
   if (session.id === state.activeSessionId) {
     setSendButton(r);
     // A turn starting while the reader is already at the end means they are
@@ -3233,6 +3243,49 @@ async function openLedger(session: Session, firstPrompt: string): Promise<string
     ].join("\n");
   } catch {
     return ""; // the engagement proceeds without a ledger rather than failing
+  }
+}
+
+// Keep the context meter honest while a turn runs.
+//
+// The meter is driven by thread/tokenUsage/updated, which the OpenCodex proxy
+// never forwards: the percentage froze at whatever the transcript said when
+// the chat was opened and sat there for the rest of the session. codex does
+// record real usage in the rollout, so read it from there instead.
+//
+// Polled rather than pushed because there is nothing to subscribe to, and
+// stopped the moment the turn ends — this exists to track a number that moves
+// during a turn.
+function startContextPoll(session: Session) {
+  if (session.ctxPoll) return;
+  const tick = async () => {
+    if (!session.running || !session.threadId) { stopContextPoll(session); return; }
+    try {
+      const n = await invoke<number | null>("context_tokens", { threadId: session.threadId });
+      if (n && n > 0 && n !== session.ctxUsed) {
+        session.ctxUsed = n;
+        persistOpenChats();
+        if (session.id === state.activeSessionId) renderContextMeter(session);
+      }
+    } catch { /* the meter is advisory; a failed read changes nothing */ }
+  };
+  session.ctxPoll = window.setInterval(tick, 8_000);
+  void tick();
+}
+
+function stopContextPoll(session: Session) {
+  if (session.ctxPoll) { clearInterval(session.ctxPoll); session.ctxPoll = undefined; }
+  // One last read: the final usage record lands as the turn finishes.
+  if (session.threadId) {
+    void invoke<number | null>("context_tokens", { threadId: session.threadId })
+      .then((n) => {
+        if (n && n > 0) {
+          session.ctxUsed = n;
+          persistOpenChats();
+          if (session.id === state.activeSessionId) renderContextMeter(session);
+        }
+      })
+      .catch(() => {});
   }
 }
 

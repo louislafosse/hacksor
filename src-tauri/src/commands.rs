@@ -1602,6 +1602,46 @@ pub struct Transcript {
 /// Walks the fields that actually carry conversation — message text, reasoning,
 /// a command and its output — rather than the whole record, so ids, timestamps
 /// and other metadata are not counted as tokens.
+/// The live context size for a thread, read from its rollout.
+///
+/// On the OpenCodex path no `thread/tokenUsage/updated` notification ever
+/// arrives, so the meter froze at whatever the transcript said when the chat
+/// was opened and stayed there for the rest of the session — which reads as a
+/// broken meter, and hides an approaching compaction.
+///
+/// Only the TAIL is read. A long engagement's rollout reaches tens of
+/// megabytes and this is polled while a turn runs; the last usage record is
+/// near the end by construction.
+#[tauri::command]
+pub async fn context_tokens(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<Option<u64>, String> {
+    let home = state.codex_home.clone();
+    tokio::task::spawn_blocking(move || {
+        let Some(path) = find_rollout(&home, &thread_id) else { return Ok(None) };
+        let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+        let len = f.metadata().map_err(|e| e.to_string())?.len();
+        const TAIL: u64 = 2 * 1024 * 1024;
+        if len > TAIL {
+            use std::io::Seek;
+            f.seek(std::io::SeekFrom::Start(len - TAIL)).map_err(|e| e.to_string())?;
+        }
+        let mut buf = String::new();
+        {
+            use std::io::Read;
+            // A tail read can start mid-character; the rollout is JSON lines,
+            // so a lossy first line is dropped by the parser anyway.
+            let mut raw = Vec::new();
+            f.read_to_end(&mut raw).map_err(|e| e.to_string())?;
+            buf.push_str(&String::from_utf8_lossy(&raw));
+        }
+        Ok(last_context_tokens(&buf))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Context occupancy at the last turn, from the rollout.
 ///
 /// codex writes a `token_usage_record` per response but never sends the
