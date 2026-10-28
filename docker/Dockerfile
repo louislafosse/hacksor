@@ -180,9 +180,15 @@ RUN npm config set fetch-retries 6 \
 # failed, and the agent fell back to Playwright. Nothing in the build logged an
 # error, because npm treated the skipped scripts as a warning.
 #
-# Approve the two native packages, rebuild them, and FAIL the build if the
-# addon is still missing, so this cannot silently regress again.
-RUN cd /usr/local/lib/node_modules/camofox-browser  && npm install-scripts approve better-sqlite3 argon2 --no-allow-scripts-pin  && npm rebuild better-sqlite3 argon2  && test -f node_modules/better-sqlite3/build/Release/better_sqlite3.node  && node -e "require('/usr/local/lib/node_modules/camofox-browser/node_modules/better-sqlite3')"  && echo "camofox-browser native deps built"
+# Approve the two native packages, rebuild them, and FAIL the build if either
+# cannot be LOADED, so this cannot silently regress again.
+#
+# The check is a require(), not a file test. It used to assert
+# build/Release/better_sqlite3.node existed, which broke when better-sqlite3
+# 13 switched to shipping prebuilt binaries under prebuilds/<platform>.node:
+# the package was installed and working, and the build failed anyway. What
+# matters is that the module loads — that is the exact failure this guards.
+RUN cd /usr/local/lib/node_modules/camofox-browser  && npm install-scripts approve better-sqlite3 argon2 --no-allow-scripts-pin  && npm rebuild better-sqlite3 argon2  && node -e "require('/usr/local/lib/node_modules/camofox-browser/node_modules/better-sqlite3')"  && node -e "require('/usr/local/lib/node_modules/camofox-browser/node_modules/argon2')"  && echo "camofox-browser native deps built"
 
 # Raise OpenCodex's provider model-discovery timeout. ocx hard-codes an 8s abort
 # on the upstream /models fetch, which these catalogs routinely exceed (measured
