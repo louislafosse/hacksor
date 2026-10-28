@@ -1,3 +1,18 @@
+# [1.14.0](https://github.com/louislafosse/hacksor/compare/v1.13.4...v1.14.0) (2026-10-28)
+
+
+### Bug Fixes
+
+* **branch:** a branch inherits the engagement it was cut from ([a9953f2](https://github.com/louislafosse/hacksor/commit/a9953f20b419260ddb71163a5e9fb78bdfe99bb7))
+* **context:** carry the real window into the config codex actually reads ([06d3f11](https://github.com/louislafosse/hacksor/commit/06d3f11a720aa53095aefa2ec38912eeec639670))
+* **context:** point codex at the model catalog so it knows the real window ([d1afd51](https://github.com/louislafosse/hacksor/commit/d1afd516205b1dae2be813c1a6e73a55966cd2fa))
+* **context:** stop codex compacting at a quarter of the window ([8893af3](https://github.com/louislafosse/hacksor/commit/8893af368c6e503d5701279681284ceb9438cc72))
+
+
+### Features
+
+* **skills:** refresh the Strix skills, 62 to 75 ([9873684](https://github.com/louislafosse/hacksor/commit/9873684f3d82cdfa019513c08650ea5e907265f5))
+
 ## [1.13.4](https://github.com/louislafosse/hacksor/compare/v1.13.3...v1.13.4) (2026-10-28)
 
 
