@@ -1,3 +1,14 @@
+# [1.12.0](https://github.com/louislafosse/hacksor/compare/v1.11.0...v1.12.0) (2026-10-28)
+
+
+### Features
+
+* **agent:** engagement directories, throwaway inboxes, prompt corrections ([31ffedc](https://github.com/louislafosse/hacksor/commit/31ffedcc691d010a6679a2c8bfd53977c1dfd3b9))
+* **chat:** show context use, group turns, and make long output readable ([c70fe8b](https://github.com/louislafosse/hacksor/commit/c70fe8bf25a8f824c30f7cdab07a8017611f2552))
+* **security:** warn before an agent turn leaves over your own connection ([986573f](https://github.com/louislafosse/hacksor/commit/986573ff776cea6cb95878ec9dc72fe1b4908ae4))
+* **ui:** move the frontend onto React, Tailwind and shadcn ([9de4377](https://github.com/louislafosse/hacksor/commit/9de4377151a7da36404d88ac0ad9d4cf681fe0e7))
+* **updater:** install updates in place instead of opening the release page ([be7fc20](https://github.com/louislafosse/hacksor/commit/be7fc20e9ca9ea077ca8c50af2e253861c5c7161))
+
 # [1.11.0](https://github.com/louislafosse/hacksor/compare/v1.10.0...v1.11.0) (2026-10-19)
 
 
