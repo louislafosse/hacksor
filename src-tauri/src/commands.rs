@@ -1369,6 +1369,19 @@ pub async fn start_chat(
         custom.as_deref(),
     );
 
+    // What the live catalog says this model's window is. codex otherwise
+    // assumes its own default for anything it does not recognise, which is how
+    // a 1M model was compacting at 258_400.
+    let context_window = read_live_catalog(&state, provider, docker_runtime(&state).await)
+        .await
+        .ok()
+        .and_then(|models| {
+            models
+                .into_iter()
+                .find(|m| m.id == args.model)
+                .and_then(|m| m.context_length)
+        });
+
     harness
         .start_thread(StartParams {
             provider,
@@ -1376,6 +1389,7 @@ pub async fn start_chat(
             cwd,
             permission,
             developer_instructions,
+            context_window,
         })
         .await
         .map_err(|e| e.to_string())
