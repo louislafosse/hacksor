@@ -102,8 +102,13 @@ RUN pipx install arjun 2>/dev/null || pip install --break-system-packages arjun 
 # 84feddd6f06e125cfc66b95ff7445a34, safari ecdf4f49dd59effc439639da29186671
 # and firefox 6f7889b9fb1a62a9577e685c1fcfa919. A library, not a CLI, so pipx
 # cannot install it: it has to go into the system interpreter the agent uses.
-RUN pip install --break-system-packages curl_cffi \
- && python3 -c "import curl_cffi; print('curl_cffi', curl_cffi.__version__)"
+# --ignore-installed certifi: curl_cffi now wants certifi >= 2026.10.19, and
+# the image's copy comes from apt. A dpkg-installed package carries no RECORD
+# file, so pip refuses to replace it ("Cannot uninstall certifi ... no RECORD
+# file was found") and the build dies. Installing a fresh copy alongside it
+# lands in /usr/local, which precedes the Debian path on sys.path.
+RUN pip install --break-system-packages --ignore-installed certifi curl_cffi \
+ && python3 -c "import curl_cffi, certifi; print('curl_cffi', curl_cffi.__version__, 'certifi', certifi.__version__)"
 RUN pipx install wafw00f 2>/dev/null || pip install --break-system-packages wafw00f || true
 RUN pipx install s3scanner 2>/dev/null || pip install --break-system-packages s3scanner || true
 ENV PATH="/root/.local/bin:${PATH}"
