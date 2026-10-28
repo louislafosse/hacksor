@@ -21,14 +21,28 @@ fi
 
 A=$(shasum -a 256 "$BUNDLE" | cut -c1-16)
 B=$(shasum -a 256 "$INSTALLED" | cut -c1-16)
-[ "$A" = "$B" ] || { echo "MISMATCH: built=$A installed=$B"; exit 1; }
 
-echo "OK: installed binary matches the build ($A)"
+# Signing REWRITES the installed binary, so after it the two hashes no longer
+# match even though the install is correct. A marker recording which build was
+# installed keeps the check honest; it is written before signing, because the
+# signature seals Resources and a later write would break it.
+MARK="/Applications/Hacksor.app/Contents/Resources/.hacksor-build"
+SIGN=""
+if [ "$A" = "$B" ]; then
+  echo "OK: installed binary matches the build ($A)"
+  SIGN=yes
+elif [ -f "$MARK" ] && [ "$(cat "$MARK")" = "$A" ]; then
+  echo "OK: installed build is $A (binary re-signed locally, so bytes differ)"
+else
+  echo "MISMATCH: built=$A installed=$B"
+  exit 1
+fi
 
 # Re-sign with the stable local identity when one exists, so macOS keeps the
 # file-access grants it was given instead of re-asking after every rebuild.
 # Silent no-op until ./scripts-sign-local.sh has been run once.
-if security find-identity -v -p codesigning 2>/dev/null | grep -qF "Hacksor Local Signing"; then
+if [ -n "$SIGN" ] && security find-certificate -c "Hacksor Local Signing" >/dev/null 2>&1; then
+  printf '%s' "$A" > "$MARK"
   ./scripts-sign-local.sh /Applications/Hacksor.app >/dev/null 2>&1 \
     && echo "OK: re-signed with the local identity" \
     || echo "WARN: re-signing failed; macOS will ask for file access again"

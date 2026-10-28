@@ -30,7 +30,10 @@ if [ ! -d "$APP" ]; then
 fi
 
 # 1. The certificate, created once and reused for every later build.
-if ! security find-identity -v -p codesigning 2>/dev/null | grep -qF "$IDENTITY"; then
+# NOT `find-identity -v`: a self-signed certificate is never policy-trusted,
+# so -v hides it (CSSMERR_TP_NOT_TRUSTED) even though codesign signs with it
+# without complaint. Checking for the certificate itself is what is true.
+if ! security find-certificate -c "$IDENTITY" >/dev/null 2>&1; then
   echo "Creating the signing certificate (one time)…"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
