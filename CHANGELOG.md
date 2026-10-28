@@ -1,3 +1,12 @@
+## [1.13.2](https://github.com/louislafosse/hacksor/compare/v1.13.1...v1.13.2) (2026-10-28)
+
+
+### Bug Fixes
+
+* **build:** detect the local cert correctly, and verify past re-signing ([27b2176](https://github.com/louislafosse/hacksor/commit/27b2176f467954e9615920e79e37271e12e2b1cf))
+* **build:** import the local signing cert with a real password ([30bea79](https://github.com/louislafosse/hacksor/commit/30bea79fc53731af84bb7acdd4c1892844810adc)), closes [PKCS#12](https://github.com/PKCS/issues/12)
+* **engagement:** close the panel with Escape ([cfc27d5](https://github.com/louislafosse/hacksor/commit/cfc27d53691a1b0029797d2ab2ee226652ca2263))
+
 ## [1.13.1](https://github.com/louislafosse/hacksor/compare/v1.13.0...v1.13.1) (2026-10-28)
 
 
