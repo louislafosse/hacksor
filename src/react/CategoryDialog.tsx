@@ -4,9 +4,10 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
+import { EmojiPicker, QUICK } from "@/react/EmojiPicker";
 
 export const CAT_COLORS = ["#ff4500", "#f59e0b", "#51da4c", "#38bdf8", "#a78bfa", "#f472b6", "#94a3b8"];
-export const CAT_EMOJI = ["🎯", "🔍", "🧪", "🏢", "🌐", "🔐", "📦", "🚩", "⚠️", "📝"];
+export const CAT_EMOJI = QUICK;
 
 export function CategoryDialog({
   onCreate,
@@ -51,22 +52,11 @@ export function CategoryDialog({
           </div>
 
           <div className="grid gap-2">
-            <Label>Icon</Label>
-            <div className="flex flex-wrap gap-1.5">
-              {CAT_EMOJI.map((e) => (
-                <button
-                  key={e}
-                  type="button"
-                  onClick={() => setEmoji(e)}
-                  className={cn(
-                    "grid size-9 place-content-center rounded-md border text-[17px] transition-colors",
-                    emoji === e ? "border-foreground" : "border-border hover:border-ring",
-                  )}
-                >
-                  {e}
-                </button>
-              ))}
+            <div className="flex items-center justify-between">
+              <Label>Icon</Label>
+              <span className="grid size-7 place-content-center rounded-md border text-[17px] leading-none">{emoji}</span>
             </div>
+            <EmojiPicker value={emoji} onPick={setEmoji} />
           </div>
 
           <div className="grid gap-2">
@@ -91,7 +81,7 @@ export function CategoryDialog({
           </div>
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="mt-1 border-t pt-4">
           <Button variant="outline" onClick={onClose}>Cancel</Button>
           <Button onClick={create} disabled={!name.trim()}>Create</Button>
         </DialogFooter>
