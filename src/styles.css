@@ -1,3 +1,48 @@
+@import "tailwindcss";
+
+/* Tailwind v4 reads its palette from here, so React components styled with
+   Tailwind and the existing vanilla UI resolve to the SAME tokens — the ones
+   already ported from HackerAI's globals.css below. One source of truth, so
+   the two halves cannot drift apart while surfaces migrate across. */
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
+/* Tailwind v4 defaults an unqualified `border` to currentColor, so shadcn
+   components came out with bright white borders against light text. This is
+   the base layer from HackerAI's globals.css that fixes it. `*` has zero
+   specificity, so every explicit border colour in the vanilla CSS below still
+   wins — only the unqualified ones change. */
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+}
+
 @import "@fontsource-variable/geist/index.css";
 @import "@fontsource-variable/geist-mono/index.css";
 
@@ -142,15 +187,127 @@ body {
 /* messages */
 .scroll { flex: 1; overflow-y: auto; }
 /* A fresh chat (only the centered greeting, no messages) has nothing to scroll,
-   so hide the scrollbar the tall empty-state would otherwise trigger. Scope to
-   the VISIBLE session: every session's .turns stays in the DOM (inactive ones
-   [hidden]), and background "New chat" sessions keep an .empty — matching those
-   would wrongly kill scrolling in the chat you're actually viewing. */
-.scroll:has(.turns:not([hidden]) .empty) { overflow-y: hidden; }
+   so hide the scrollbar the tall empty-state would otherwise trigger.
+   This used to be `.scroll:has(.turns:not([hidden]) .empty)`, which matched an
+   .empty ANYWHERE in the visible session: one greeting node left behind beside
+   real content turned scrolling off for the whole conversation, and the only
+   way out was to click through chats until one happened to be clean. The lock
+   is now set from JS (syncScrollLock), only when the greeting is the session's
+   ONLY child, so a stray node can no longer cost you the scrollbar. */
+.scroll.no-scroll { overflow-y: hidden; }
 .col { width: 100%; max-width: 768px; min-width: 0; margin: 0 auto; padding: 8px 20px 0; }
 .turns { display: flex; flex-direction: column; gap: 20px; padding-bottom: 24px; }
 
-.msg.user { display: flex; flex-direction: column; align-items: flex-end; }
+/* Each prompt opens a new stretch of the transcript: a rule above it makes the
+   turn boundaries findable when scrolling back through a long engagement. The
+   first one has no rule, since there is nothing above it to separate from. */
+.msg.user { display: flex; flex-direction: column; align-items: flex-end; position: relative; margin-top: 26px; padding-top: 22px; }
+.msg.user::before {
+  content: ""; position: absolute; top: 0; left: 0; right: 0;
+  border-top: 1px solid var(--border); opacity: .55;
+}
+.turns > .msg.user:first-child { margin-top: 0; padding-top: 0; }
+.turns > .msg.user:first-child::before { content: none; }
+/* Search hits inside the transcript. */
+.search-hit { background: #d8a65744; border-radius: 3px; }
+.search-hit.current { background: #d8a657; color: #141414; }
+/* A finding, surfaced where it is recorded. Severity is the one thing that
+   should read at a glance while scrolling back through an engagement. */
+.finding-card {
+  display: flex; align-items: center; gap: 12px;
+  border: 1px solid var(--border); border-radius: 12px;
+  padding: 11px 13px; background: var(--card);
+}
+.finding-card .fc-main { flex: 1; min-width: 0; }
+.finding-card .fc-title { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.finding-card .fc-sub {
+  font-size: 11.5px; color: var(--muted-foreground); margin-top: 3px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--font-mono);
+}
+/* A tinted pill rather than a solid block: at a glance it is the severity, and
+   it stays legible in both themes without fighting the card behind it. */
+.finding-card .fc-sev {
+  font-size: 10.5px; font-weight: 700; letter-spacing: .04em; white-space: nowrap;
+  border-radius: 7px; padding: 4px 9px;
+  color: var(--sev); background: color-mix(in srgb, var(--sev) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--sev) 38%, transparent);
+}
+.finding-card.sev-critical { --sev: #f05d6c; }
+.finding-card.sev-high     { --sev: #ef8a4b; }
+.finding-card.sev-medium   { --sev: #d8a657; }
+.finding-card.sev-low      { --sev: #51da4c; }
+.finding-card.sev-info     { --sev: #8ab4f8; }
+
+/* Sidebar categories: drag a chat onto a header to file it. */
+.section-label-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.cat-add {
+  background: none; border: 1px solid var(--border); color: var(--muted-foreground);
+  border-radius: 7px; font-size: 11px; padding: 2px 7px; cursor: pointer;
+}
+.cat-add:hover { color: var(--foreground); background: var(--accent); }
+.cat-head {
+  display: flex; align-items: center; gap: 7px;
+  margin: 12px 0 2px; padding: 6px 8px 6px 9px;
+  border-radius: 9px; font-size: 11px; font-weight: 600; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--muted-foreground);
+  border: 1px solid transparent;
+  position: relative;
+}
+/* The category's colour is a dot, not a border: it reads at a glance and keeps
+   every header on the same left edge as the chats beneath it. */
+.cat-head::before {
+  content: ""; width: 6px; height: 6px; border-radius: 999px; flex: none;
+  background: var(--cat-color, var(--muted-foreground));
+}
+.cat-head.cat-none::before { opacity: .45; }
+/* An icon or a colour, never both: the dot is the fallback when no emoji was
+   chosen, so a category reads as one mark either way. */
+.cat-head:has(.cat-emoji-dot)::before { display: none; }
+.cat-head .cat-emoji-dot { font-size: 12px; line-height: 1; margin: 0; }
+.cat-head .cat-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cat-head .cat-count {
+  font-variant-numeric: tabular-nums; font-size: 10.5px;
+  padding: 1px 6px; border-radius: 999px; background: var(--accent); color: var(--muted-foreground);
+}
+.cat-head .cat-x {
+  background: none; border: none; color: var(--muted-foreground);
+  cursor: pointer; opacity: 0; font-size: 11px; padding: 2px 3px; border-radius: 5px;
+}
+.cat-head:hover .cat-x { opacity: .75; }
+.cat-head .cat-x:hover { opacity: 1; color: var(--destructive); background: var(--accent); }
+
+/* While a chat is in the air, every target shows itself; the one under the
+   pointer is filled in. Without this the drop point is guesswork. */
+body.dragging-chat .cat-head { border-color: color-mix(in srgb, var(--border) 85%, transparent); border-style: dashed; }
+body.dragging-chat .cat-head.drop {
+  border-style: solid; border-color: var(--cat-color, var(--foreground));
+  background: var(--accent); color: var(--foreground);
+}
+body.dragging-chat { cursor: grabbing; }
+body.dragging-chat .item2 { cursor: grabbing; }
+.item2.dragging { opacity: .4; }
+.drag-ghost {
+  position: fixed; top: 0; left: 0; z-index: 90; pointer-events: none;
+  max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 6px 11px; border-radius: 9px; font-size: 12.5px;
+  background: var(--popover); color: var(--popover-foreground);
+  border: 1px solid var(--border); box-shadow: 0 10px 26px rgba(0, 0, 0, 0.45);
+}
+
+.chat-find {
+  /* Below the titlebar: at the top it covered the window close button. */
+  position: absolute; top: 52px; right: 18px; z-index: 30; display: flex; align-items: center; gap: 6px;
+  background: var(--card, var(--background)); border: 1px solid var(--border); border-radius: 10px;
+  padding: 6px 8px; box-shadow: 0 6px 20px #0006;
+}
+.chat-find input {
+  background: var(--background); color: var(--foreground); border: 1px solid var(--border);
+  border-radius: 7px; padding: 5px 8px; font-size: 13px; width: 200px;
+}
+.chat-find .cf-count { color: var(--muted-foreground); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 52px; text-align: center; }
+.chat-find button { background: none; border: 1px solid var(--border); color: var(--foreground); border-radius: 7px; cursor: pointer; padding: 3px 8px; font-size: 12px; }
+.chat-find button:hover { background: var(--accent); }
 .msg.user .bubble {
   background: var(--muted); color: var(--foreground);
   border-radius: 22px; padding: 10px 16px; max-width: 75%;
@@ -249,6 +406,9 @@ button.ghost:hover { background: var(--accent); }
 }
 .send:hover { opacity: 0.88; }
 .send.stop { background: var(--destructive); color: #fff; }
+.tchip.ctx { font-variant-numeric: tabular-nums; min-width: 42px; text-align: center; }
+.tchip.ctx.warn { color: #d8a657; border-color: #d8a65755; }
+.tchip.ctx.hot { color: #e06c75; border-color: #e06c7555; }
 .hint { max-width: 768px; margin: 8px auto 0; color: var(--muted-foreground); font-size: 11px; text-align: center; }
 
 /* modal */
@@ -788,9 +948,47 @@ input::placeholder, textarea::placeholder { color: var(--muted-foreground); }
   background: var(--card); border-left: 1px solid var(--border); z-index: 40;
   display: flex; flex-direction: column; box-shadow: -8px 0 30px rgba(0,0,0,0.18);
 }
-.tooldrawer .td-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
-.tooldrawer .td-icon { font-family: var(--font-mono); color: var(--muted-foreground); }
-.tooldrawer .td-title { flex: 1; font-family: var(--font-mono); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Two rows, after HackerAI's tool panel: the panel says WHERE you are, the
+   line under it says WHAT the agent is doing. One row carrying both made the
+   tool name read as the panel's name. */
+.tooldrawer .td-head { display: flex; align-items: center; gap: 4px; padding: 9px 10px 9px 14px; border-bottom: 1px solid var(--border); }
+.tooldrawer .td-panel { font-size: 13px; font-weight: 600; }
+.tooldrawer .td-tool {
+  display: flex; align-items: center; gap: 9px;
+  padding: 9px 14px; border-bottom: 1px solid var(--border);
+  background: var(--background);
+}
+/* The tool's glyph sits in a tile rather than floating next to the text. */
+.tooldrawer .td-icon {
+  display: inline-grid; place-content: center; flex: none;
+  width: 24px; height: 24px; border-radius: 7px;
+  border: 1px solid var(--border); background: var(--card);
+  font-family: var(--font-mono); font-size: 12px; color: var(--muted-foreground);
+}
+.tooldrawer .td-title {
+  flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 12.5px;
+  color: var(--muted-foreground);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Unfolded: the whole command, wrapped, with the row growing to fit. A long
+   JSON argument is usually the thing you opened the drawer to read. */
+.tooldrawer .td-tool.expanded { align-items: flex-start; }
+.tooldrawer .td-tool.expanded .td-title {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  overflow: visible;
+  max-height: 40vh;
+  overflow-y: auto;
+  color: var(--foreground);
+  user-select: text;
+}
+.tooldrawer .td-icon { cursor: pointer; transition: transform 140ms cubic-bezier(0.16, 1, 0.3, 1); }
+.tooldrawer .td-icon:hover { border-color: var(--ring); color: var(--foreground); }
+.tooldrawer .td-tool.expanded .td-icon { transform: rotate(90deg); }
+.tooldrawer .icon-btn.on { background: var(--accent); color: var(--foreground); }
+/* Columnar tool output (nmap, httpx, ffuf) is unreadable wrapped. */
+.tooldrawer .td-body.nowrap { white-space: pre; }
 .tooldrawer .td-body { flex: 1; margin: 0; padding: 14px; overflow: auto; font-family: var(--font-mono); font-size: 12.5px; white-space: pre-wrap; word-break: break-word; }
 
 /* Proxy panel */
@@ -839,7 +1037,11 @@ input::placeholder, textarea::placeholder { color: var(--muted-foreground); }
 
 /* "Jump to latest" pill (shown while scrolled up during a live turn) */
 .jump-latest {
-  position: absolute; left: 50%; transform: translateX(-50%); bottom: 128px; z-index: 20;
+  /* Anchored to the composer, not to a fixed offset from the window: the
+     composer grows with a multi-line draft, so any constant was going to sit
+     on top of it sooner or later. */
+  position: absolute; left: 50%; transform: translateX(-50%);
+  bottom: calc(100% + 10px); z-index: 20;
   border: 1px solid var(--border); background: var(--card); color: var(--foreground);
   border-radius: 999px; padding: 6px 14px; font-size: 12.5px; cursor: pointer;
   box-shadow: 0 4px 16px rgba(0,0,0,0.2);
@@ -961,3 +1163,519 @@ input::placeholder, textarea::placeholder { color: var(--muted-foreground); }
   color: var(--muted-foreground); font-size: 12.5px; cursor: pointer;
 }
 .transcript-more:hover { background: var(--accent); color: var(--foreground); }
+
+/* ---- composer overflow menu (effort + access) ---- */
+.more-wrap { position: relative; display: inline-flex; }
+.tchip.more { font-size: 15px; line-height: 1; padding: 4px 9px; letter-spacing: 1px; }
+.tchip.more.open { background: var(--accent); color: var(--foreground); }
+.more-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  min-width: 196px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.42);
+}
+.more-menu .mm-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; padding: 3px 4px 3px 8px; border-radius: 8px;
+}
+.more-menu .mm-row:hover { background: var(--accent); }
+.more-menu .mm-label { font-size: 12px; color: var(--muted-foreground); }
+
+/* ---- category dialog ---- */
+.modal.narrow { width: 400px; position: relative; }
+.swatches { display: flex; flex-wrap: wrap; gap: 6px; }
+.swatches button {
+  background: var(--background); border: 1px solid var(--border);
+  border-radius: 9px; cursor: pointer; padding: 0; line-height: 1;
+}
+.swatches.emoji button { width: 34px; height: 34px; font-size: 17px; }
+.swatches.colors button { width: 28px; height: 28px; border-radius: 999px; }
+.swatches button:hover { border-color: var(--ring); }
+.swatches button.on { border-color: var(--foreground); box-shadow: 0 0 0 2px var(--background), 0 0 0 3px var(--foreground); }
+.cat-emoji-dot { margin-right: 6px; font-size: 12px; }
+
+/* ---- motion, ported from HackerAI's globals.css ----
+   A gradient sweep across the glyphs rather than a whole-element opacity
+   pulse: it reads as the model working, not as the UI flickering. */
+@keyframes text-shimmer {
+  from { background-position: 100% center; }
+  to   { background-position: 0% center; }
+}
+.thinking-live, .status.running {
+  animation: text-shimmer 2.4s linear infinite;
+  background: linear-gradient(
+    90deg,
+    var(--muted-foreground) 0%,
+    var(--muted-foreground) 40%,
+    var(--foreground) 50%,
+    var(--muted-foreground) 60%,
+    var(--muted-foreground) 100%
+  );
+  background-size: 200% auto;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+/* HackerAI's fold easing: fast out of the gate, settling at the end. */
+.card .body, .tooldrawer, .more-menu {
+  transition: opacity 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.tchip, .icon-btn, .send, button.primary, button.ghost, .swatches button {
+  transition: background-color 140ms ease, border-color 140ms ease,
+    color 140ms ease, opacity 140ms ease, transform 140ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.tchip:active, .icon-btn:active, .swatches button:active { transform: scale(0.96); }
+
+@media (prefers-reduced-motion: reduce) {
+  .thinking-live, .status.running {
+    animation: none;
+    color: var(--muted-foreground);
+    -webkit-text-fill-color: var(--muted-foreground);
+  }
+  .tchip, .icon-btn, .send, button.primary, button.ghost, .swatches button { transition: none; }
+  .tchip:active, .icon-btn:active, .swatches button:active { transform: none; }
+}
+
+/* ---- row action popover (archive / delete) ---- */
+.ctx-pop {
+  position: fixed; z-index: 70; min-width: 182px; padding: 5px;
+  display: flex; flex-direction: column; gap: 2px;
+  background: var(--popover); color: var(--popover-foreground);
+  border: 1px solid var(--border); border-radius: 11px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.42);
+}
+.ctx-pop .ctx-item {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  padding: 7px 9px; border: none; border-radius: 8px; cursor: pointer;
+  background: transparent; color: inherit; font: inherit; font-size: 13px; text-align: left;
+}
+.ctx-pop .ctx-item:hover { background: var(--accent); }
+.ctx-pop .ctx-item.danger { color: var(--destructive); }
+.ctx-pop .ctx-item svg { width: 15px; height: 15px; flex: none; }
+
+/* ---- purge dialog ---- */
+.purge-row { display: flex; gap: 10px; align-items: flex-start; padding: 9px 2px; cursor: pointer; }
+.purge-row input { margin-top: 2px; accent-color: var(--destructive); }
+.purge-row span { display: flex; flex-direction: column; gap: 2px; }
+.purge-row b { font-size: 13.5px; font-weight: 550; }
+.purge-row em {
+  font-style: normal; font-size: 12px; color: var(--muted-foreground);
+  overflow-wrap: anywhere;
+}
+.purge-row input:disabled + span { opacity: 0.45; }
+.purge-msg {
+  margin: 6px 0 2px; padding: 8px 10px; border-radius: 9px; font-size: 12.5px;
+  background: color-mix(in srgb, var(--destructive) 12%, transparent);
+  color: var(--destructive);
+}
+button.primary.danger { background: var(--destructive); color: #fff; }
+
+/* Chrome is not content: selecting a chat title while dragging it into a
+   category produced a blue smear across the sidebar. Text selection belongs to
+   the transcript, where it is used to copy findings out. */
+.sidebar, .topbar, .toolbar, .ctx-pop, .more-menu, .cat-head, .queue {
+  -webkit-user-select: none;
+  user-select: none;
+}
+.turns, .msg, .card, .td-body, .modal {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* ---- chats filed under a category ----
+   A rail in the category's colour, so a filed chat is obviously attached to
+   the header above it rather than just sitting after it. */
+.item2.in-cat { margin-left: 11px; padding-left: 14px; position: relative; }
+.item2.in-cat::before {
+  content: ""; position: absolute; left: 0; top: -2px; bottom: -2px;
+  width: 2px; border-radius: 2px;
+  background: color-mix(in srgb, var(--cat-color, var(--border)) 55%, transparent);
+}
+.item2.in-cat.cat-last::before { bottom: 50%; border-radius: 2px 2px 0 0; }
+/* The elbow that ties the last row to the rail. */
+.item2.in-cat.cat-last::after {
+  content: ""; position: absolute; left: 0; top: 50%;
+  width: 7px; height: 2px; border-radius: 2px;
+  background: color-mix(in srgb, var(--cat-color, var(--border)) 55%, transparent);
+}
+body.dragging-chat .item2.in-cat::before { opacity: .5; }
+
+/* ---- category fold + menu icons ---- */
+.cat-head { cursor: pointer; }
+.cat-head .cat-chev {
+  display: inline-flex; width: 11px; height: 11px; flex: none;
+  color: var(--muted-foreground); transition: transform 140ms cubic-bezier(0.16, 1, 0.3, 1);
+  transform: rotate(90deg);
+}
+.cat-head.closed .cat-chev { transform: rotate(0deg); }
+.cat-head .cat-chev svg { width: 100%; height: 100%; }
+.more-menu .mm-label { display: inline-flex; align-items: center; gap: 6px; }
+.more-menu .mm-label svg { width: 14px; height: 14px; flex: none; opacity: .8; }
+
+/* ---- security pane ---- */
+.check-row { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; }
+.check-row input { margin-top: 2px; }
+.check-row span { display: flex; flex-direction: column; gap: 2px; }
+.check-row b { font-size: 13.5px; font-weight: 550; }
+.check-row em { font-style: normal; font-size: 12px; color: var(--muted-foreground); line-height: 1.45; }
+.warn-note {
+  margin: 10px 0 0; padding: 9px 11px; border-radius: 9px; font-size: 12.5px; line-height: 1.5;
+  background: color-mix(in srgb, var(--destructive) 11%, transparent);
+  color: var(--destructive);
+}
+
+/* The context chip before any turn has reported usage: present, but visibly
+   without a number yet rather than absent. */
+.tchip.ctx { font-variant-numeric: tabular-nums; }
+.tchip.ctx.idle { opacity: .5; }
+
+/* Checkboxes are DRAWN, not native.
+   A global `button, input, textarea, select { appearance: none }` strips native
+   control chrome across the app, which leaves a checkbox as a zero-size
+   element — it was rendering as a 2px dot. `accent-color` and sizing cannot
+   bring it back, so these are drawn.
+
+   A standalone setting is a SWITCH, built from the same parts as .pill-toggle
+   (999px track, --accent ground, --background knob with the same soft shadow)
+   so it reads as the control the rest of Hacksor uses. A list you pick several
+   items from keeps a square box — see .purge-row below. */
+input[type="checkbox"] {
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+  padding: 0;
+  flex: none;
+  cursor: pointer;
+  vertical-align: middle;
+}
+input[type="checkbox"]:disabled { opacity: .4; cursor: default; }
+
+.check-row input[type="checkbox"] {
+  position: relative;
+  width: 34px;
+  height: 20px;
+  min-width: 34px;
+  border-radius: 999px;
+  background: var(--accent);
+  border: 1px solid var(--border);
+  transition: background-color 160ms cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.check-row input[type="checkbox"]::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: var(--background);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+  transform: translateY(-50%);
+  transition: transform 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.check-row input[type="checkbox"]:hover { border-color: var(--ring); }
+.check-row input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--ring); }
+.check-row input[type="checkbox"]:checked {
+  background: var(--foreground);
+  border-color: var(--foreground);
+}
+.check-row input[type="checkbox"]:checked::after { transform: translateY(-50%) translateX(14px); }
+
+/* Picking several things from a list stays a box with a tick: a row of
+   switches reads as several unrelated settings. */
+.purge-row input[type="checkbox"] {
+  display: inline-grid;
+  place-content: center;
+  width: 17px;
+  height: 17px;
+  min-width: 17px;
+  border: 1.5px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+}
+.purge-row input[type="checkbox"]:hover { border-color: var(--ring); }
+.purge-row input[type="checkbox"]:checked {
+  background: var(--destructive);
+  border-color: var(--destructive);
+}
+.purge-row input[type="checkbox"]:checked::after {
+  content: "";
+  width: 4.5px;
+  height: 9px;
+  margin-top: -2px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+/* `.field label { display: block }` outranks a bare `.check-row` on
+   specificity, which stacked the switch above its own label. */
+.check-row, .field label.check-row {
+  display: flex;
+  /* Top-aligned, not centred: beside a three-line description a centred
+     switch floats in the middle of the paragraph and reads as unrelated. */
+  align-items: flex-start;
+  gap: 11px;
+  padding: 3px 0;
+  margin-bottom: 0;
+  cursor: pointer;
+  color: var(--foreground);
+  font-size: inherit;
+}
+/* Line the switch up with the first line of its label rather than the box. */
+.check-row > input[type="checkbox"] { margin-top: 1px; }
+/* A toggle that follows a button needs room to read as its own control. */
+.field .row + .check-row { margin-top: 16px; }
+.check-row > span { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.check-row b { font-size: 13.5px; font-weight: 550; color: var(--foreground); }
+.check-row em {
+  font-style: normal; font-size: 12px; line-height: 1.45;
+  color: var(--muted-foreground);
+}
+
+/* ---- context chip menu ---- */
+.tchip.ctx { cursor: pointer; }
+.ctx-menu { min-width: 250px; padding: 2px; }
+.ctx-menu .cm-row {
+  display: flex; justify-content: space-between; gap: 14px;
+  padding: 6px 9px; font-size: 12.5px;
+}
+.ctx-menu .cm-row span { color: var(--muted-foreground); }
+.ctx-menu .cm-row b { font-weight: 550; font-variant-numeric: tabular-nums; }
+.ctx-menu .cm-note {
+  padding: 8px 9px 6px; margin-top: 2px; border-top: 1px solid var(--border);
+  font-size: 11.5px; line-height: 1.5; color: var(--muted-foreground);
+}
+
+/* A dialog that belongs to the conversation covers the conversation column
+   only; .main is the positioned ancestor. Centring it across the sidebar too
+   detaches it from the message it is interrupting. */
+.modal-bg.local { position: absolute; }
+
+
+/* ---- VPN confirmation ----
+   Anchored over the composer rather than centred as a modal: it confirms the
+   keystroke that was just pressed, so it belongs where that happened. */
+.vpn-confirm {
+  position: absolute;
+  right: 14px;
+  bottom: calc(100% - 6px);
+  z-index: 70;
+  width: 300px;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.vpn-confirm .vc-head { font-size: 13px; font-weight: 600; color: var(--destructive); }
+.vpn-confirm .vc-body {
+  margin-top: 3px; font-size: 12px; line-height: 1.45; color: var(--muted-foreground);
+  overflow-wrap: anywhere;
+}
+.vpn-confirm .vc-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 10px; }
+.vpn-confirm button { font-size: 12.5px; padding: 5px 12px; }
+.composer-wrap { position: relative; }
+
+/* The greeting is chrome, not transcript: there is nothing in it worth
+   copying, and selecting it while clicking a suggestion looked like a bug.
+   Messages inside .turns stay selectable. */
+.empty, .empty * { -webkit-user-select: none; user-select: none; }
+
+/* The row is the control: show it as one. */
+.more-menu .mm-row { cursor: pointer; }
+
+/* The jump button distinguishes "go to the end" from "re-attach to a live
+   answer" — the second is the one worth noticing mid-stream. */
+.jump-latest.live {
+  border-color: color-mix(in srgb, var(--foreground) 45%, transparent);
+  color: var(--foreground);
+}
+.jump-latest.live::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: 999px;
+  background: #51da4c;
+  vertical-align: middle;
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+@keyframes live-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) {
+  .jump-latest.live::before { animation: none; }
+}
+
+/* A chat inside a category carries the colour rail at its left edge, and the
+   status dot is absolutely positioned from the same edge — so a running
+   spinner sat directly on top of the rail. Push it clear of it. */
+.item2.in-cat .i2-status { left: 12px; }
+.item2.in-cat .i2-status.running { left: 11px; }
+
+/* Drawer toolbar icons are SVG like the rest of the app: ⤶ and ⤓ are not in
+   every system font and would have rendered as empty boxes. */
+.tooldrawer .td-head .icon-btn svg { width: 15px; height: 15px; }
+
+/* Chips that open a picker get a chevron, as HackerAI's composer does with
+   "Auto ⌄" and "Full access ⌄". Without it they look like plain buttons and
+   there is nothing to say a menu is behind them — which is part of why the
+   effort control read as dead. The context chip is excluded: it opens a
+   read-only detail panel, not a choice. */
+.toolbar .tchip:not(.ctx):not(.more)::after,
+.more-menu .tchip::after {
+  content: "";
+  display: inline-block;
+  width: 0;
+  height: 0;
+  margin-left: 6px;
+  vertical-align: 1px;
+  border-left: 3.5px solid transparent;
+  border-right: 3.5px solid transparent;
+  border-top: 4px solid currentColor;
+  opacity: .55;
+}
+.toolbar .tchip:hover::after, .more-menu .tchip:hover::after { opacity: .9; }
+
+/* ---- tool drawer transport ----
+   HackerAI's panel has a transport for stepping back through what its agent
+   did. Hacksor stores tool runs, not frames, so this steps between those —
+   with the same "jump to live" promise for getting back to the newest. */
+.tooldrawer .td-foot {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 10px 8px 12px; border-top: 1px solid var(--border);
+  background: var(--card);
+}
+.tooldrawer .td-foot .icon-btn svg { width: 14px; height: 14px; }
+.tooldrawer .td-foot .icon-btn:disabled { opacity: .3; cursor: default; }
+.tooldrawer .td-pos {
+  margin-left: 4px; font-size: 11.5px; color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+.tooldrawer .td-live {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 11px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--muted-foreground); font-size: 12px;
+}
+.tooldrawer .td-live:hover { background: var(--accent); color: var(--foreground); }
+.tooldrawer .td-live::before {
+  content: ""; width: 6px; height: 6px; border-radius: 999px;
+  background: var(--muted-foreground);
+}
+/* Green and pulsing only while a turn is actually running. */
+.tooldrawer .td-live.running::before { background: #51da4c; animation: live-pulse 1.6s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .tooldrawer .td-live.running::before { animation: none; } }
+
+/* ---- markdown polish ----
+   The language sits beside the copy button and, unlike it, is always visible:
+   knowing a block is `bash` rather than `python` changes what you do with it,
+   so it should not require a hover to discover. */
+.code-lang {
+  position: absolute; top: 7px; right: 62px; z-index: 2;
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .04em;
+  color: var(--muted-foreground); opacity: .7; pointer-events: none;
+  text-transform: lowercase;
+}
+.bubble pre:hover .code-lang { opacity: 1; }
+/* Room for both, so a long first line never runs under them. */
+.bubble pre { padding-top: 26px; }
+
+/* Tighter, more deliberate rhythm: headings get air above and little below,
+   so a section reads as attached to the text under it. */
+.bubble :is(h1, h2, h3, h4) { margin: 1.1em 0 0.4em; line-height: 1.3; letter-spacing: -0.01em; }
+.bubble > :first-child { margin-top: 0; }
+.bubble > :last-child { margin-bottom: 0; }
+.bubble p { margin: 0.6em 0; }
+.bubble li { margin: 0.25em 0; }
+.bubble li > p { margin: 0.2em 0; }
+.bubble li::marker { font-variant-numeric: tabular-nums; }
+
+/* Inline code reads as a token, not as highlighted prose. */
+.bubble :not(pre) > code {
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  font-size: 0.88em;
+  padding: 1px 5px;
+}
+
+/* A quote is an aside: mark it with a rule, not a filled block. */
+.bubble blockquote {
+  border-left: 2px solid var(--border);
+  padding-left: 0.9em;
+  color: var(--muted-foreground);
+}
+
+/* Tables scroll instead of forcing the whole answer wide. */
+.bubble table { display: block; overflow-x: auto; max-width: 100%; border-collapse: collapse; }
+.bubble th { font-weight: 600; text-align: left; }
+.bubble :is(th, td) { padding: 6px 10px; border: 1px solid var(--border); white-space: nowrap; }
+.bubble tr:nth-child(2n) td { background: color-mix(in srgb, var(--muted) 45%, transparent); }
+
+/* ======================================================================
+   Modernisation pass: spacing, grouping, lighter sidebar.
+   ====================================================================== */
+
+/* 1. BREATHING ROOM.
+   The transcript was tuned for density. A pentest answer is long-form prose
+   with code in it, and reading it for hours is the actual job — so the column
+   gets a measure closer to comfortable reading, and turns get real separation
+   instead of a 20px gap. */
+.col { max-width: 820px; padding: 16px 28px 0; }
+.turns { gap: 28px; padding-bottom: 40px; }
+.msg.user { margin-top: 34px; padding-top: 26px; }
+
+/* 2. TURN GROUPING.
+   A single reply arrives as several blocks — reasoning, a command, more text.
+   Each carried its own full margin, so one answer read as four unrelated
+   events. Consecutive assistant blocks now sit close together, and the space
+   belongs BETWEEN turns rather than inside them. */
+.turns > .msg.assistant + .msg.assistant,
+.turns > .msg.assistant + .card,
+.turns > .card + .msg.assistant,
+.turns > .card + .card {
+  margin-top: -16px; /* against the flex gap: tightens within a turn only */
+}
+
+/* 3. SIDEBAR: lighter rows, more air.
+   Rows were a dense stack of bordered boxes. Hover is enough to show what is
+   interactive; the resting state can be quiet. */
+.item2 { padding: 9px 11px; border-radius: 10px; gap: 8px; }
+.item2:hover { background: color-mix(in srgb, var(--accent) 70%, transparent); }
+.item2 .t { letter-spacing: -0.005em; }
+.item2 .d { opacity: .7; }
+.section-label { letter-spacing: .07em; opacity: .75; }
+
+/* Scrollbars stay visible, just quiet.
+   An earlier pass hid the thumb until the pane was hovered, which removed the
+   one cue telling you where you are in a long transcript — and a transcript
+   here runs to thousands of lines. Position is information; keep it. */
+.scroll::-webkit-scrollbar, .sidebar ::-webkit-scrollbar { width: 11px; }
+.scroll::-webkit-scrollbar-thumb, .sidebar ::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  background-clip: content-box;
+  border: 3px solid transparent;
+  border-radius: 999px;
+}
+.scroll::-webkit-scrollbar-thumb:hover, .sidebar ::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  background-clip: content-box;
+}
+.scroll::-webkit-scrollbar-track, .sidebar ::-webkit-scrollbar-track { background: transparent; }
+
+/* The composer is the one piece of chrome always on screen: give it a touch
+   more presence than the surrounding panels. */
+.composer { border-radius: 18px; }
+.composer .toolbar { gap: 7px; }

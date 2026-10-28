@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { check as checkUpdate } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { marked, Marked } from "marked";
 import { markedHighlight } from "marked-highlight";
 import hljs from "highlight.js";
@@ -64,6 +66,16 @@ function enhanceCodeBlocks(container: HTMLElement) {
     if (pre.querySelector(":scope > .code-copy")) return;   // already added
     if (pre.querySelector("code.language-mermaid")) return; // rendered as a diagram
     const code = pre.querySelector("code");
+    // Name the language next to the button. An answer here is mostly payloads
+    // and commands, and `bash` vs `python` vs `http` decides what you can do
+    // with the block — worth saying rather than leaving to inference.
+    const lang = (/language-([a-z0-9+#.-]+)/i.exec(code?.className ?? "")?.[1] ?? "").toLowerCase();
+    if (lang && lang !== "text") {
+      const tag = document.createElement("span");
+      tag.className = "code-lang";
+      tag.textContent = lang;
+      pre.appendChild(tag);
+    }
     const btn = document.createElement("button");
     btn.className = "code-copy";
     btn.type = "button";
@@ -98,6 +110,8 @@ type SettingsView = {
   working_dir: string;
   kali_mode: boolean;
   runtime: string;
+  warn_without_vpn?: boolean;
+  limit_runtime_mount?: boolean;
   services_mode?: string;
   has_cloudflare?: boolean;
   cloudflare_email?: string | null;
@@ -184,8 +198,31 @@ interface Session {
   userOrdinal?: number;
   // Set on a branch until its first message carries the extracted context.
   branchContext?: BranchContext;
+  // The engagement directory this session records into. Only sessions STARTED
+  // after the ledger shipped have one: a chat restored from before keeps
+  // working exactly as it did, with no directory and no injected instructions.
+  /// Ledger instructions waiting to ride out with the next message.
+  pendingLedgerPreamble?: string;
+  ledgerDir?: string;
+  /// The same directory as the HOST sees it, for display and deletion.
+  ledgerHostDir?: string;
+  ledgerFindings?: string;
+  ledgerNotes?: string;
   cmdSig?: string;
   cmdRepeat?: number;
+  // Live context usage for this thread, from codex's thread/tokenUsage/updated.
+  // The point is to see compaction COMING: codex compacts at a threshold of the
+  // model's window, and until now the first sign of it was the conversation
+  // silently losing its earlier turns.
+  ctxUsed?: number;
+  /// Characters seen in this chat, for the estimate used when codex reports
+  /// no usage (it stays silent through the OpenCodex proxy).
+  ctxChars?: number;
+  ctxWindow?: number;
+  // When the task was last re-sent after a compaction. Every compaction gets
+  // one (a long engagement compacts repeatedly and loses the thread each
+  // time); the timestamp only guards against re-anchoring in a tight loop.
+  lastAnchorMs?: number;
   // Per-turn: did the model emit ANY output (text, reasoning, or a command)?
   // Used to detect a fully-empty completion (e.g. Anthropic models decline the
   // security persona and return nothing) so the UI surfaces it, without a false
@@ -235,6 +272,8 @@ const state = {
   workingDir: "",
   kaliMode: false,
   runtime: "host",
+  warnWithoutVpn: true,
+  limitRuntimeMount: false,
   sessions: [] as Session[],
   activeSessionId: "",
   attachments: [] as { path: string; name: string; isImage: boolean }[],
@@ -243,6 +282,21 @@ const state = {
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i;
 
 // Matching line-icon set (archive box, restore, trash).
+const PREV_ICON =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M18 6 9 12l9 6V6Z"/><path d="M6 5v14"/></svg>';
+const NEXT_ICON =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="m6 6 9 6-9 6V6Z"/><path d="M18 5v14"/></svg>';
+const WRAP_ICON =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M4 6h16"/><path d="M4 12h12a3 3 0 0 1 0 6h-3"/><path d="m15 15-2 3 2 3"/><path d="M4 18h4"/></svg>';
+const SAVE_ICON =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M12 4v10"/><path d="m8 11 4 4 4-4"/><path d="M5 19h14"/></svg>';
+const CHEVRON_ICON =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="m9 6 6 6-6 6"/></svg>';
 const ARCHIVE_ICON =
   `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg>`;
 const RESTORE_ICON =
@@ -311,6 +365,88 @@ function uniqueTitle(base: string, selfTid?: string | null, selfId?: string): st
   return clean;
 }
 
+// Categories: user-made groups in the sidebar, with chats dragged into them.
+// Keyed by THREAD id, like titles and pins, so a group survives a restart.
+interface Cat {
+  name: string;
+  emoji: string;
+  color: string;
+}
+
+const CAT_COLORS = ["#ff4500", "#f59e0b", "#51da4c", "#38bdf8", "#a78bfa", "#f472b6", "#94a3b8"];
+
+function loadCats(): { list: Cat[]; of: Map<string, string> } {
+  try {
+    const raw = JSON.parse(localStorage.getItem("hacksor-categories") || "{}");
+    // Categories were plain names before they carried an emoji and a colour;
+    // read those forward rather than dropping someone's groups.
+    const list: Cat[] = (Array.isArray(raw.list) ? raw.list : []).map((c: unknown, i: number) =>
+      typeof c === "string"
+        ? { name: c, emoji: "", color: CAT_COLORS[i % CAT_COLORS.length] }
+        : {
+            name: String((c as Cat)?.name ?? ""),
+            emoji: String((c as Cat)?.emoji ?? ""),
+            color: String((c as Cat)?.color || CAT_COLORS[i % CAT_COLORS.length]),
+          },
+    ).filter((c: Cat) => c.name);
+    return { list, of: new Map(Object.entries(raw.of || {})) };
+  } catch { return { list: [], of: new Map() }; }
+}
+const cats = loadCats();
+// Which categories are folded shut. A long sidebar is mostly other people's
+// engagements; folding is how the current one stays in view.
+const catsClosed = loadSet("hacksor-cats-closed");
+function saveCats() {
+  try {
+    localStorage.setItem("hacksor-categories",
+      JSON.stringify({ list: cats.list, of: Object.fromEntries(cats.of) }));
+  } catch {}
+}
+function catByName(name: string | null | undefined): Cat | undefined {
+  return name ? cats.list.find((c) => c.name === name) : undefined;
+}
+function addCategory(name: string, emoji = "", color = CAT_COLORS[0]) {
+  const n = name.trim().slice(0, 40);
+  if (!n || cats.list.some((c) => c.name.toLowerCase() === n.toLowerCase())) return;
+  cats.list.push({ name: n, emoji, color });
+  saveCats();
+  renderSidebar();
+}
+function removeCategory(name: string) {
+  cats.list = cats.list.filter((c) => c.name !== name);
+  for (const [tid, c] of [...cats.of]) if (c === name) cats.of.delete(tid);
+  saveCats();
+  renderSidebar();
+}
+function assignCategory(tid: string | null | undefined, name: string | null) {
+  if (!tid) return;
+  if (name) cats.of.set(tid, name); else cats.of.delete(tid);
+  saveCats();
+  renderSidebar();
+}
+
+// A real dialog for making a category. window.prompt() is a no-op in Tauri's
+// webview, which is why the button appeared to do nothing at all.
+// The category dialog is the first surface on React + shadcn. The vanilla UI
+// still owns the shell and calls into it; surfaces move across one at a time
+// rather than in a single rewrite.
+function openCategoryDialog() {
+  void (async () => {
+    const [{ mountOverlay }, { createElement }, { CategoryDialog }] = await Promise.all([
+      import("./react/mount"),
+      import("react"),
+      import("./react/CategoryDialog"),
+    ]);
+    const close = mountOverlay((done) =>
+      createElement(CategoryDialog, {
+        onCreate: (name: string, emoji: string, color: string) => addCategory(name, emoji, color),
+        onClose: done,
+      }),
+    );
+    void close;
+  })();
+}
+
 const archivedIds = loadSet("hacksor-archived");
 const hiddenIds = loadSet("hacksor-hidden");
 const pinnedIds = loadSet("hacksor-pinned"); // by threadId
@@ -331,6 +467,8 @@ function persistOpenChats() {
         threadId: s.threadId, title: s.title, workingDir: s.workingDir,
         provider: s.provider, model: s.model, effort: s.effort,
         mode: s.mode, permission: s.permission, auto: s.auto, role: s.role,
+        ledgerDir: s.ledgerDir, ledgerHostDir: s.ledgerHostDir, ledgerFindings: s.ledgerFindings, ledgerNotes: s.ledgerNotes,
+        ctxUsed: s.ctxUsed, ctxWindow: s.ctxWindow, ctxChars: s.ctxChars,
       }));
     localStorage.setItem("hacksor-open-chats", JSON.stringify(list));
   } catch {}
@@ -444,7 +582,10 @@ app.innerHTML = `
       </button>
     </div>
     <div class="sidebar-scroll">
-      <div class="section-label">Recents</div>
+      <div class="section-label section-label-row">
+        <span>Recents</span>
+        <button class="cat-add" id="catadd" title="New category">+ Category</button>
+      </div>
       <div class="chat-list" id="sesslist"></div>
       <div class="chat-list" id="recentslist"></div>
       <div class="section-label archive-head" id="archlabel" hidden>Archive</div>
@@ -469,8 +610,8 @@ app.innerHTML = `
     <div class="scroll" id="scroll">
       <div class="col"><div id="turnshost"></div></div>
     </div>
-    <button class="jump-latest" id="jumplatest" hidden title="Jump to latest">↓ Latest</button>
     <div class="composer-wrap">
+      <button class="jump-latest" id="jumplatest" hidden title="Jump to latest">↓ Latest</button>
       <div class="queue" id="queue" hidden></div>
       <div class="composer" id="composer">
         <div class="attachments" id="attachments" hidden></div>
@@ -481,8 +622,8 @@ app.innerHTML = `
             <button data-v="ask">Ask</button>
           </div>
           <button class="tchip" id="modelchip" title="Model & provider">model</button>
-          <button class="tchip" id="effortchip" title="Reasoning effort">High</button>
-          <button class="tchip" id="permchip" title="Approval mode">Full access</button>
+          <button class="tchip ctx" id="ctxchip" hidden title="Context used">0%</button>
+          <div id="moremount" class="more-wrap"></div>
           <div class="grow"></div>
           <button class="icon-btn attach" id="attach" title="Attach files">${ATTACH_ICON}</button>
           <button class="send" id="send" title="Send">↑</button>
@@ -494,12 +635,25 @@ app.innerHTML = `
   </div>
   <div class="tooldrawer" id="tooldrawer" hidden>
     <div class="td-head">
-      <span class="td-icon" id="td-icon">❯</span>
-      <span class="td-title" id="td-title"></span>
+      <span class="td-panel">Hacksor's computer</span>
+      <div class="grow"></div>
+      <button class="icon-btn" id="td-wrap" title="Toggle line wrapping">${WRAP_ICON}</button>
+      <button class="icon-btn" id="td-save" title="Save output to a file">${SAVE_ICON}</button>
       <button class="icon-btn" id="td-copy" title="Copy">⧉</button>
       <button class="icon-btn" id="td-close" title="Close">✕</button>
     </div>
+    <div class="td-tool" id="td-tool">
+      <button class="td-icon" id="td-icon" type="button" title="Show the full command" aria-expanded="false">❯</button>
+      <span class="td-title" id="td-title"></span>
+    </div>
     <pre class="td-body" id="td-body"></pre>
+    <div class="td-foot" id="td-foot" hidden>
+      <button class="icon-btn" id="td-prev" title="Previous tool run">${PREV_ICON}</button>
+      <button class="icon-btn" id="td-next" title="Next tool run">${NEXT_ICON}</button>
+      <span class="td-pos" id="td-pos"></span>
+      <div class="grow"></div>
+      <button class="td-live" id="td-live" hidden>Jump to live</button>
+    </div>
   </div>
 `;
 
@@ -516,8 +670,32 @@ let stickToBottom = true;
 let programmaticTop = -1;
 let lastScrollTop = 0;
 jumpBtn.addEventListener("click", () => { stickToBottom = true; scrollToBottom(true); });
-const atBottom = () => scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 40;
-const setFollow = (on: boolean) => { stickToBottom = on; jumpBtn.hidden = on; };
+// How close to the bottom still counts as "at the bottom".
+//
+// While an answer is streaming the content grows under the reader, so by the
+// time their scroll event is handled the bottom has moved further away: they
+// reach the end, more text lands, the gap exceeds the threshold, and following
+// never re-arms — the answer runs on below them and the only way back is the
+// Latest button. A larger margin during a live turn absorbs that growth.
+const BOTTOM_IDLE = 40;
+const BOTTOM_LIVE = 160;
+const bottomSlack = () => (activeSession()?.running ? BOTTOM_LIVE : BOTTOM_IDLE);
+const atBottom = () => scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < bottomSlack();
+const setFollow = (on: boolean) => {
+  stickToBottom = on;
+  jumpBtn.hidden = on;
+  if (!on) refreshJumpLabel();
+};
+
+// "Latest" and "Live" are different promises: one scrolls to the end of a
+// finished conversation, the other re-attaches to an answer still being
+// written. Say which it is, so it is obvious that clicking resumes following.
+function refreshJumpLabel() {
+  const live = !!activeSession()?.running;
+  jumpBtn.textContent = live ? "↓ Live" : "↓ Latest";
+  jumpBtn.classList.toggle("live", live);
+  jumpBtn.title = live ? "Follow the answer as it arrives" : "Jump to the end";
+}
 // Gestures are a BACKSTOP for scroll events that get swallowed mid-stream —
 // they must never fire while the view is already pinned to the bottom. At the
 // bottom a wheel moves nothing, so NO scroll event follows, and the scroll
@@ -574,8 +752,7 @@ scrollEl.addEventListener("scroll", () => {
 });
 const sessList = document.getElementById("sesslist") as HTMLDivElement;
 const modelChip = document.getElementById("modelchip") as HTMLButtonElement;
-const effortChip = document.getElementById("effortchip") as HTMLButtonElement;
-const permChip = document.getElementById("permchip") as HTMLButtonElement;
+const ctxChip = document.getElementById("ctxchip") as HTMLButtonElement;
 const input = document.getElementById("input") as HTMLTextAreaElement;
 
 const PERMS: { v: "full_access" | "ask_approval" | "auto_review" | "read_only"; label: string }[] = [
@@ -671,13 +848,63 @@ window.addEventListener("keydown", (e) => {
     e.preventDefault();
     openSearch();
   }
+  // Find inside the open conversation. The transcript is the engagement
+  // record and it gets long; browser find cannot help because a restored chat
+  // renders only its tail.
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+    e.preventDefault();
+    openFindBar();
+  }
 });
 
 document.getElementById("newchat")!.addEventListener("click", () => newSession());
+document.getElementById("catadd")!.addEventListener("click", () => openCategoryDialog());
 document.getElementById("settingsbtn")!.addEventListener("click", () => openSettings());
 document.getElementById("notesbtn")!.addEventListener("click", () => openNotes());
 document.getElementById("searchbtn")!.addEventListener("click", () => openSearch());
 document.getElementById("td-close")!.addEventListener("click", closeToolDrawer);
+// The command is one ellipsised line so the header stays compact, but a tool
+// call is often a long JSON argument and the interesting part is past the cut.
+// The arrow unfolds it in place rather than making the reader guess or copy it
+// out to read it.
+document.getElementById("td-icon")!.addEventListener("click", () => {
+  const row = document.getElementById("td-tool") as HTMLElement;
+  const icon = document.getElementById("td-icon") as HTMLElement;
+  const open = row.classList.toggle("expanded");
+  icon.setAttribute("aria-expanded", open ? "true" : "false");
+  icon.title = open ? "Collapse the command" : "Show the full command";
+});
+// Columnar tool output (nmap, httpx, ffuf) is unreadable wrapped.
+document.getElementById("td-wrap")!.addEventListener("click", () => {
+  const body = document.getElementById("td-body") as HTMLElement;
+  const off = body.classList.toggle("nowrap");
+  (document.getElementById("td-wrap") as HTMLElement).classList.toggle("on", off);
+});
+// A long scan belongs in the engagement directory, not the clipboard.
+document.getElementById("td-save")!.addEventListener("click", () => {
+  const body = document.getElementById("td-body") as HTMLElement;
+  const name = ((document.getElementById("td-title") as HTMLElement).textContent || "output")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 60) || "output";
+  const blob = new Blob([body.textContent ?? ""], { type: "text/plain" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `${name}.txt`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+const stepDrawer = (delta: number) => {
+  const cards = drawerCards();
+  const i = drawerCard ? cards.indexOf(drawerCard) : -1;
+  const next = cards[i + delta];
+  if (next) { showDrawerCard(next); next.scrollIntoView({ block: "nearest" }); }
+};
+document.getElementById("td-prev")!.addEventListener("click", () => stepDrawer(-1));
+document.getElementById("td-next")!.addEventListener("click", () => stepDrawer(1));
+document.getElementById("td-live")!.addEventListener("click", () => {
+  const cards = drawerCards();
+  const last = cards[cards.length - 1];
+  if (last) { showDrawerCard(last); last.scrollIntoView({ block: "nearest" }); }
+});
 document.getElementById("td-copy")!.addEventListener("click", () => {
   navigator.clipboard?.writeText((document.getElementById("td-body") as HTMLElement).textContent || "").catch(() => {});
 });
@@ -731,37 +958,77 @@ document.getElementById("mode")!.addEventListener("click", (e) => {
   state.mode = t.dataset.v as any;
   document.querySelectorAll("#mode button").forEach((b) => b.classList.remove("active"));
   t.classList.add("active");
-  permChip.hidden = state.mode === "ask";
   updateHint();
   syncActiveSession();
   savePrefs();
 });
 modelChip.addEventListener("click", openModelMenu);
-effortChip.addEventListener("click", openEffortMenu);
-permChip.addEventListener("click", openPermMenu);
+ctxChip.addEventListener("click", openContextMenu);
+
+// `anthropic/claude-opus-4-5` -> `claude-opus-4-5`. The provider is already
+// named under the composer and in the chip's tooltip, so the prefix only ate
+// the room the model name needed.
+function modelLabel(id: string): string {
+  return id.slice(id.lastIndexOf("/") + 1) || id;
+}
+
+// Moving between models changes the window the meter is measuring against —
+// 200k to 1M is a different answer for the same conversation. The exact figure
+// codex reported was for the OLD window, so drop it and fall back to the new
+// model's own context length until a fresh turn reports usage again.
+function onModelChanged() {
+  const session = activeSession();
+  if (session) {
+    session.ctxWindow = undefined;
+    session.ctxUsed = undefined;
+    persistOpenChats();
+  }
+  renderContextMeter(session);
+}
+
+// The composer's ⋯ menu is a React/shadcn dropdown; this keeps it in step with
+// the vanilla state that still owns effort and permission.
+let composerMenuRoot: import("react-dom/client").Root | null = null;
+function renderComposerMenu() {
+  const host = document.getElementById("moremount");
+  if (!host) return;
+  void (async () => {
+    const [{ createRoot }, { createElement }, { ComposerMenu }] = await Promise.all([
+      import("react-dom/client"),
+      import("react"),
+      import("./react/ComposerMenu"),
+    ]);
+    composerMenuRoot ??= createRoot(host);
+    composerMenuRoot.render(
+      createElement(ComposerMenu, {
+        efforts: EFFORTS,
+        effort: state.effort,
+        effortDisabled: state.auto,
+        permDisabled: state.mode === "ask",
+        onEffort: (v) => { state.effort = v; updateChips(); },
+        perms: PERMS,
+        permission: state.permission,
+        onPermission: (v) => { state.permission = v as typeof state.permission; updateChips(); },
+      }),
+    );
+  })();
+}
 
 function updateChips() {
-  modelChip.textContent = state.auto ? "✦ Auto" : (state.model || "model");
+  modelChip.textContent = state.auto ? "✦ Auto" : (modelLabel(state.model) || "model");
   const prov = state.providers.find((p) => p.id === state.provider)?.display ?? "";
   modelChip.title = `${prov}${state.auto ? "" : " · " + state.model}`;
+  // The meter measures against the CURRENT model's window, so repaint it
+  // whenever the chips change — switching model, Auto, or session.
+  renderContextMeter(activeSession());
+  renderComposerMenu();
   // Effort is auto-managed while Auto is on, so hide the (non-interactive) chip.
-  effortChip.hidden = state.auto;
-  effortChip.textContent = EFFORTS.find((e) => e.v === state.effort)?.label ?? "High";
-  permChip.textContent = PERMS.find((p) => p.v === state.permission)?.label ?? "Full access";
+  renderContextMeter(activeSession());
+  syncScrollLock();
   syncActiveSession();
   savePrefs();
 }
 
-function openEffortMenu() {
-  if (state.auto) return; // effort is auto-managed while Auto is on
-  const panel = el("div", "menu-list");
-  for (const e of EFFORTS) {
-    const row = el("button", "menu-item ctx" + (e.v === state.effort ? " sel" : ""), e.label);
-    row.onclick = () => { state.effort = e.v; updateChips(); closeMenu(); };
-    panel.appendChild(row);
-  }
-  popup(effortChip, panel);
-}
 
 // ---- lightweight floating menu (no native selects) ----
 let openPanel: HTMLElement | null = null;
@@ -793,15 +1060,6 @@ function popup(anchor: HTMLElement, panel: HTMLElement) {
   }, 0);
 }
 
-function openPermMenu() {
-  const panel = el("div", "menu-list");
-  for (const p of PERMS) {
-    const row = el("button", "menu-item" + (p.v === state.permission ? " sel" : ""), p.label);
-    row.onclick = () => { state.permission = p.v; updateChips(); updateHint(); closeMenu(); };
-    panel.appendChild(row);
-  }
-  popup(permChip, panel);
-}
 
 const PROVIDER_SUB: Record<string, string> = {
   openrouter: "400+ models · one key",
@@ -852,7 +1110,7 @@ function openModelMenu() {
   // auto row
   const autoRow = el("button", "menu-item auto-row" + (state.auto ? " sel" : ""),
     `✦ Auto <span class="hintmini">pick the best model per task</span>`);
-  autoRow.onclick = () => { state.auto = true; updateChips(); updateHint(); closeMenu(); };
+  autoRow.onclick = () => { state.auto = true; onModelChanged(); updateChips(); updateHint(); closeMenu(); };
   panel.appendChild(autoRow);
 
   // search + list
@@ -870,7 +1128,14 @@ function openModelMenu() {
     for (const m of rows) {
       const row = el("button", "menu-item" + (!state.auto && m.id === state.model ? " sel" : ""));
       row.innerHTML = `<span class="mi-name">${escapeHtml(m.display_name)}</span><span class="mi-id">${escapeHtml(m.id)}</span>`;
-      row.onclick = () => { state.auto = false; state.model = m.id; updateChips(); updateHint(); closeMenu(); };
+      row.onclick = () => {
+        state.auto = false;
+        state.model = m.id;
+        onModelChanged();
+        updateChips();
+        updateHint();
+        closeMenu();
+      };
       list.appendChild(row);
     }
   };
@@ -931,7 +1196,10 @@ input.addEventListener("input", () => {
   const s = activeSession();
   if (s) { s.draft = input.value; persistDraft(s); }
 });
-sendBtn.addEventListener("click", onSend);
+// The click handler is owned by setSendButton(), which swaps it between send
+// and stop. A second listener here fired onSend on every click — sending twice
+// per press, and sending again when the button was meant to stop a turn.
+setSendButton(false);
 
 // ---------------------------------------------------------------- sessions
 
@@ -998,8 +1266,7 @@ function selectSession(id: string) {
     state.auto = active.auto;
     document.querySelectorAll("#mode button").forEach((b) =>
       b.classList.toggle("active", (b as HTMLElement).dataset.v === state.mode));
-    permChip.hidden = state.mode === "ask";
-    input.value = active.draft;
+      input.value = active.draft;
     histIdx = -1; // reset prompt-history recall for the newly-active chat
     input.style.height = "auto";
     input.style.height = Math.min(input.scrollHeight, 220) + "px";
@@ -1017,13 +1284,25 @@ function selectSession(id: string) {
         // Fetch only the tail the UI will actually render; earlier messages are
         // pulled on demand (see renderTranscript). Shipping the whole rollout
         // measured 12.46 MB over the IPC bridge to render 1.29 MB of it.
-        let tr: Transcript = { items: [], total: 0, prompts: [] };
+        let tr: Transcript = { items: [], total: 0, prompts: [], chars: 0 };
         try {
           tr = await invoke<Transcript>("read_transcript", { threadId: active.threadId, limit: TRANSCRIPT_CAP });
         } catch { /* handled below */ }
         const items = tr.items;
         const s = state.sessions.find((x) => x.id === sid);
         if (s && items && items.length) { s.turnsEl.innerHTML = ""; s.blocks.clear(); renderTranscript(s, items, false, tr); }
+        // Seed the context estimate from the WHOLE stored conversation. Without
+        // this a reopened chat counted only what arrived live afterwards, so a
+        // long engagement reported a few hundred tokens.
+        if (s && (tr.tokens || tr.chars)) {
+          // codex records real usage in the rollout even when it never sends
+          // the notification, so prefer that; the character estimate is only
+          // for a conversation with no usage records at all.
+          if (tr.tokens) s.ctxUsed = tr.tokens;
+          if (tr.chars) s.ctxChars = Math.max(s.ctxChars ?? 0, tr.chars);
+          persistOpenChats();
+          if (s.id === state.activeSessionId) renderContextMeter(s);
+        }
         // Record the thread's true creation provider (from the rollout) so a
         // later provider switch starts a new thread — codex binds a thread to
         // its creation provider. Only set if we don't already know it.
@@ -1051,6 +1330,7 @@ function selectSession(id: string) {
   }
   updateHint();
   renderSidebar();
+  syncScrollLock();
   scrollToBottom();
 }
 
@@ -1146,7 +1426,7 @@ function renderHistory(session: Session, thread: any) {
 // freezes the UI. Render the most recent ones instantly, with a button to
 // expand the rest on demand.
 const TRANSCRIPT_CAP = 60;
-type Transcript = { items: any[]; total: number; prompts: string[] };
+type Transcript = { items: any[]; total: number; prompts: string[]; chars?: number; tokens?: number | null };
 
 function renderTranscript(session: Session, items: any[], full = false, meta?: Transcript) {
   const start = full ? 0 : Math.max(0, items.length - TRANSCRIPT_CAP);
@@ -1255,6 +1535,9 @@ function renderSidebar() {
     // title (it used to show only the working directory, which is the one
     // thing already visible underneath).
     item.title = s ? `${row.title}\n${s.workingDir}` : row.title;
+    // Dragging a chat onto a category header files it there; dropping it on
+    // "Recents" takes it back out.
+    if (row.tid) startRowDrag(item, row.tid, row.title);
     item.addEventListener("click", () => {
       if (s) selectSession(s.id);
       else { const r = recents.find((x) => x.id === row.key); if (r) resumeRecent(r); }
@@ -1262,18 +1545,67 @@ function renderSidebar() {
     item.querySelector(".i2-btn.pin")!.addEventListener("click", (e) => { e.stopPropagation(); togglePin(row.tid); });
     item.querySelectorAll(".i2-btn")[1].addEventListener("click", (e) => {
       e.stopPropagation();
-      if (s) archiveSession(s.id);
-      else { archivedIds.add(row.key); saveSet("hacksor-archived", archivedIds); renderSidebar(); }
+      const justArchive = () => {
+        if (s) archiveSession(s.id);
+        else { archivedIds.add(row.key); saveSet("hacksor-archived", archivedIds); renderSidebar(); }
+      };
+      openArchiveMenu(e.currentTarget as HTMLElement, justArchive, () => openPurgeDialog(row, s));
     });
     return item;
   };
 
   sessList.innerHTML = "";
   recentsList.innerHTML = ""; // unified into sessList now
+
+  // A header that chats can be dropped onto. `name` is null for the
+  // uncategorised group, which is also how a chat is taken back out.
+  const catHeader = (name: string | null, count: number): HTMLElement => {
+    const closed = name ? catsClosed.has(name) : false;
+    const h = el("div", "cat-head" + (name ? "" : " cat-none") + (closed ? " closed" : ""));
+    const cat = catByName(name);
+    if (cat?.color) h.style.setProperty("--cat-color", cat.color);
+    h.innerHTML =
+      (name ? `<span class="cat-chev">${CHEVRON_ICON}</span>` : "") +
+      (cat?.emoji ? `<span class="cat-emoji-dot">${escapeHtml(cat.emoji)}</span>` : "") +
+      `<span class="cat-name">${escapeHtml(name ?? "Uncategorised")}</span>` +
+      `<span class="cat-count">${count}</span>` +
+      (name ? `<button class="cat-x" title="Delete category (chats stay)">✕</button>` : "");
+    // Pointer-based drop target; see startRowDrag for why not HTML5 DnD.
+    h.dataset.cat = name ?? "";
+    h.classList.add("cat-drop");
+    h.querySelector(".cat-x")?.addEventListener("click", (e) => { e.stopPropagation(); removeCategory(name!); });
+    if (name) {
+      h.addEventListener("click", () => {
+        if (catsClosed.has(name)) catsClosed.delete(name); else catsClosed.add(name);
+        saveSet("hacksor-cats-closed", catsClosed);
+        renderSidebar();
+      });
+    }
+    return h;
+  };
+
   const shown = Math.min(rows.length, chatDisplayLimit);
-  for (const row of rows.slice(0, shown)) {
-    sessList.appendChild(rowEl(row));
+  const visible = rows.slice(0, shown);
+  const inCat = (row: Row) => (row.tid ? cats.of.get(row.tid) : undefined);
+  // Categories first, in the order they were made; everything else under
+  // "Uncategorised", which doubles as the target for dragging a chat back out.
+  for (const cat of cats.list) {
+    const group = visible.filter((r) => inCat(r) === cat.name);
+    sessList.appendChild(catHeader(cat.name, group.length));
+    if (catsClosed.has(cat.name)) continue;
+    group.forEach((row, i) => {
+      const e = rowEl(row);
+      // Indent and rail: without them a filed chat is indistinguishable from a
+      // loose one, and the group reads as a heading with nothing under it.
+      e.classList.add("in-cat");
+      if (i === group.length - 1) e.classList.add("cat-last");
+      if (cat.color) e.style.setProperty("--cat-color", cat.color);
+      sessList.appendChild(e);
+    });
   }
+  const loose = visible.filter((r) => !inCat(r) || !catByName(inCat(r)));
+  if (cats.list.length) sessList.appendChild(catHeader(null, loose.length));
+  for (const row of loose) sessList.appendChild(rowEl(row));
   // "Show more" when there are more chats than the current cap — reveal the rest
   // in pages so the full history is reachable without an unbounded initial render.
   if (rows.length > shown) {
@@ -1399,6 +1731,182 @@ function unarchiveSession(id: string, select: boolean) {
   else renderSidebar();
 }
 
+// Dragging a chat into a category, with pointer events rather than HTML5
+// drag-and-drop.
+//
+// The window runs with `dragDropEnabled: true` so files can be dropped onto the
+// composer; that hands drag gestures to Tauri's native handler, and the
+// in-page `dragstart`/`drop` pair never fires. Pointer events are not
+// intercepted, so they work in the webview and on a trackpad alike.
+function startRowDrag(item: HTMLElement, tid: string, title: string) {
+  item.addEventListener("pointerdown", (down) => {
+    // Left button only, and never from the row's own buttons.
+    if (down.button !== 0 || (down.target as HTMLElement).closest(".i2-btn")) return;
+    const startX = down.clientX;
+    const startY = down.clientY;
+    let ghost: HTMLElement | null = null;
+    let target: HTMLElement | null = null;
+
+    const dropZoneAt = (x: number, y: number): HTMLElement | null => {
+      for (const node of document.elementsFromPoint(x, y)) {
+        const zone = (node as HTMLElement).closest?.(".cat-drop") as HTMLElement | null;
+        if (zone) return zone;
+      }
+      return null;
+    };
+
+    const move = (e: PointerEvent) => {
+      if (!ghost) {
+        // A few pixels of slop so a click is still a click.
+        if (Math.hypot(e.clientX - startX, e.clientY - startY) < 5) return;
+        ghost = el("div", "drag-ghost");
+        ghost.textContent = title;
+        document.body.appendChild(ghost);
+        item.classList.add("dragging");
+        document.body.classList.add("dragging-chat");
+      }
+      ghost.style.transform = `translate(${e.clientX + 12}px, ${e.clientY + 10}px)`;
+      const zone = dropZoneAt(e.clientX, e.clientY);
+      if (zone !== target) {
+        target?.classList.remove("drop");
+        target = zone;
+        target?.classList.add("drop");
+      }
+    };
+
+    const finish = (e: PointerEvent) => {
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", finish);
+      document.removeEventListener("pointercancel", cancel);
+      if (!ghost) return; // never passed the slop: it was a click
+      ghost.remove();
+      item.classList.remove("dragging");
+      document.body.classList.remove("dragging-chat");
+      const zone = dropZoneAt(e.clientX, e.clientY);
+      zone?.classList.remove("drop");
+      target?.classList.remove("drop");
+      if (zone) assignCategory(tid, zone.dataset.cat || null);
+    };
+
+    const cancel = () => {
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", finish);
+      document.removeEventListener("pointercancel", cancel);
+      ghost?.remove();
+      item.classList.remove("dragging");
+      document.body.classList.remove("dragging-chat");
+      target?.classList.remove("drop");
+    };
+
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", finish);
+    document.addEventListener("pointercancel", cancel);
+  });
+}
+
+// Archiving hides a chat; it leaves the transcript, the engagement directory
+// and the note on disk. The button offers both, because "I am done with this"
+// and "no trace of this should remain" are different intentions and only the
+// second one is irreversible.
+function openArchiveMenu(anchorEl: HTMLElement, onArchive: () => void, onDelete: () => void) {
+  document.querySelector(".ctx-pop")?.remove();
+  const pop = el("div", "ctx-pop");
+  pop.innerHTML =
+    `<button class="ctx-item" data-a="archive">${ARCHIVE_ICON}<span>Archive chat</span></button>` +
+    `<button class="ctx-item danger" data-a="delete">${DELETE_ICON}<span>Delete data…</span></button>`;
+  document.body.appendChild(pop);
+  const r = anchorEl.getBoundingClientRect();
+  pop.style.top = `${Math.min(r.bottom + 4, window.innerHeight - pop.offsetHeight - 8)}px`;
+  pop.style.left = `${Math.min(r.left, window.innerWidth - pop.offsetWidth - 8)}px`;
+  const close = () => { pop.remove(); document.removeEventListener("mousedown", away, true); };
+  const away = (ev: MouseEvent) => { if (!pop.contains(ev.target as Node)) close(); };
+  setTimeout(() => document.addEventListener("mousedown", away, true), 0);
+  pop.addEventListener("click", (ev) => {
+    const b = (ev.target as HTMLElement).closest(".ctx-item") as HTMLElement | null;
+    if (!b) return;
+    close();
+    if (b.dataset.a === "archive") onArchive(); else onDelete();
+  });
+}
+
+// Choose exactly what to destroy. Nothing is pre-ticked: every box here is a
+// one-way door, and the engagement directory in particular is the report.
+function openPurgeDialog(row: { key: string; tid?: string | null; title: string }, sess: Session | undefined) {
+  const dir = sess?.ledgerHostDir || sess?.ledgerDir || "";
+  const note = sess?.ledgerNotes || "";
+  const bg = el("div", "modal-bg");
+  bg.innerHTML = `
+    <div class="modal narrow">
+      <button class="modal-close" id="p-close" title="Close (Esc)">✕</button>
+      <h2>Delete engagement data</h2>
+      <p>This cannot be undone. Pick what should be removed from disk.</p>
+      <label class="purge-row">
+        <input type="checkbox" id="p-conv" ${row.tid ? "" : "disabled"} />
+        <span><b>Stored conversation</b><em>${row.tid ? "The full transcript on disk" : "Nothing stored yet"}</em></span>
+      </label>
+      <label class="purge-row">
+        <input type="checkbox" id="p-dir" ${dir ? "" : "disabled"} />
+        <span><b>Engagement directory</b><em>${dir ? escapeHtml(dir) : "This chat has none"}</em></span>
+      </label>
+      <label class="purge-row">
+        <input type="checkbox" id="p-note" ${note ? "" : "disabled"} />
+        <span><b>Engagement notes</b><em>${note ? "ENGAGEMENT_NOTES.md (keeps the evidence)" : "This chat has none"}</em></span>
+      </label>
+      <div class="purge-msg" id="p-msg" hidden></div>
+      <div class="actions">
+        <button class="ghost" id="p-cancel">Cancel</button>
+        <button class="primary danger" id="p-go" disabled>Delete</button>
+      </div>
+    </div>`;
+  app.appendChild(bg);
+  const go = bg.querySelector("#p-go") as HTMLButtonElement;
+  const boxes = [...bg.querySelectorAll('input[type="checkbox"]')] as HTMLInputElement[];
+  const sync = () => { go.disabled = !boxes.some((b) => b.checked); };
+  for (const b of boxes) b.addEventListener("change", sync);
+  const close = () => { document.removeEventListener("keydown", esc); bg.remove(); };
+  const esc = (e: KeyboardEvent) => { if (e.key === "Escape") { e.preventDefault(); close(); } };
+  document.addEventListener("keydown", esc);
+  bg.querySelector("#p-close")!.addEventListener("click", close);
+  bg.querySelector("#p-cancel")!.addEventListener("click", close);
+  bg.addEventListener("mousedown", (e) => { if (e.target === bg) close(); });
+  go.addEventListener("click", async () => {
+    go.disabled = true;
+    go.textContent = "Deleting…";
+    try {
+      const rep = await invoke<{ rollout: boolean; engagement: boolean; notes: boolean; errors: string[] }>(
+        "purge_thread",
+        {
+          threadId: row.tid || null,
+          engagementDir: dir || null,
+          notesPath: note || null,
+          deleteRollout: (bg.querySelector("#p-conv") as HTMLInputElement).checked,
+          deleteEngagement: (bg.querySelector("#p-dir") as HTMLInputElement).checked,
+          deleteNotes: (bg.querySelector("#p-note") as HTMLInputElement).checked,
+        },
+      );
+      if (rep.errors.length) {
+        const msg = bg.querySelector("#p-msg") as HTMLElement;
+        msg.hidden = false;
+        msg.textContent = rep.errors.join(" · ");
+        go.disabled = false;
+        go.textContent = "Delete";
+        return;
+      }
+      // The transcript is gone, so the chat must not linger in the list.
+      if (rep.rollout && sess) deleteSession(sess.id);
+      else if (rep.rollout) { hiddenIds.add(row.key); saveSet("hacksor-hidden", hiddenIds); renderSidebar(); }
+      else renderSidebar();
+      close();
+    } catch (e) {
+      const msg = bg.querySelector("#p-msg") as HTMLElement;
+      msg.hidden = false;
+      msg.textContent = String(e);
+      go.disabled = false;
+      go.textContent = "Delete";
+    }
+  });
+}
+
 function deleteSession(id: string) {
   const s = state.sessions.find((x) => x.id === id);
   if (!s) return;
@@ -1449,6 +1957,8 @@ async function boot() {
   state.workingDir = s.working_dir;
   state.kaliMode = s.kali_mode;
   state.runtime = s.runtime;
+  state.warnWithoutVpn = s.warn_without_vpn !== false;
+  state.limitRuntimeMount = !!s.limit_runtime_mount;
   state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key, cheaperInference: s.has_cheaper_inference_key, abliteration: s.has_abliteration_key };
 
   // Restore saved composer preferences.
@@ -1463,7 +1973,6 @@ async function boot() {
   }
   document.querySelectorAll("#mode button").forEach((b) =>
     b.classList.toggle("active", (b as HTMLElement).dataset.v === state.mode));
-  permChip.hidden = state.mode === "ask";
 
   newSession();
 
@@ -1474,6 +1983,11 @@ async function boot() {
     const s = makeSession();
     s.threadId = c.threadId;
     s.title = storedTitle(c.threadId) || c.title || "Chat";
+    // Absent on chats from before the ledger: they stay as they were.
+    s.ledgerDir = c.ledgerDir; s.ledgerHostDir = c.ledgerHostDir; s.ledgerFindings = c.ledgerFindings; s.ledgerNotes = c.ledgerNotes;
+    // Usage is only reported live, so without this a reopened chat reads 0%
+    // until its next turn — which looks like the meter is broken.
+    s.ctxUsed = c.ctxUsed; s.ctxWindow = c.ctxWindow; s.ctxChars = c.ctxChars;
     s.started = true;
     s.resumed = false;
     s.workingDir = c.workingDir || state.workingDir;
@@ -1820,7 +2334,26 @@ async function onSend() {
   const text = input.value.trim();
   const session = activeSession();
   if (!text || !session) return;
-  // A turn is in flight → queue this message and send it when the turn ends.
+  // Agent mode reaches the target from this machine; check the way out first.
+  if (!(await vpnGate())) return;
+  // A turn is in flight. Steer it NOW rather than queueing.
+  //
+  // This used to always queue, and the queue only drained when a shell command
+  // completed or the turn ended. An MCP tool call is not a commandExecution,
+  // so a steer sent during one sat in the queue until the model happened to run
+  // a shell command — which is why a correction could take minutes to land, or
+  // never land until the turn was over. codex accepts mid-turn input on a
+  // running thread, so send it straight through.
+  //
+  // Queue only when there is genuinely nothing to steer into: the thread is
+  // still being created (`starting`), or codex refuses the steer (a compacting
+  // turn cannot take one) — see the fallback in steerNow.
+  if (session.running && session.threadId && !session.starting) {
+    const steerText = text;
+    input.value = ""; session.draft = ""; persistDraft(session); input.style.height = "auto";
+    void steerNow(session, steerText);
+    return;
+  }
   if (session.running || session.starting) {
     session.queue.push(text);
     input.value = ""; session.draft = ""; persistDraft(session); input.style.height = "auto";
@@ -1871,6 +2404,7 @@ async function onSend() {
   persistDraft(session);
   input.style.height = "auto";
   session.turnsEl.querySelector(".empty")?.remove();
+  syncScrollLock();
   if (session.title === "New chat") {
     // The truncated prompt is the placeholder: the row must say something
     // immediately, and it is also the fallback if naming fails.
@@ -1885,6 +2419,10 @@ async function onSend() {
   if (session.sentHistory[session.sentHistory.length - 1] !== text) session.sentHistory.push(text);
   if (session.sentHistory.length > 200) session.sentHistory.shift();
   histIdx = -1;
+  // A session's FIRST message is where its engagement directory is created.
+  // Captured before `started` flips, and only for sessions that have none, so
+  // chats restored from before the ledger are untouched.
+  const firstMessage = !session.started;
   if (!session.started) { session.started = true; renderSidebar(); }
   session.recency = Date.now(); // new activity floats this chat to the top
   stickToBottom = true; // sending always jumps to the latest
@@ -1897,6 +2435,26 @@ async function onSend() {
   ensureThinking(session);
 
   try {
+    // Set the engagement directory up WITHOUT blocking the turn.
+    //
+    // Naming it asks the model for a target, which goes through the proxy,
+    // which needs the runtime container — and on a first message that
+    // container is started by this very turn. Awaiting it here deadlocked the
+    // send: the turn waited on a model that was waiting on the turn, and the
+    // chat sat on "Still working…" indefinitely.
+    //
+    // So it runs alongside, and its preamble rides on the NEXT message. The
+    // directory and its note still appear during this turn.
+    if (firstMessage && !session.ledgerDir && session.role === "default") {
+      void openLedger(session, text)
+        .then((p) => { if (p) session.pendingLedgerPreamble = p; })
+        .catch(() => {});
+    }
+    // A preamble that was not ready in time goes out with this message.
+    if (session.pendingLedgerPreamble) {
+      fullText = `${session.pendingLedgerPreamble}\n\n${fullText}`;
+      session.pendingLedgerPreamble = undefined;
+    }
     // A branch's first message carries the conversation it was cut from: the
     // branch is a fresh thread, so this is the only thing that tells the model
     // any of it happened. Consumed once — later messages are ordinary.
@@ -2018,11 +2576,17 @@ function drainQueue(session: Session) {
 
 // Send a steer message into the currently-running turn (codex accepts mid-turn
 // input and adjusts course). Shows it as a user bubble tagged "steer".
-async function steerNow(session: Session, text: string) {
+async function steerNow(session: Session, text: string, auto = false) {
   if (!session.threadId) { input.value = text; onSend(); return; }
   session.recency = Date.now();
-  addUserMessage(session, text, [], true);
-  session.lastText = text;
+  // An automatic re-anchor is not the user's message: show it as a note, and
+  // leave `lastText` alone so "Try again" still retries what they actually sent.
+  if (auto) {
+    addAutoNoteText(session, "↪ Re-sent the task to the agent after compaction.");
+  } else {
+    addUserMessage(session, text, [], true);
+    session.lastText = text;
+  }
   const steerPlan = state.auto ? autoPlan(text, session.escalation, session) : null;
   if (steerPlan) session.phase = steerPlan.phase;
   const model = steerPlan?.model ?? state.model;
@@ -2035,7 +2599,17 @@ async function steerNow(session: Session, text: string) {
       },
     });
   } catch (e) {
-    addError(session, "Steer failed: " + String(e));
+    const msg = String(e);
+    // codex refuses to steer a turn that is compacting ("cannot steer a compact
+    // turn"). That is temporary, so hold the message and let the normal drain
+    // deliver it instead of losing it to an error bar.
+    if (/compact|no active turn|not steerable/i.test(msg)) {
+      session.queue.unshift(text);
+      renderQueue(session);
+      addAutoNoteText(session, "↪ Held that message until the current step finishes — codex will not steer a turn while it is compacting.");
+    } else {
+      addError(session, "Steer failed: " + msg);
+    }
   }
 }
 
@@ -2065,7 +2639,14 @@ function setSessionRunning(session: Session, r: boolean) {
   session.running = r;
   if (r) { session.unread = false; session.cmdSig = undefined; session.cmdRepeat = 0; }
   if (r) startIdleWatch(session); else stopIdleWatch(session);
-  if (session.id === state.activeSessionId) setSendButton(r);
+  if (session.id === state.activeSessionId) {
+    setSendButton(r);
+    // A turn starting while the reader is already at the end means they are
+    // watching: follow it. If they had scrolled away to read, leave them
+    // there — the button says "Live" and puts them back when they want it.
+    if (r && atBottom()) setFollow(true);
+    refreshJumpLabel();
+  }
   if (!r) drainQueue(session);
   renderSidebar();
 }
@@ -2081,6 +2662,7 @@ async function stopRun() {
 }
 
 function addUserMessage(session: Session, text: string, atts: { name: string; isImage: boolean }[] = [], steer = false) {
+  session.ctxChars = (session.ctxChars ?? 0) + text.length;
   const m = el("div", "msg user");
   // Counted here rather than from the DOM: a steer is a user message in the
   // rollout but never enters `sentHistory`, so counting prompt history would
@@ -2537,6 +3119,85 @@ function ocxDashboardButton(): HTMLButtonElement {
   return b;
 }
 
+interface SessionLedger {
+  dir: string; host_dir: string; findings: string; notes: string; report: string; created: boolean;
+}
+
+// The target a session is about, decided by the model.
+//
+// This used to take a host out of the prompt and fall back to its opening
+// words, which named a directory `hey-how-are-u` after a greeting. Whether a
+// message names a target at all is a judgement, so the model makes it and may
+// answer "nothing here", in which case no directory is created.
+async function targetForSession(session: Session, text: string): Promise<string> {
+  try {
+    // Bounded: this is a convenience, not a prerequisite. If the model is slow
+    // or the proxy is still coming up, give up and let the next message try
+    // again rather than leaving a request outstanding forever.
+    const name = await Promise.race([
+      invoke<string>("suggest_target", {
+        args: { provider: state.provider, model: session.turnModel || state.model, text },
+      }),
+      new Promise<string>((r) => setTimeout(() => r(""), 25_000)),
+    ]);
+    return (name || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+// Give a NEW session an engagement directory, and tell the agent to use it.
+//
+// Why this exists: the context window compacts, and when it does the agent
+// loses the map of what it established, what it ruled out and what it was
+// about to try — so it repeats dead ends or invents continuity it does not
+// have. A directory on disk does not compact. The first message carries the
+// paths and the capture rules; everything after that is the agent keeping its
+// own record current.
+//
+// Only sessions started from now on get one. A chat restored from before has
+// no ledgerDir, receives no injection, and behaves exactly as it always did.
+async function openLedger(session: Session, firstPrompt: string): Promise<string> {
+  if (session.ledgerDir) return "";
+  try {
+    const target = await targetForSession(session, firstPrompt);
+    // No target named: a greeting or a general question is not an engagement,
+    // and it must not leave a directory behind.
+    if (!target) return "";
+    const l = await invoke<SessionLedger>("ledger_init", {
+      workingDir: session.workingDir,
+      target,
+    });
+    if (!l?.dir) return "";
+    session.ledgerDir = l.dir;
+    session.ledgerHostDir = l.host_dir;
+    session.ledgerFindings = l.findings;
+    session.ledgerNotes = l.notes;
+    persistOpenChats();
+    addAutoNoteText(session, l.created
+      ? `📁 Engagement directory: ${l.host_dir}`
+      : `📁 Continuing the existing engagement: ${l.host_dir}`);
+    return [
+      "<engagement_ledger>",
+      `This session's engagement directory is ${l.dir}. It is the record of this`,
+      "engagement and it outlives your context window, which WILL compact and take",
+      "the rest with it. Keep it current as you work, not at the end.",
+      "",
+      `- Findings: \`hacksor-findings add --file ${l.findings} -t "<title>" -s <severity> --cvss <n> -u <url> -d "<what>" -e "<evidence>"\`, the moment one is confirmed.`,
+      `- The report is generated from that store: \`hacksor-findings report --file ${l.findings} -o ${l.dir}/deliverables/report.md\`. Regenerate it whenever you add or change a finding, so the deliverable is never behind the work.`,
+      `- ${l.notes}: rewrite "Current state" as it changes, and append to "Open leads" and "Ruled out". A negative with its boundary is as valuable as a finding: it is what stops the next pass from re-running a dead end.`,
+      `- Evidence goes under ${l.dir}/artifacts/<workstream>/ (one directory per workstream: recon, a host, a PoC, a decompile). Anything that must not ship goes to ${l.dir}/_quarantine_not_in_delivery/.`,
+      `- Anything you create on the target (accounts, uploads, webhooks, registrations) is appended to ${l.dir}/RESIDUAL_STATE.md when you create it.`,
+      "",
+      "If you have lost the thread — after a compaction, or on resume — READ the notes",
+      "file first and continue from its Current state rather than guessing or starting over.",
+      "</engagement_ledger>",
+    ].join("\n");
+  } catch {
+    return ""; // the engagement proceeds without a ledger rather than failing
+  }
+}
+
 // Name a new chat from its first message.
 //
 // Keeping the raw prompt made every row a wall of the same opening sentence,
@@ -2558,6 +3219,205 @@ async function nameChat(session: Session, text: string) {
     setChatTitle(session.threadId, session.title);
     renderSidebar();
   } catch { /* keep the placeholder */ }
+}
+
+// Show how full the model's context is, so compaction stops being a surprise.
+//
+// codex compacts when the conversation approaches the model's window and
+// replaces the earlier turns with a summary. Before this the only signal was
+// the chat quietly losing its own history mid-engagement. The chip turns amber
+// as the threshold nears and red once compaction is imminent.
+// Lock scrolling only when the greeting is genuinely all there is.
+//
+// The old CSS matched an `.empty` anywhere inside the visible session, so a
+// greeting node left beside real content disabled the scrollbar for the whole
+// conversation — you had to click through chats until one happened to be
+// clean. Requiring it to be the ONLY child makes a stray node harmless, and
+// computing it here means the default is always "scrolling works".
+function syncScrollLock() {
+  const host = activeSession()?.turnsEl;
+  const onlyGreeting = !!host && host.children.length === 1 && host.firstElementChild?.classList.contains("empty") === true;
+  scrollEl.classList.toggle("no-scroll", onlyGreeting);
+}
+
+// What the chip knows, from codex when it reports and from the transcript when
+// it does not.
+//
+// `thread/tokenUsage/updated` never arrives on some provider paths (the
+// OpenCodex proxy does not relay it), which left the meter reading 0% for a
+// whole engagement. Characters/4 is a rough but honest stand-in, and the real
+// figure takes over the moment codex sends one.
+function contextUsage(session: Session | undefined): { used: number; win: number; exact: boolean } {
+  if (!session) return { used: 0, win: 0, exact: false };
+  const modelWin = state.models.find((m) => m.id === (session.model || state.model))?.context_length ?? 0;
+  const win = session.ctxWindow || modelWin || 0;
+  if (session.ctxUsed) return { used: session.ctxUsed, win, exact: true };
+  return { used: Math.round((session.ctxChars ?? 0) / 4), win, exact: false };
+}
+
+// Rough size of one completed item, for the context estimate. Walks the few
+// fields that actually carry text rather than stringifying the whole item,
+// which would count ids and metadata as conversation.
+function addCtxChars(session: Session, item: Record<string, unknown> | undefined) {
+  if (!item) return;
+  let n = 0;
+  for (const k of ["text", "content", "command", "output", "summary", "aggregated_output"]) {
+    const v = item[k];
+    if (typeof v === "string") n += v.length;
+    else if (Array.isArray(v)) for (const p of v) if (typeof p === "string") n += p.length;
+  }
+  if (!n) return;
+  session.ctxChars = (session.ctxChars ?? 0) + n;
+  if (session.id === state.activeSessionId) renderContextMeter(session);
+  persistOpenChats();
+}
+
+function renderContextMeter(session: Session | undefined) {
+  if (!session) { ctxChip.hidden = true; return; }
+  const { used, win } = contextUsage(session);
+  // Nothing sent yet: there is no context to report, and "0 / 1000k · 0%" is
+  // noise on an empty chat. The chip appears with the first message.
+  if (!used || !win) {
+    ctxChip.hidden = true;
+    return;
+  }
+  ctxChip.hidden = false;
+  const pct = Math.min(100, Math.round((used / win) * 100));
+  ctxChip.textContent = `${pct}%`;
+  ctxChip.classList.toggle("idle", used === 0);
+  // codex compacts at a fraction of the window, so "near" starts before 100.
+  ctxChip.classList.toggle("warn", pct >= 75 && pct < 90);
+  ctxChip.classList.toggle("hot", pct >= 90);
+  ctxChip.title = "Context used";
+}
+
+// The numbers behind the percentage. The chip has room for one figure, but
+// "how much is left" and "when does it compact" are the questions it raises.
+function openContextMenu() {
+  const session = activeSession();
+  const { used, win, exact } = contextUsage(session);
+  if (!used || !win) return; // nothing to report on an empty chat
+  const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
+  const panel = el("div", "menu-list ctx-menu");
+  if (!win) {
+    panel.innerHTML = `<div class="cm-row"><span>Context</span><b>unknown</b></div>`;
+  } else {
+    const pct = Math.min(100, Math.round((used / win) * 100));
+    panel.innerHTML =
+      `<div class="cm-row"><span>Used</span><b>${k(used)} / ${k(win)} · ${pct}%</b></div>` +
+      `<div class="cm-row"><span>Left</span><b>${k(Math.max(0, win - used))}</b></div>` +
+      (exact ? "" : `<div class="cm-row"><span>Source</span><b>estimate</b></div>`) +
+      (pct >= 90 ? `<div class="cm-note">Compaction imminent.</div>` : "");
+  }
+  popup(ctxChip, panel);
+}
+
+ctxChip.addEventListener("click", openContextMenu);
+
+// ---------------------------------------------------------------- find in chat
+
+// Find text inside the open conversation (Cmd/Ctrl+F).
+//
+// The transcript is the engagement record and it gets long: scrolling for a
+// host, a parameter or a finding is how most of it gets re-read. Browser find
+// cannot help, because a restored chat renders only its tail and the rest is
+// fetched on demand, so this searches what is rendered and says so when more
+// exists above.
+let findBar: HTMLElement | null = null;
+let findHits: HTMLElement[] = [];
+let findAt = -1;
+
+function clearFindHits() {
+  for (const el of document.querySelectorAll(".search-hit")) {
+    const parent = el.parentNode;
+    if (!parent) continue;
+    parent.replaceChild(document.createTextNode(el.textContent ?? ""), el);
+    parent.normalize();
+  }
+  findHits = [];
+  findAt = -1;
+}
+
+// Wrap every match in the live transcript. Walks text nodes so the existing
+// markup (code blocks, links, highlighting) survives untouched.
+function markFindHits(term: string): HTMLElement[] {
+  clearFindHits();
+  const host = activeSession()?.turnsEl;
+  if (!host || term.trim().length < 2) return [];
+  const needle = term.toLowerCase();
+  const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) =>
+      n.nodeValue && n.nodeValue.toLowerCase().includes(needle) && n.parentElement?.tagName !== "SCRIPT"
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_REJECT,
+  });
+  const texts: Text[] = [];
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) texts.push(n as Text);
+  const out: HTMLElement[] = [];
+  for (const node of texts) {
+    const value = node.nodeValue ?? "";
+    const frag = document.createDocumentFragment();
+    let i = 0;
+    for (;;) {
+      const at = value.toLowerCase().indexOf(needle, i);
+      if (at < 0) break;
+      if (at > i) frag.appendChild(document.createTextNode(value.slice(i, at)));
+      const mark = el("span", "search-hit", escapeHtml(value.slice(at, at + term.length)));
+      frag.appendChild(mark);
+      out.push(mark);
+      i = at + term.length;
+    }
+    if (i < value.length) frag.appendChild(document.createTextNode(value.slice(i)));
+    node.parentNode?.replaceChild(frag, node);
+  }
+  return out;
+}
+
+function gotoFindHit(delta: number, countEl: HTMLElement) {
+  if (!findHits.length) { countEl.textContent = "0/0"; return; }
+  findHits[findAt]?.classList.remove("current");
+  findAt = (findAt + delta + findHits.length) % findHits.length;
+  const hit = findHits[findAt];
+  hit.classList.add("current");
+  // Scrolling to a hit must not re-arm follow mode (see the scroll handler).
+  stickToBottom = false;
+  jumpBtn.hidden = false;
+  hit.scrollIntoView({ block: "center" });
+  programmaticTop = scrollEl.scrollTop;
+  countEl.textContent = `${findAt + 1}/${findHits.length}`;
+}
+
+function openFindBar() {
+  const session = activeSession();
+  if (!session) return;
+  if (findBar) { (findBar.querySelector("input") as HTMLInputElement)?.select(); return; }
+  const bar = el("div", "chat-find");
+  bar.innerHTML =
+    `<input type="search" placeholder="Find in chat" spellcheck="false" />` +
+    `<span class="cf-count">0/0</span>` +
+    `<button class="cf-prev" title="Previous (Shift+Enter)">↑</button>` +
+    `<button class="cf-next" title="Next (Enter)">↓</button>` +
+    `<button class="cf-close" title="Close (Esc)">✕</button>`;
+  (document.querySelector(".main") ?? document.body).appendChild(bar);
+  findBar = bar;
+  const input = bar.querySelector("input") as HTMLInputElement;
+  const count = bar.querySelector(".cf-count") as HTMLElement;
+  const close = () => { clearFindHits(); bar.remove(); findBar = null; };
+  const run = () => {
+    findHits = markFindHits(input.value);
+    findAt = -1;
+    if (findHits.length) gotoFindHit(1, count);
+    else count.textContent = input.value.trim().length < 2 ? "0/0" : "none";
+  };
+  input.addEventListener("input", () => run());
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); gotoFindHit(e.shiftKey ? -1 : 1, count); }
+    if (e.key === "Escape") { e.preventDefault(); close(); }
+  });
+  bar.querySelector(".cf-next")!.addEventListener("click", () => gotoFindHit(1, count));
+  bar.querySelector(".cf-prev")!.addEventListener("click", () => gotoFindHit(-1, count));
+  bar.querySelector(".cf-close")!.addEventListener("click", close);
+  input.focus();
 }
 
 function modelSupportsVision(id: string): boolean {
@@ -2823,20 +3683,64 @@ function toolCard(icon: string, label: string, extraCls = "") {
   });
   head.querySelector(".card-expand")!.addEventListener("click", (e) => {
     e.stopPropagation();
-    openToolDrawer(icon, labelEl.textContent || label, fullOutput.get(pre) ?? pre.textContent ?? "");
+    openToolDrawer(icon, labelEl.textContent || label, fullOutput.get(pre) ?? pre.textContent ?? "", card);
   });
   return { card, pre, label: labelEl, status: head.querySelector(".status") as HTMLElement };
 }
 
 // Right-side drawer showing one tool's full output, larger and copyable.
-function openToolDrawer(icon: string, title: string, content: string) {
+// Which tool card the drawer is currently showing, so it can step between
+// runs. HackerAI's panel has a transport for re-watching what its agent did;
+// this is the same idea reduced to what hacksor actually stores — the tool
+// runs of this conversation, in order, with a way back to the newest.
+let drawerCard: HTMLElement | null = null;
+
+function drawerCards(): HTMLElement[] {
+  const session = activeSession();
+  if (!session) return [];
+  return [...session.turnsEl.querySelectorAll<HTMLElement>(".card")]
+    .filter((c) => c.querySelector("pre"));
+}
+
+function showDrawerCard(card: HTMLElement) {
+  const pre = card.querySelector("pre") as HTMLElement | null;
+  const icon = card.querySelector(".head .icon")?.textContent ?? "❯";
+  const label = card.querySelector(".head .label")?.textContent ?? "output";
+  openToolDrawer(icon, label, (pre && fullOutput.get(pre)) ?? pre?.textContent ?? "", card);
+}
+
+function refreshDrawerTransport() {
+  const foot = document.getElementById("td-foot") as HTMLElement;
+  const pos = document.getElementById("td-pos") as HTMLElement;
+  const live = document.getElementById("td-live") as HTMLElement;
+  const prev = document.getElementById("td-prev") as HTMLButtonElement;
+  const next = document.getElementById("td-next") as HTMLButtonElement;
+  const cards = drawerCards();
+  const i = drawerCard ? cards.indexOf(drawerCard) : -1;
+  // Only worth a transport when there is more than one run to move between.
+  foot.hidden = cards.length < 2 || i < 0;
+  if (foot.hidden) return;
+  pos.textContent = `${i + 1} of ${cards.length}`;
+  prev.disabled = i <= 0;
+  next.disabled = i >= cards.length - 1;
+  // "Jump to live" means the newest run, and only matters when you are not on
+  // it — the same promise HackerAI's button makes.
+  live.hidden = i >= cards.length - 1;
+  live.classList.toggle("running", !!activeSession()?.running);
+}
+
+function openToolDrawer(icon: string, title: string, content: string, card?: HTMLElement) {
   buildDrawerOpen = false; // a tool output, not the live build log (the caller re-sets it)
+  drawerCard = card ?? null;
   const drawer = document.getElementById("tooldrawer") as HTMLElement;
   (document.getElementById("td-icon") as HTMLElement).textContent = icon;
   (document.getElementById("td-title") as HTMLElement).textContent = title;
+  document.getElementById("td-tool")?.classList.remove("expanded");
+  document.getElementById("td-icon")?.setAttribute("aria-expanded", "false");
   (document.getElementById("td-body") as HTMLElement).textContent = content;
   drawer.hidden = false;
   document.getElementById("app")!.classList.add("drawer-open");
+  refreshDrawerTransport();
 }
 function closeToolDrawer() {
   buildDrawerOpen = false;
@@ -2869,7 +3773,11 @@ function makeSmoothReveal(paint: (text: string) => void, scroll = true, onDone?:
   // instead of a fixed chars-per-frame rate. The old 22 char/frame ceiling meant
   // a 30 KB answer needed ~23s to finish appearing — long enough to look stuck,
   // then to dump in one go when it finally caught up.
-  const DRAIN_MS = 600;
+  // Drain the backlog over about this long. A thought that arrives in one
+  // buffered chunk (providers that never stream reasoning deltas) otherwise
+  // lands in ~600ms, which reads as a pop rather than as thinking; stretching
+  // it makes a late arrival look like the live case.
+  const DRAIN_MS = 1100;
   const frame = (now: number) => {
     raf = 0;
     const backlog = received.length - shown;
@@ -2988,20 +3896,72 @@ function createBlock(kind: string): ItemBlock {
     // Start EXPANDED so the thinking phase streams live (no dead time); it is
     // auto-collapsed to a "Thought for Ns" summary the moment the final answer
     // begins (see ensureBlock).
-    const { card, pre } = toolCard("✳", "Thinking", "reasoning");
+    const { card, pre, label } = toolCard("✳", "Thinking", "reasoning");
     card.dataset.t0 = String(Date.now());
+    // Count up while thinking. Some providers never stream reasoning deltas,
+    // so the card can sit empty for a long time; a running clock is the
+    // difference between "working" and "hung".
+    const t0 = Date.now();
+    const tick = window.setInterval(() => {
+      if (!card.isConnected) { clearInterval(tick); return; }
+      label.textContent = `Thinking… ${Math.round((Date.now() - t0) / 1000)}s`;
+    }, 1000);
     const reveal = makeSmoothReveal((t) => { pre.textContent = t; });
     const b: ItemBlock = {
       root: card, buffer: "",
       appendDelta: (s) => { b.buffer = reveal.push(s); },
       setFinal: (item) => {
         const full = (item.summary?.join("\n\n") || item.content?.join("\n\n") || b.buffer) ?? "";
+        if (!full) return; // item/started carries nothing yet
+        clearInterval(tick);
         b.buffer = full;
         reveal.finish(full);
       },
     };
     return b;
   }
+// A finding the agent just recorded, pulled out of the `hacksor-findings add`
+// it ran. Severity and title are the two things worth seeing at a glance while
+// scrolling an engagement; the rest stays in the ledger and the report.
+interface ParsedFinding { title: string; severity: string; cvss: string; url: string; }
+function parseFindingAdd(cmd: string): ParsedFinding | null {
+  if (!/\bhacksor-findings\b[\s\S]*\badd\b/.test(cmd)) return null;
+  // Values may be quoted (single or double) or bare.
+  const grab = (flags: string[]): string => {
+    for (const f of flags) {
+      const re = new RegExp(`${f}\\s+(?:"([^"]*)"|'([^']*)'|(\\S+))`);
+      const m = cmd.match(re);
+      if (m) return (m[1] ?? m[2] ?? m[3] ?? "").trim();
+    }
+    return "";
+  };
+  const title = grab(["-t", "--title"]);
+  if (!title) return null;
+  return {
+    title,
+    severity: grab(["-s", "--severity"]).toLowerCase(),
+    cvss: grab(["--cvss"]),
+    url: grab(["-u", "--url"]),
+  };
+}
+
+function findingCard(f: ParsedFinding): HTMLElement {
+  const sev = ["critical", "high", "medium", "low", "info"].includes(f.severity) ? f.severity : "info";
+  const card = el("div", `finding-card sev-${sev}`);
+  // Severity and score read as one pill ("CRITICAL · 9.8"): the score alone is
+  // meaningless to skim and the word alone loses the ranking between two
+  // criticals.
+  const badge = escapeHtml(sev.toUpperCase()) + (f.cvss ? ` · ${escapeHtml(f.cvss)}` : "");
+  card.innerHTML =
+    `<div class="fc-main">` +
+      `<div class="fc-title">${escapeHtml(f.title)}</div>` +
+      (f.url ? `<div class="fc-sub">${escapeHtml(f.url)}</div>` : "") +
+    `</div>` +
+    `<div class="fc-sev">${badge}</div>`;
+  card.title = `${f.title}${f.url ? `\n${f.url}` : ""}`;
+  return card;
+}
+
   if (kind === "commandExecution") {
     const { card, pre, label, status } = toolCard("❯", "command");
     status.textContent = "running…"; status.className = "status running";
@@ -3050,7 +4010,18 @@ function createBlock(kind: string): ItemBlock {
       setFinal: (item) => {
         if (raf) { cancelAnimationFrame(raf); raf = 0; }
         pending = "";
-        if (item.command) { label.textContent = item.command; label.title = item.command; }
+        if (item.command) {
+          label.textContent = item.command;
+          label.title = item.command;
+          // Recording a finding is the moment worth surfacing: show it as a
+          // card above the command instead of leaving it buried in a terminal
+          // block the reader has to expand.
+          const f = parseFindingAdd(item.command);
+          if (f && !card.previousElementSibling?.classList.contains("finding-card")) {
+            card.parentElement?.insertBefore(findingCard(f), card);
+            card.classList.add("collapsed");
+          }
+        }
         if (item.aggregatedOutput) { b.buffer = item.aggregatedOutput; setPre(item.aggregatedOutput); }
         const code = item.exitCode, st = item.status;
         if (st === "failed" || (typeof code === "number" && code !== 0)) { status.textContent = `exit ${code ?? "?"}`; status.className = "status fail"; }
@@ -3258,6 +4229,13 @@ listen<Notif>("hacksor://event", (evt) => {
     case "item/agentMessage/delta": session.sawOutputThisTurn = true; ensureBlock(session, params.itemId, "agentMessage").appendDelta?.(params.delta); break;
     case "item/reasoning/summaryTextDelta":
     case "item/reasoning/textDelta": session.sawOutputThisTurn = true; ensureBlock(session, params.itemId, "reasoning").appendDelta?.(params.delta); break;
+    // A new summary part is a paragraph boundary, not text. Unhandled, the
+    // parts of a long thought ran together into one block.
+    case "item/reasoning/summaryPartAdded": {
+      const b = ensureBlock(session, params.itemId, "reasoning");
+      if (b.buffer) b.appendDelta?.("\n\n");
+      break;
+    }
     case "item/commandExecution/outputDelta": session.sawOutputThisTurn = true; ensureBlock(session, params.itemId, "commandExecution").appendDelta?.(params.delta); break;
     case "item/started":
     case "item/completed": {
@@ -3267,12 +4245,66 @@ listen<Notif>("hacksor://event", (evt) => {
       // Any rendered item (assistant text, reasoning, a command) counts as a
       // non-empty turn — even a buffered, non-streamed reply.
       session.sawOutputThisTurn = true;
+      // Feed the context estimate from what actually passed through this turn:
+      // assistant text, reasoning, and tool output all occupy the window.
+      addCtxChars(session, item);
       ensureBlock(session, item.id, item.type).setFinal?.(item);
       if (method === "item/completed" && item.type === "commandExecution") {
         checkDoomLoop(session, item.command || "");
-        // "When a command is executed and there's a steer message, steer it."
-        if (session.running && session.queue.length) drainQueue(session);
       }
+      // Drain at the end of ANY item, not just a shell command: an MCP tool
+      // call or a file change is just as good a moment, and waiting only for
+      // commandExecution is what used to strand a queued message.
+      if (method === "item/completed" && session.running && session.queue.length) {
+        drainQueue(session);
+      }
+      break;
+    }
+    case "thread/compacted": {
+      // codex has replaced the conversation with a summary. The summary keeps
+      // the gist and loses the instruction: the task it was given, the state it
+      // had reached, and the fact that work is already done. Left alone the
+      // agent drifts, re-runs finished steps, or invents continuity — which is
+      // why the fix until now was the user retyping the task.
+      //
+      // Re-anchor it once, immediately, with the original request and a pointer
+      // to the engagement notes (which did not compact, unlike the context).
+      session.turnsEl.appendChild(
+        el("div", "auto-note", "⚘ Context compacted — reminding the agent of the task."));
+      scrollToBottom();
+      if (Date.now() - (session.lastAnchorMs ?? 0) > 60_000) {
+        session.lastAnchorMs = Date.now();
+        const task = (session.sentHistory[0] ?? "").trim();
+        const lines = [
+          "<context_restored>",
+          "Your context was just compacted: the earlier turns are now a summary, so treat",
+          "anything not restated here as something you must re-read rather than recall.",
+        ];
+        if (task) lines.push("", `The task you were given is still: ${task.slice(0, 1200)}`);
+        if (session.ledgerNotes) {
+          lines.push(
+            "",
+            `Before doing anything else, read ${session.ledgerNotes} and continue from its`,
+            "\"Current state\" section. Do NOT restart work already recorded there, and do not",
+            "re-run anything under \"Ruled out\".",
+          );
+        } else {
+          lines.push("", "Continue the task above from where you were. Do not start over.");
+        }
+        lines.push("</context_restored>");
+        void steerNow(session, lines.join("\n"), true);
+      }
+      break;
+    }
+    case "thread/tokenUsage/updated": {
+      // Forwarded verbatim by the harness; shape is { tokenUsage: { total, modelContextWindow } }.
+      const u = params.tokenUsage ?? params.usage ?? params;
+      const total = Number(u?.total ?? u?.totalTokens ?? 0);
+      const win = Number(u?.modelContextWindow ?? u?.contextWindow ?? 0);
+      if (total > 0) session.ctxUsed = total;
+      if (win > 0) session.ctxWindow = win;
+      if (total > 0 || win > 0) persistOpenChats();
+      if (session.id === state.activeSessionId) renderContextMeter(session);
       break;
     }
     case "turn/plan/updated": renderPlan(session, params); break;
@@ -3281,6 +4313,93 @@ listen<Notif>("hacksor://event", (evt) => {
     default: break;
   }
 });
+
+// ------------------------------------------------------------- vpn awareness
+
+interface VpnStatus {
+  tunnel: boolean; iface: string; ip: string; country: string; isp: string;
+  proxy: boolean; hosting: boolean; exposed: boolean; lookup_error: string;
+}
+
+function describeVpn(v: VpnStatus): string {
+  const where = v.ip ? `${v.ip}${v.country ? ` \u00b7 ${v.country}` : ""}` : "address unknown";
+  if (!v.exposed) {
+    const why = v.tunnel ? v.iface : v.proxy ? "proxy exit" : "hosting";
+    return `Protected via ${why} \u2014 ${where}.`;
+  }
+  return `Exposed \u2014 ${where} via ${v.iface || "unknown"}.`;
+}
+
+// One gate at a time. Enter in the composer fires onSend, and because the
+// confirmation did not take focus a second Enter opened a second copy; a few
+// taps left a stack that each needed dismissing.
+let vpnGateOpen = false;
+
+// Confirm before a turn goes out over the operator's own connection.
+// A small popover above the send button, not a modal: it confirms an action
+// that is one keystroke away, so it sits where that keystroke happened.
+async function vpnGate(): Promise<boolean> {
+  if (!state.warnWithoutVpn || state.mode !== "agent") return true;
+  if (vpnGateOpen) return false;
+  vpnGateOpen = true;
+
+  // The LOCAL route check decides, and it is instant. The public lookup only
+  // adds detail (which address, whose network) and used to be awaited first,
+  // which put seconds between pressing Send and seeing the warning.
+  let route: VpnStatus;
+  try {
+    route = await invoke<VpnStatus>("vpn_route");
+  } catch {
+    vpnGateOpen = false;
+    return true; // never block a turn because the check itself broke
+  }
+  if (!route.exposed) {
+    vpnGateOpen = false;
+    return true;
+  }
+
+  return await new Promise<boolean>((resolve) => {
+    const pop = el("div", "vpn-confirm");
+    pop.innerHTML =
+      `<div class="vc-head">No VPN</div>` +
+      `<div class="vc-body" id="vc-detail">Leaving through ${escapeHtml(route.iface || "an unknown interface")}, not a tunnel.</div>` +
+      `<div class="vc-actions">` +
+        `<button class="ghost" id="vc-no">Cancel</button>` +
+        `<button class="primary danger" id="vc-yes">Send anyway</button>` +
+      `</div>`;
+    (document.querySelector(".composer-wrap") ?? app).appendChild(pop);
+    const yes = pop.querySelector("#vc-yes") as HTMLButtonElement;
+    yes.focus();
+
+    // Fill in the address once the lookup lands — the dialog is already up and
+    // usable, so this only ever adds detail. If it turns out the egress IS
+    // protected (a proxy or hosting exit the route check cannot see), the
+    // warning was wrong: withdraw it and let the turn through.
+    let settled = false;
+    void invoke<VpnStatus>("vpn_status").then((full) => {
+      if (settled) return;
+      if (!full.exposed) { done(true); return; }
+      const d = pop.querySelector("#vc-detail");
+      if (d) d.textContent = describeVpn(full);
+    }).catch(() => {});
+
+    const done = (ok: boolean) => {
+      settled = true;
+      vpnGateOpen = false;
+      document.removeEventListener("keydown", onKey, true);
+      pop.remove();
+      input.focus();
+      resolve(ok);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); done(true); }
+      else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); done(false); }
+    };
+    document.addEventListener("keydown", onKey, true);
+    pop.querySelector("#vc-no")!.addEventListener("click", () => done(false));
+    yes.addEventListener("click", () => done(true));
+  });
+}
 
 // ---------------------------------------------------------------- settings
 
@@ -3451,6 +4570,7 @@ function openSettings(force = false) {
         <button class="tab-btn active" data-tab="general">General</button>
         <button class="tab-btn" data-tab="providers">Providers</button>
         <button class="tab-btn" data-tab="agent">Agent</button>
+        <button class="tab-btn" data-tab="security">Security</button>
         <button class="tab-btn" data-tab="advanced">Advanced</button>
       </div>
 
@@ -3582,9 +4702,10 @@ function openSettings(force = false) {
         </div>
       </div>
 
+      <div class="tab-pane" data-pane="security"><div id="s-security-mount"></div></div>
       <div class="tab-pane" data-pane="advanced">
         <div class="field">
-          <label><input type="checkbox" id="s-kali" ${state.kaliMode ? "checked" : ""} style="width:auto;margin-right:6px;vertical-align:middle" /> Kali container mode <span id="s-kali-status" class="unset-badge"></span></label>
+          <label class="check-row"><input type="checkbox" id="s-kali" ${state.kaliMode ? "checked" : ""} /> <span><b>Kali container mode</b> <span id="s-kali-status" class="unset-badge"></span></span></label>
           <p style="margin:6px 0 0">When on, the Kali container starts <b>automatically</b> and the agent runs tools via <code>docker exec hacksor-kali</code> (working dir mounted). Requires Docker.</p>
         </div>
         <div class="field">
@@ -3696,6 +4817,39 @@ function openSettings(force = false) {
   svcModeSel?.addEventListener("change", async () => {
     await invoke("save_settings", { args: { services_mode: svcModeSel.value } }).catch((e) => alert(String(e)));
   });
+  // Security tab: React + shadcn. Mounted into its pane while the rest of the
+  // dialog is still vanilla — Settings converts a tab at a time.
+  void (async () => {
+    const host = bg.querySelector("#s-security-mount");
+    if (!host) return;
+    const [{ createRoot }, { createElement }, { SecurityTab }] = await Promise.all([
+      import("react-dom/client"),
+      import("react"),
+      import("./react/settings/SecurityTab"),
+    ]);
+    const root = createRoot(host as HTMLElement);
+    // createElement, NOT SecurityTab({...}): calling a component directly runs
+    // its hooks outside React's render phase, which throws and leaves the pane
+    // blank.
+    root.render(
+      createElement(SecurityTab, {
+        warnWithoutVpn: state.warnWithoutVpn,
+        onWarnChange: (v) => {
+          state.warnWithoutVpn = v;
+          void invoke("save_settings", { args: { warn_without_vpn: v } }).catch((e) => alert(String(e)));
+        },
+        limitRuntimeMount: state.limitRuntimeMount,
+        onMountChange: (v) => {
+          state.limitRuntimeMount = v;
+          void invoke("save_settings", { args: { limit_runtime_mount: v } }).catch((e) => alert(String(e)));
+        },
+        checkVpn: () => invoke<VpnStatus>("vpn_status"),
+        describeVpn,
+      }),
+    );
+    bg.addEventListener("hacksor:closed", () => setTimeout(() => root.unmount(), 0), { once: true });
+  })();
+
   refreshServices();
   // Tab switching.
   bg.querySelectorAll(".tab-btn").forEach((tb) => tb.addEventListener("click", () => {
@@ -3998,7 +5152,27 @@ function openReleaseNotes(title: string, sub: string, markdown: string, download
   bg.querySelector("#rn-close")!.addEventListener("click", close);
   bg.querySelector("#rn-ok")!.addEventListener("click", close);
   if (download) {
-    bg.querySelector("#rn-get")!.addEventListener("click", () => {
+    const get = bg.querySelector("#rn-get") as HTMLButtonElement;
+    get.addEventListener("click", async () => {
+      // Install in place when this build has the updater configured (release
+      // builds do; a local build does not), and fall back to the download page
+      // otherwise rather than leaving the button dead.
+      get.disabled = true;
+      const was = get.textContent;
+      try {
+        const up = await checkUpdate();
+        if (up) {
+          get.textContent = "Downloading…";
+          await up.downloadAndInstall((p) => {
+            if (p.event === "Progress") get.textContent = "Downloading…";
+            if (p.event === "Finished") get.textContent = "Restarting…";
+          });
+          await relaunch();
+          return;
+        }
+      } catch { /* not configured, offline, or unsigned: fall through */ }
+      get.disabled = false;
+      get.textContent = was;
       invoke("open_release_page", { url: download }).catch(() => {});
     });
   }
