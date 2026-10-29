@@ -3337,6 +3337,59 @@ async function recoverLedger(session: Session) {
   } catch { /* the chat is fine without it */ }
 }
 
+// Move a session onto a different engagement directory, because the chat
+// asked for it.
+//
+// The user says "record this under ~/sec/acme instead"; the agent answers with
+// the engagement-directory marker; this repoints the session at it. The marker
+// is the SAME line openLedger writes when it creates one, so there is one
+// spelling of "the engagement directory is X" for both the UI and the agent to
+// use, and nothing new for the model to remember.
+//
+// The directory is adopted, not reset: switching back to an engagement from
+// last week keeps every finding and note already in it.
+const ENGAGEMENT_MARK = /^\s*(?:📁\s*)?Engagement directory:\s*(\S.*?)\s*$/mu;
+
+async function switchLedgerFromMessage(session: Session, text: string) {
+  const asked = text.match(ENGAGEMENT_MARK)?.[1]?.replace(/[`*]/g, "").trim();
+  if (!asked) return;
+  // The agent quoting our own note back — in a summary, or when it just
+  // confirms where it is working — must not be read as a request to move.
+  if (asked === session.ledgerHostDir || asked === session.ledgerDir) return;
+  try {
+    const l = await invoke<SessionLedger>("ledger_use", {
+      workingDir: session.workingDir,
+      dir: asked,
+    });
+    if (!l?.dir || l.host_dir === session.ledgerHostDir) return;
+    session.ledgerDir = l.dir;
+    session.ledgerHostDir = l.host_dir;
+    session.ledgerFindings = l.findings;
+    session.ledgerNotes = l.notes;
+    // The agent knows the directory it named; it does NOT know the paths
+    // inside it or the capture rules for them. Re-state them on the next
+    // message — which also writes the new path into the rollout, so a reopened
+    // chat recovers the engagement it moved TO and not the one it left.
+    session.pendingLedgerPreamble = ledgerPreamble({
+      dir: l.dir, findings: l.findings, notes: l.notes,
+    });
+    persistOpenChats();
+    if (session === activeSession()) updateChips();
+    const note = addAutoNoteText(session, l.created
+      ? `📁 Engagement moved to ${l.host_dir}`
+      : `📁 Engagement switched to ${l.host_dir}`);
+    if (note) {
+      note.classList.add("clickable");
+      note.title = "Open findings, report and artifacts";
+      note.addEventListener("click", () => void openEngagement());
+    }
+  } catch (e) {
+    // A path that cannot be used is the user's to fix, so say so plainly
+    // instead of leaving the panel pointing at the old directory in silence.
+    addError(session, `Could not use that engagement directory: ${String(e)}`);
+  }
+}
+
 // Name a new chat from its first message.
 //
 // Keeping the raw prompt made every row a wall of the same opening sentence,
@@ -4390,6 +4443,11 @@ listen<Notif>("hacksor://event", (evt) => {
       ensureBlock(session, item.id, item.type).setFinal?.(item);
       if (method === "item/completed" && item.type === "commandExecution") {
         checkDoomLoop(session, item.command || "");
+      }
+      // The agent can move the engagement by naming the new directory in its
+      // reply; the UI follows so the panel opens what was asked for.
+      if (method === "item/completed" && item.type === "agentMessage" && item.text) {
+        void switchLedgerFromMessage(session, item.text);
       }
       // Drain at the end of ANY item, not just a shell command: an MCP tool
       // call or a file change is just as good a moment, and waiting only for

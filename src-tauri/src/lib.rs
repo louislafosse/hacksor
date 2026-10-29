@@ -75,6 +75,7 @@ pub fn run() {
             commands::suggest_title,
             commands::ledger_init,
             commands::ledger_recover,
+            commands::ledger_use,
             commands::context_tokens,
             commands::suggest_target,
             commands::purge_thread,

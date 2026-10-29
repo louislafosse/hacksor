@@ -4092,6 +4092,120 @@ pub async fn ledger_init(
     })
 }
 
+/// Point a session at a DIFFERENT engagement directory.
+///
+/// The user asks for it in the chat ("record this one under
+/// ~/sec/acme instead"), the agent answers with the engagement-directory
+/// marker, and the UI calls this. Adopting an existing engagement is the
+/// common case — switching back to one from last week keeps every finding and
+/// note already in it — so an existing directory is never touched, only read.
+///
+/// Rejects the paths that would turn a typo into a mess: a home or filesystem
+/// root would get an `artifacts/` tree and a README scattered into it.
+#[tauri::command]
+pub async fn ledger_use(
+    state: State<'_, AppState>,
+    working_dir: String,
+    dir: String,
+) -> Result<SessionLedger, String> {
+    let asked = dir.trim();
+    if asked.is_empty() {
+        return Err("no directory given".into());
+    }
+    // The agent names paths as IT sees them, which under Docker are container
+    // paths. Everything below this line is a host path.
+    let asked = std::path::PathBuf::from(crate::platform::from_container_path(asked));
+    let root = std::path::PathBuf::from(if working_dir.trim().is_empty() {
+        state.settings.lock().await.working_dir.clone()
+    } else {
+        working_dir
+    });
+    let joined = if asked.is_absolute() { asked } else { root.join(asked) };
+    let path = normalize_engagement_path(&joined)?;
+    let adopted = path.join("ENGAGEMENT_NOTES.md").is_file();
+    if !adopted {
+        let slug = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(target_slug)
+            .ok_or_else(|| "that path has no directory name".to_string())?;
+        create_ledger_tree(&path, &slug).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    let docker = docker_runtime(&state).await;
+    let seen = |p: &std::path::Path| -> String {
+        if docker { crate::platform::to_container_path(p) } else { p.to_string_lossy().into_owned() }
+    };
+    Ok(SessionLedger {
+        dir: seen(&path),
+        host_dir: path.to_string_lossy().into_owned(),
+        findings: seen(&path.join("findings.jsonl")),
+        notes: seen(&path.join("ENGAGEMENT_NOTES.md")),
+        report: seen(&path.join("deliverables").join("report.md")),
+        created: !adopted,
+    })
+}
+
+/// Resolve `..` and reject a path no engagement should ever be laid out in.
+///
+/// `canonicalize` needs the path to exist, and the point here is often a
+/// directory that does not yet — so `..` and `.` are resolved lexically, then
+/// the deepest EXISTING ancestor is canonicalized to resolve symlinks and the
+/// remainder appended to it. That is what makes `~/sec/../sec/acme` and a
+/// symlinked `~/sec` land on the same path as the plain spelling, which
+/// matters because the UI compares the result against the directory the
+/// session is already on to decide whether anything changed.
+fn normalize_engagement_path(p: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+    let mut head = std::path::PathBuf::new();
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => head.push(c.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // A `..` with nothing above it to climb is a path reaching past
+                // the root; there is nothing sensible to resolve it to.
+                if parts.pop().is_none() {
+                    return Err(format!("{}: path escapes the filesystem root", p.display()));
+                }
+            }
+            Component::Normal(name) => parts.push(name.to_os_string()),
+        }
+    }
+    // Deepest existing ancestor first, so symlinks in the part that DOES exist
+    // are resolved; whatever is left is appended unchanged.
+    let mut base = head.clone();
+    let mut split = 0;
+    for i in (0..=parts.len()).rev() {
+        let mut probe = head.clone();
+        for name in &parts[..i] {
+            probe.push(name);
+        }
+        if let Ok(real) = probe.canonicalize() {
+            base = real;
+            split = i;
+            break;
+        }
+    }
+    if split == 0 && !head.as_os_str().is_empty() && head.canonicalize().is_err() {
+        return Err(format!("{}: no such directory", p.display()));
+    }
+    let mut out = base;
+    for name in &parts[split..] {
+        out.push(name);
+    }
+    if out.parent().is_none() {
+        return Err("the filesystem root is not an engagement directory".into());
+    }
+    if out == crate::platform::home_dir() {
+        return Err("the home directory is not an engagement directory".into());
+    }
+    if out.exists() && !out.is_dir() {
+        return Err(format!("{} is a file, not a directory", out.display()));
+    }
+    Ok(out)
+}
+
 // ---- findings notes (shared with the agent via codex_home/notes) ----
 
 /// What a purge actually removed, so the UI can say it plainly.
@@ -4894,6 +5008,41 @@ mod transcript_tests {
                 "{escape} should not resolve inside the engagement"
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn switching_engagement_resolves_a_path_without_requiring_it_to_exist() {
+        let root = std::env::temp_dir().join(format!("hacksor-switch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sec")).unwrap();
+        let real = root.canonicalize().unwrap();
+
+        // A directory that does not exist yet still resolves: that is the
+        // point, since the tree is laid out after this returns.
+        let fresh = normalize_engagement_path(&root.join("sec/acme.example")).unwrap();
+        assert_eq!(fresh, real.join("sec/acme.example"));
+
+        // `..` is applied, whether it falls in the existing part of the path
+        // or the part that does not exist yet. Both spellings must land on the
+        // same directory, because the UI compares the result against the
+        // engagement the session is already on to decide if anything moved.
+        for spelling in ["sec/../sec/acme.example", "sec/acme.example/../acme.example"] {
+            assert_eq!(
+                normalize_engagement_path(&root.join(spelling)).unwrap(),
+                fresh,
+                "{spelling} should resolve to the same directory"
+            );
+        }
+
+        // The roots that would get an artifacts tree scattered into them.
+        assert!(normalize_engagement_path(std::path::Path::new("/")).is_err());
+        assert!(normalize_engagement_path(&crate::platform::home_dir()).is_err());
+
+        // A file is not an engagement directory.
+        std::fs::write(root.join("notes.txt"), "x").unwrap();
+        assert!(normalize_engagement_path(&root.join("notes.txt")).is_err());
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
