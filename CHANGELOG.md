@@ -1,3 +1,10 @@
+# [1.16.0](https://github.com/louislafosse/hacksor/compare/v1.15.0...v1.16.0) (2026-10-29)
+
+
+### Features
+
+* **engagement:** move a session's engagement directory from the chat ([62ba17b](https://github.com/louislafosse/hacksor/commit/62ba17b4026678ddad6f1bbc8dd00edebb358966))
+
 # [1.15.0](https://github.com/louislafosse/hacksor/compare/v1.14.0...v1.15.0) (2026-10-28)
 
 
