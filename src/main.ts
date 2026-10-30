@@ -216,6 +216,10 @@ interface Session {
   ledgerNotes?: string;
   cmdSig?: string;
   cmdRepeat?: number;
+  /// An active `/goal`: the session keeps working until it is met.
+  goal?: GoalState;
+  /// A `/goal` whose instructions have not ridden out yet.
+  pendingGoal?: string;
   // Live context usage for this thread, from codex's thread/tokenUsage/updated.
   // The point is to see compaction COMING: codex compacts at a threshold of the
   // model's window, and until now the first sign of it was the conversation
@@ -484,6 +488,7 @@ function persistOpenChats() {
         mode: s.mode, permission: s.permission, auto: s.auto, role: s.role,
         ledgerDir: s.ledgerDir, ledgerHostDir: s.ledgerHostDir, ledgerFindings: s.ledgerFindings, ledgerNotes: s.ledgerNotes,
         ctxUsed: s.ctxUsed, ctxWindow: s.ctxWindow, ctxChars: s.ctxChars,
+        goal: s.goal,
       }));
     localStorage.setItem("hacksor-open-chats", JSON.stringify(list));
   } catch {}
@@ -627,6 +632,7 @@ app.innerHTML = `
     </div>
     <div class="composer-wrap">
       <button class="jump-latest" id="jumplatest" hidden title="Jump to latest">↓ Latest</button>
+      <div class="goalbar" id="goalbar" hidden></div>
       <div class="queue" id="queue" hidden></div>
       <div class="composer" id="composer">
         <div class="attachments" id="attachments" hidden></div>
@@ -1042,6 +1048,7 @@ function updateChips() {
   // chat the button would open nothing and just add noise to the toolbar.
   const engBtn = document.getElementById("engagementbtn");
   if (engBtn) engBtn.hidden = !(activeSession()?.ledgerHostDir || activeSession()?.ledgerDir);
+  renderGoalBar(activeSession());
   renderComposerMenu();
   // Effort is auto-managed while Auto is on, so hide the (non-interactive) chip.
   renderContextMeter(activeSession());
@@ -1216,6 +1223,14 @@ input.addEventListener("input", () => {
   autosizeInput();
   const s = activeSession();
   if (s) { s.draft = input.value; persistDraft(s); }
+  // Typing a leading "/" is how anyone looks for commands; the hint line below
+  // the composer is already there, so it says what there is instead of leaving
+  // the only command in the app undiscoverable.
+  if (/^\/\S*$/.test(input.value)) {
+    hint.textContent = "/goal <objective> \u2014 keep working until it is met, or you stop it";
+  } else {
+    updateHint();
+  }
 });
 // The click handler is owned by setSendButton(), which swaps it between send
 // and stop. A second listener here fired onSend on every click — sending twice
@@ -2012,6 +2027,10 @@ async function boot() {
     // Usage is only reported live, so without this a reopened chat reads 0%
     // until its next turn — which looks like the meter is broken.
     s.ctxUsed = c.ctxUsed; s.ctxWindow = c.ctxWindow; s.ctxChars = c.ctxChars;
+    // A goal is restored STOPPED: the loop drives itself off turn/completed,
+    // and a reopened chat has no turn in flight to resume from. The bar shows
+    // it with a Resume button rather than quietly starting to send.
+    if (c.goal?.text) s.goal = { ...c.goal, running: false };
     s.started = true;
     s.resumed = false;
     s.workingDir = c.workingDir || state.workingDir;
@@ -2359,9 +2378,23 @@ function renderEmpty(session: Session) {
 async function onSend() {
   // Runtime still provisioning: don't send, show the user why (the build log).
   if (runtimeBusy) { showBuildLog(); return; }
-  const text = input.value.trim();
+  let text = input.value.trim();
   const session = activeSession();
   if (!text || !session) return;
+  // `/goal <objective>` sends the message as written and puts the session in
+  // goal mode, where the end of a turn is not a stopping point. Parsed here,
+  // before the queue, so it works whether or not a turn is in flight.
+  const goalCmd = /^\/goal\b\s*([\s\S]*)$/i.exec(text);
+  if (goalCmd) {
+    const objective = goalCmd[1].trim();
+    if (!objective) {
+      addError(session, "Usage: /goal <what you want achieved> \u2014 the session then keeps working until it is met, you stop it, or it hits the round cap.");
+      return;
+    }
+    text = objective;
+    input.value = objective;
+    session.pendingGoal = objective;
+  }
   // Agent mode reaches the target from this machine; check the way out first.
   if (!(await vpnGate())) return;
   // A turn is in flight: queue the message and let the drain send it at the
@@ -2482,6 +2515,7 @@ async function onSend() {
         .then((p) => { if (p) session.pendingLedgerPreamble = p; })
         .catch(() => {});
     }
+    fullText = withGoalPreamble(session, fullText);
     // A preamble that was not ready in time goes out with this message.
     if (session.pendingLedgerPreamble) {
       fullText = `${session.pendingLedgerPreamble}\n\n${fullText}`;
@@ -2627,7 +2661,7 @@ async function steerNow(session: Session, text: string, auto = false) {
   try {
     await invoke("send_message", {
       args: {
-        thread_id: session.threadId, text, working_dir: session.workingDir,
+        thread_id: session.threadId, text: withGoalPreamble(session, text), working_dir: session.workingDir,
         model, provider: state.provider, effort, mode: state.mode, role: session.role, images: [],
       },
     });
@@ -2692,6 +2726,9 @@ function stopRun() {
   // duration of the thing being stopped.
   setSessionRunning(s, false);
   removeThinking(s);
+  // Stop means stop: a goal that stayed armed would look stopped and then
+  // send the next round the moment anything completed.
+  if (s.goal?.running) endGoal(s, "stopped");
   addAutoNoteText(s, "⏹ Stopped.");
   if (s.threadId) void invoke("interrupt", { threadId: s.threadId }).catch(() => {});
 }
@@ -3693,7 +3730,311 @@ async function maybePhaseHandover(session: Session, answer: string | undefined |
 // Post-turn Auto housekeeping. The phase judge is skipped when the turn already
 // escalated: that sends a follow-up on the SAME task, so re-routing mid-retry
 // would swap the model out from under an attempt still in progress.
+// ---- Goal mode -------------------------------------------------------------
+//
+// `/goal <what you want>` starts a session working toward one objective and
+// keeps it working: every time a turn ends without the goal being met, the next
+// one is sent automatically.
+//
+// Why this exists: a model ends its turn when it has something presentable,
+// which on a long engagement is far short of done — one finding, a short list,
+// a question about what to look at next. The persona argues against that;
+// goal mode removes the opportunity. The turn boundary stops being a stopping
+// point.
+//
+// The agent ends the goal itself, by saying so in plain text:
+//   GOAL ACHIEVED  — met, with what proves it
+//   GOAL IMPOSSIBLE — every remaining route is closed, with the boundary
+//   GOAL BLOCKED   — it needs a decision only the user can make
+// Nothing else ends it but the cap, or the user pressing Stop. A claim of
+// achieved or impossible is challenged once against the verifier when one is
+// configured, because the first claim of "done" is often the easy one.
+type GoalState = {
+  text: string;
+  /// Continuations sent so far. 0 means the opening message is still running.
+  turns: number;
+  max: number;
+  running: boolean;
+  /// Pushbacks spent on a premature "achieved"/"impossible", capped.
+  challenges: number;
+  done?: "achieved" | "impossible" | "input" | "stopped" | "cap";
+  detail?: string;
+};
+
+// High enough that it is not what ends a real engagement, low enough to bound
+// a runaway. Reaching it stops and offers more rather than deciding for you.
+const GOAL_MAX_TURNS = 40;
+const GOAL_MAX_CHALLENGES = 2;
+
+const GOAL_MARKERS: { kind: "achieved" | "impossible" | "input"; re: RegExp }[] = [
+  // Anchored to the start of a line, so the same words inside a sentence
+  // ("the goal is impossible to achieve without credentials") do not end a run.
+  // Leading markdown, quoting and emoji are allowed because models add them.
+  { kind: "achieved", re: /^[\s>*_`#✅☑️✔️]*GOAL\s+ACHIEVED\b[\s:.—–-]*(.*)$/im },
+  { kind: "impossible", re: /^[\s>*_`#⛔🚫❌]*GOAL\s+IMPOSSIBLE\b[\s:.—–-]*(.*)$/im },
+  { kind: "input", re: /^[\s>*_`#❓❔🛑]*GOAL\s+BLOCKED\b[\s:.—–-]*(.*)$/im },
+];
+
+function goalMarker(text: string) {
+  for (const m of GOAL_MARKERS) {
+    const hit = text.match(m.re);
+    if (hit) {
+      // A bolded marker leaves its closing `**` on the front of the detail.
+      const detail = (hit[1] || "").replace(/^[*_`\s:.\u2014\u2013-]+/, "").trim();
+      return { kind: m.kind, detail: detail.slice(0, 300) };
+    }
+  }
+  return null;
+}
+
+/// The instructions that ride out with the goal's opening message.
+function goalPreamble(goal: string, max: number): string {
+  return [
+    "<goal_mode>",
+    `GOAL: ${goal}`,
+    "",
+    "You are in goal mode. You keep working until this goal is met. The end of a",
+    "turn is not a stopping point: if the goal is not met, you will simply be told",
+    "to continue, so there is nothing to gain by stopping to report progress or to",
+    "ask which direction to take. Decide, and keep going.",
+    "",
+    "While working toward it:",
+    "- Pick the highest-value next action yourself, every time. Never ask which lead to follow.",
+    "- A confirmed finding is progress toward the goal, not the goal. Record it and move on.",
+    "- A dead end is information. Record the boundary that closed it and take the next route.",
+    "- Long-running work (a scan, a fuzz, a crawl) is started and worked around, not waited on idly.",
+    "- Keep the engagement directory current as you go; it is what survives a compaction.",
+    "",
+    "End the goal by writing ONE of these as its own line, exactly:",
+    "- `GOAL ACHIEVED — <what proves it>` when the goal is genuinely met, with evidence.",
+    "- `GOAL IMPOSSIBLE — <the boundary that closes every remaining route>` when there is",
+    "  nothing left to try. Not 'this is hard' or 'this would take a while' — closed.",
+    "- `GOAL BLOCKED — <the single question>` when you need a decision only the operator can",
+    "  make: a credential, an authorization, a scope call, or an action that would be",
+    "  destructive or affect a real person. Use this sparingly; it costs them a round trip.",
+    "",
+    "Write none of those and you will be sent on to the next round. A claim of ACHIEVED or",
+    `IMPOSSIBLE may be challenged once, so make sure it holds. The run stops after ${max}`,
+    "rounds whatever happens.",
+    "</goal_mode>",
+  ].join("\n");
+}
+
+const goalBar = document.getElementById("goalbar") as HTMLDivElement;
+
+function renderGoalBar(session: Session | undefined) {
+  if (!session || session.id !== state.activeSessionId) return;
+  const g = session.goal;
+  if (!g) { goalBar.hidden = true; goalBar.innerHTML = ""; return; }
+  goalBar.hidden = false;
+  const label = g.running
+    ? `Round ${g.turns + 1} of ${g.max}`
+    : ({
+        achieved: "Achieved",
+        impossible: "Not possible",
+        input: "Waiting on you",
+        stopped: "Stopped",
+        cap: `Stopped at ${g.max} rounds`,
+      }[g.done || "stopped"]);
+  goalBar.className = `goalbar${g.running ? " live" : ` done ${g.done || "stopped"}`}`;
+  goalBar.innerHTML =
+    `<span class="g-icon">◎</span>` +
+    `<span class="g-text" title="${escapeHtml(g.text)}">${escapeHtml(g.text)}</span>` +
+    `<span class="g-state">${escapeHtml(label)}</span>` +
+    (g.running
+      ? `<button class="g-btn" data-a="stop">Stop</button>`
+      : `<button class="g-btn" data-a="resume">Resume</button><button class="g-btn" data-a="clear">✕</button>`);
+}
+
+goalBar.addEventListener("click", (ev) => {
+  const b = (ev.target as HTMLElement).closest(".g-btn") as HTMLElement | null;
+  const session = activeSession();
+  if (!b || !session?.goal) return;
+  if (b.dataset.a === "stop") {
+    endGoal(session, "stopped");
+  } else if (b.dataset.a === "clear") {
+    session.goal = undefined;
+    persistOpenChats();
+    renderGoalBar(session);
+  } else if (b.dataset.a === "resume") {
+    // More rounds on the same goal: the count restarts so the cap means the
+    // same thing each time it is offered.
+    session.goal.running = true;
+    session.goal.turns = 0;
+    session.goal.challenges = 0;
+    session.goal.done = undefined;
+    persistOpenChats();
+    renderGoalBar(session);
+    addAutoNoteText(session, `◎ Resuming the goal for up to ${session.goal.max} more rounds.`);
+    void goalContinue(session, goalNudge(session.goal.text, null));
+  }
+});
+
+/// Prepend a pending goal's instructions to an outgoing message, if any.
+///
+/// Both send paths go through this: a goal set while the composer is idle
+/// rides out with that message, and one set while a turn is running rides out
+/// with the steer that carries it.
+function withGoalPreamble(session: Session, body: string): string {
+  const g = session.pendingGoal;
+  if (!g) return body;
+  session.pendingGoal = undefined;
+  return `${startGoal(session, g)}\n\n${body}`;
+}
+
+/// Start a goal. Returns the preamble to send with the user's message.
+function startGoal(session: Session, goal: string): string {
+  session.goal = { text: goal, turns: 0, max: GOAL_MAX_TURNS, running: true, challenges: 0 };
+  persistOpenChats();
+  renderGoalBar(session);
+  return goalPreamble(goal, GOAL_MAX_TURNS);
+}
+
+function endGoal(session: Session, done: GoalState["done"], detail?: string) {
+  const g = session.goal;
+  if (!g) return;
+  g.running = false;
+  g.done = done;
+  g.detail = detail;
+  persistOpenChats();
+  renderGoalBar(session);
+  const line = {
+    achieved: "◎ Goal achieved",
+    impossible: "◎ Goal not reachable",
+    input: "◎ Goal paused — the agent needs your decision",
+    stopped: "◎ Goal stopped",
+    cap: `◎ Goal stopped after ${g.max} rounds — Resume for more`,
+  }[done || "stopped"];
+  addAutoNoteText(session, detail ? `${line}: ${detail}` : line);
+}
+
+/// Decide what happens after a turn that ran under an active goal.
+async function goalStep(session: Session, answer: string | undefined | null) {
+  const g = session.goal;
+  if (!g?.running) return;
+  const text = (answer || "").trim();
+  const hit = text ? goalMarker(text) : null;
+
+  if (hit?.kind === "input") { endGoal(session, "input", hit.detail); return; }
+
+  if (hit) {
+    // "Done" on the first attempt is the claim most worth testing, and the
+    // verifier is a different model looking only at the goal and the result.
+    // No verifier configured (no key for this provider) means the claim is
+    // taken at face value rather than the feature not working.
+    if (g.challenges < GOAL_MAX_CHALLENGES) {
+      const v = await goalVerdict(session, text);
+      if (v && (v.verdict === "fail" || v.verdict === "partial")) {
+        g.challenges++;
+        g.turns++;
+        persistOpenChats();
+        renderGoalBar(session);
+        addAutoNoteText(session, `◎ Checked that claim: ${v.reason || v.verdict}. Pushing back.`);
+        await goalContinue(session, goalPushback(g.text, hit.kind, v.reason));
+        return;
+      }
+    }
+    endGoal(session, hit.kind, hit.detail);
+    return;
+  }
+
+  if (g.turns + 1 >= g.max) { endGoal(session, "cap"); return; }
+  g.turns++;
+  persistOpenChats();
+  renderGoalBar(session);
+  await goalContinue(session, goalNudge(g.text, text));
+}
+
+/// Ask the verifier whether the goal is really met. Null when there is none.
+async function goalVerdict(session: Session, answer: string) {
+  try {
+    const v = await invoke<{ verdict: string; reason: string }>("verify_turn", {
+      args: {
+        provider: session.provider,
+        model: verifierModel(),
+        task: `GOAL: ${session.goal?.text || ""}\n\nThe agent claims this goal is finished. Judge ONLY whether the goal itself is met with concrete evidence.`,
+        answer,
+      },
+    });
+    return v.verdict === "unknown" ? null : v;
+  } catch {
+    return null;
+  }
+}
+
+function goalNudge(goal: string, lastAnswer: string | null): string {
+  const ended = lastAnswer && lastAnswer.length < 1200
+    ? "That turn ended without the goal being met and without anything that needs my input."
+    : "That turn ended without the goal being met.";
+  return [
+    `GOAL (unchanged): ${goal}`,
+    "",
+    `${ended} Continue now — this is round-after-round work, not a check-in.`,
+    "",
+    "- Take the highest-value untested surface or the strongest open lead and work it.",
+    "- Do not summarise what you have done, do not restate the plan, do not ask which direction to take.",
+    "- Record findings, boundaries and residual state in the engagement directory as you go.",
+    "",
+    "End the goal only with `GOAL ACHIEVED — <proof>`, `GOAL IMPOSSIBLE — <the closed boundary>`,",
+    "or `GOAL BLOCKED — <the one question only I can answer>`. Otherwise keep working.",
+  ].join("\n");
+}
+
+function goalPushback(goal: string, kind: "achieved" | "impossible", reason: string): string {
+  const head = kind === "achieved"
+    ? "You reported the goal as achieved, but that does not hold up on review"
+    : "You reported the goal as impossible, but that does not hold up on review";
+  return [
+    `GOAL (unchanged): ${goal}`,
+    "",
+    `${head}: ${reason || "the evidence does not demonstrate it"}.`,
+    "",
+    kind === "achieved"
+      ? "Close the gap: demonstrate the goal end to end with evidence, or keep working until you can."
+      : "Try a route you have not tried. A boundary you met once with one technique is not a closed boundary — change the technique, the vector, the role, or the asset.",
+    "",
+    "Do not repeat the same claim without new evidence behind it.",
+  ].join("\n");
+}
+
+/// Send the next round of a goal on the same thread.
+async function goalContinue(session: Session, text: string) {
+  if (!session.threadId) { endGoal(session, "stopped"); return; }
+  const plan = session.auto ? autoPlan(session.goal?.text || "", session.escalation, session) : null;
+  const model = plan?.model ?? session.model ?? state.model;
+  const effort = plan?.effort ?? session.effort ?? state.effort;
+  if (plan) session.autoModel = plan.model;
+  const note = el("div", "auto-note");
+  note.innerHTML = `◎ <b>Goal</b> · round ${(session.goal?.turns ?? 0) + 1} of ${session.goal?.max ?? GOAL_MAX_TURNS} <span class="am-keep">· continuing, context kept</span>`;
+  session.turnsEl.appendChild(note);
+  scrollToBottom();
+  setSessionRunning(session, true);
+  try {
+    await invoke("send_message", {
+      args: {
+        thread_id: session.threadId,
+        text,
+        working_dir: session.workingDir,
+        model,
+        provider: session.provider,
+        effort,
+        mode: session.mode,
+        role: session.role,
+        images: [],
+      },
+    });
+  } catch (e) {
+    setSessionRunning(session, false);
+    addError(session, String(e));
+    endGoal(session, "stopped");
+  }
+}
+
 async function afterTurn(session: Session, answer: string | undefined | null) {
+  // A goal owns what happens after a turn: it sends the next round itself, and
+  // letting the Auto escalator also decide would mean two continuations racing
+  // on one thread.
+  if (session.goal?.running) { await goalStep(session, answer); return; }
   const escalated = await maybeEscalate(session, answer);
   if (!escalated) await maybePhaseHandover(session, answer);
 }

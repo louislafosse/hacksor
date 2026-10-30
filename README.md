@@ -48,6 +48,11 @@ locally.
 - Custom standing instructions and personality presets (cynic, robot, nerd,
   mentor).
 - Automatic context compaction from the harness, so long engagements keep going.
+- `/goal <objective>` puts a chat in goal mode: the end of a turn stops being a
+  stopping point, and each one that leaves the goal unmet is followed by the next
+  automatically. The agent ends it by reporting the goal achieved, impossible, or
+  blocked on a decision only you can make — and a claim of achieved or impossible is
+  challenged once against a verifier model before the run is allowed to stop.
 
 **Providers and models**
 - Every request routes through a local **OpenCodex** proxy that fronts 40+

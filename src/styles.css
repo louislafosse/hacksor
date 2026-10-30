@@ -1716,3 +1716,33 @@ input[type="checkbox"]:disabled { opacity: .4; cursor: default; }
 .pv-body .pv-code code { font-family: var(--font-mono); font-size: 12px; line-height: 1.55; }
 .pv-body.bubble { font-size: 13.5px; line-height: 1.6; }
 .pv-body.bubble > :first-child { margin-top: 0; }
+
+/* ---- goal bar (/goal): the objective a session is working toward ---- */
+.goalbar {
+  display: flex; align-items: center; gap: 9px;
+  margin: 0 auto 8px; max-width: 768px; padding: 7px 10px;
+  border-radius: 10px; font-size: 13px;
+  background: var(--muted); border: 1px solid var(--border);
+}
+.goalbar .g-icon { flex: none; color: var(--muted-foreground); font-family: var(--font-mono); }
+.goalbar .g-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.goalbar .g-state {
+  flex: none; font-size: 11.5px; font-family: var(--font-mono); color: var(--muted-foreground);
+}
+.goalbar .g-btn {
+  flex: none; border: none; background: transparent; color: var(--muted-foreground);
+  cursor: pointer; border-radius: 6px; padding: 3px 8px; font-size: 12px;
+}
+.goalbar .g-btn:hover { background: var(--accent); color: var(--foreground); }
+/* Running: the icon pulses, so a long round does not look like a stall. */
+.goalbar.live { border-color: color-mix(in srgb, var(--link-color) 45%, var(--border)); }
+.goalbar.live .g-icon { color: var(--link-color); animation: goal-pulse 1.8s ease-in-out infinite; }
+@keyframes goal-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) {
+  .goalbar.live .g-icon { animation: none; }
+}
+.goalbar.done.achieved { border-color: color-mix(in srgb, #51da4c 45%, var(--border)); }
+.goalbar.done.achieved .g-icon, .goalbar.done.achieved .g-state { color: #51da4c; }
+.goalbar.done.impossible .g-state, .goalbar.done.input .g-state { color: #d97706; }
+.goalbar.done.impossible { border-color: color-mix(in srgb, #d97706 40%, var(--border)); }
+.goalbar.done.input { border-color: color-mix(in srgb, #d97706 40%, var(--border)); }
