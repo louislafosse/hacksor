@@ -1,3 +1,15 @@
+# [1.17.0](https://github.com/louislafosse/hacksor/compare/v1.16.0...v1.17.0) (2026-10-30)
+
+
+### Bug Fixes
+
+* **prompt:** stop the briefing format from reading as permission to stop ([71c1a53](https://github.com/louislafosse/hacksor/commit/71c1a5350d9f9efcc7a8f554a711f35ceb7bf723))
+
+
+### Features
+
+* **goal:** keep a session working until the objective is met ([a935201](https://github.com/louislafosse/hacksor/commit/a935201135fc1598be15f8200bab3a904cd25cb3))
+
 # [1.16.0](https://github.com/louislafosse/hacksor/compare/v1.15.0...v1.16.0) (2026-10-29)
 
 
