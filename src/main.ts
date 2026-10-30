@@ -1012,6 +1012,16 @@ function onModelChanged() {
 // The composer's ⋯ menu is a React/shadcn dropdown; this keeps it in step with
 // the vanilla state that still owns effort and permission.
 let composerMenuRoot: import("react-dom/client").Root | null = null;
+/// What the composer menu shows for this chat's goal.
+function goalSummary() {
+  const g = activeSession()?.goal;
+  if (!g) return undefined;
+  const round = g.running
+    ? `${g.turns + 1}/${g.max}`
+    : ({ achieved: "achieved", impossible: "not possible", input: "needs you", stopped: "stopped", cap: "at cap" }[g.done || "stopped"]);
+  return { text: g.text, running: g.running, round };
+}
+
 function renderComposerMenu() {
   const host = document.getElementById("moremount");
   if (!host) return;
@@ -1032,6 +1042,10 @@ function renderComposerMenu() {
         perms: PERMS,
         permission: state.permission,
         onPermission: (v) => { state.permission = v as typeof state.permission; updateChips(); },
+        goal: goalSummary(),
+        onGoalNew: promptForGoal,
+        onGoalStop: () => { const s = activeSession(); if (s?.goal?.running) { endGoal(s, "stopped"); updateChips(); } },
+        onGoalResume: () => { const s = activeSession(); if (s) resumeGoal(s); },
       }),
     );
   })();
@@ -3857,16 +3871,7 @@ goalBar.addEventListener("click", (ev) => {
     persistOpenChats();
     renderGoalBar(session);
   } else if (b.dataset.a === "resume") {
-    // More rounds on the same goal: the count restarts so the cap means the
-    // same thing each time it is offered.
-    session.goal.running = true;
-    session.goal.turns = 0;
-    session.goal.challenges = 0;
-    session.goal.done = undefined;
-    persistOpenChats();
-    renderGoalBar(session);
-    addAutoNoteText(session, `◎ Resuming the goal for up to ${session.goal.max} more rounds.`);
-    void goalContinue(session, goalNudge(session.goal.text, null));
+    resumeGoal(session);
   }
 });
 
@@ -3880,6 +3885,36 @@ function withGoalPreamble(session: Session, body: string): string {
   if (!g) return body;
   session.pendingGoal = undefined;
   return `${startGoal(session, g)}\n\n${body}`;
+}
+
+/// Give a finished goal more rounds.
+///
+/// The round count restarts, so the cap means the same thing every time it is
+/// offered rather than the second run getting whatever was left of the first.
+function resumeGoal(session: Session) {
+  const g = session.goal;
+  if (!g || g.running) return;
+  g.running = true;
+  g.turns = 0;
+  g.challenges = 0;
+  g.done = undefined;
+  persistOpenChats();
+  renderGoalBar(session);
+  updateChips();
+  addAutoNoteText(session, `\u25ce Resuming the goal for up to ${g.max} more rounds.`);
+  void goalContinue(session, goalNudge(g.text, null));
+}
+
+/// Put the command in the composer rather than opening a dialog for it.
+///
+/// Typing the objective is the whole interaction, the composer is already the
+/// place for typing, and it leaves `/goal` in front of the user so the next
+/// one does not need the menu at all.
+function promptForGoal() {
+  input.value = "/goal ";
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+  input.dispatchEvent(new Event("input"));
 }
 
 /// Start a goal. Returns the preamble to send with the user's message.
