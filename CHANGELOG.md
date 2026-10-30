@@ -1,3 +1,10 @@
+# [1.18.0](https://github.com/louislafosse/hacksor/compare/v1.17.0...v1.18.0) (2026-10-30)
+
+
+### Features
+
+* **goal:** reach the goal from the menu, not just the command ([d3c0f50](https://github.com/louislafosse/hacksor/commit/d3c0f5077d332b406971894fcdd69e541967073e))
+
 # [1.17.0](https://github.com/louislafosse/hacksor/compare/v1.16.0...v1.17.0) (2026-10-30)
 
 
