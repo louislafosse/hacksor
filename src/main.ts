@@ -147,8 +147,29 @@ const SUGGESTIONS = [
 type ItemBlock = {
   root: HTMLElement;
   buffer: string;
-  setFinal?: (item: any) => void;
+  /// `final` is true only for `item/completed`. It matters for commands:
+  /// `item/started` reports status `inProgress` too, so the status alone
+  /// cannot tell a command still streaming from one left running in the
+  /// background after its tool call returned.
+  setFinal?: (item: any, final?: boolean) => void;
   appendDelta?: (s: string) => void;
+};
+
+/// One process still running after the tool call that started it returned.
+type BgJob = {
+  /// Keyed by codex's `processId` when it reports one, otherwise by the item
+  /// id, so a job is still tracked and shown when the id is absent.
+  key: string;
+  /// Only set when codex named the process. Without it there is nothing to
+  /// pass to `command/exec/terminate`, so the job can be shown but not killed.
+  processId?: string;
+  command: string;
+  startedMs: number;
+  /// The card that started it, so the strip can scroll to it and relabel it
+  /// once the process is gone.
+  card: HTMLElement;
+  /// Set while a terminate is in flight, so a second click does not re-send it.
+  killing?: boolean;
 };
 
 // What `branch_context` extracted for a branch: the file the agent can read,
@@ -216,6 +237,15 @@ interface Session {
   ledgerNotes?: string;
   cmdSig?: string;
   cmdRepeat?: number;
+  /// Processes the agent left running through unified exec, by codex processId.
+  /// A unified-exec process outlives the turn that started it, so these are the
+  /// only record the UI has of work still happening after a turn ends.
+  bgJobs?: Map<string, BgJob>;
+  /// Commands and findings recorded in the CURRENT turn, reset on turn/started.
+  /// Goal mode uses them to tell a round of work from a turn that stopped just
+  /// to write a finding up.
+  turnCommands?: number;
+  turnFindings?: number;
   /// An active `/goal`: the session keeps working until it is met.
   goal?: GoalState;
   /// A `/goal` whose instructions have not ridden out yet.
@@ -633,6 +663,7 @@ app.innerHTML = `
     <div class="composer-wrap">
       <button class="jump-latest" id="jumplatest" hidden title="Jump to latest">↓ Latest</button>
       <div class="goalbar" id="goalbar" hidden></div>
+      <div class="bgjobs" id="bgjobs" hidden></div>
       <div class="queue" id="queue" hidden></div>
       <div class="composer" id="composer">
         <div class="attachments" id="attachments" hidden></div>
@@ -1063,6 +1094,7 @@ function updateChips() {
   const engBtn = document.getElementById("engagementbtn");
   if (engBtn) engBtn.hidden = !(activeSession()?.ledgerHostDir || activeSession()?.ledgerDir);
   renderGoalBar(activeSession());
+  renderBgJobs(activeSession());
   renderComposerMenu();
   // Effort is auto-managed while Auto is on, so hide the (non-interactive) chip.
   renderContextMeter(activeSession());
@@ -2745,6 +2777,10 @@ function stopRun() {
   if (s.goal?.running) endGoal(s, "stopped");
   addAutoNoteText(s, "⏹ Stopped.");
   if (s.threadId) void invoke("interrupt", { threadId: s.threadId }).catch(() => {});
+  // Stop means stop: `turn/interrupt` unwinds the turn but leaves every
+  // unified-exec process alive, so a backgrounded scan kept running in the
+  // runtime after the UI said it had stopped.
+  void killAllBgJobs(s);
 }
 
 function addUserMessage(session: Session, text: string, atts: { name: string; isImage: boolean }[] = [], steer = false) {
@@ -4209,7 +4245,7 @@ function ensureBlock(session: Session, id: string, kind: string): ItemBlock {
   removeThinking(session);
   let b = session.blocks.get(id);
   if (b) return b;
-  b = createBlock(kind);
+  b = createBlock(session, kind);
   session.blocks.set(id, b);
   // Which prompt this block belongs to. Every block carries it, not just the
   // user messages: a tool-heavy turn can fill the whole rendered tail, so an
@@ -4426,7 +4462,182 @@ function flushRestoredHighlights(fromTop: boolean) {
   for (const bubble of picked) upgradeHighlightNow(bubble);
 }
 
-function createBlock(kind: string): ItemBlock {
+// ---- background jobs: processes that outlive the turn that started them ----
+//
+// Unified exec hands the model a PTY it can leave running and come back to, so
+// `item/completed` can arrive with status `inProgress` and a live `processId`.
+// Nothing used to distinguish that from a command the turn was still streaming:
+// both read "running…", and after the turn ended the card sat there claiming to
+// run with no way to tell whether anything was still happening or to stop it.
+
+const bgJobsBar = document.getElementById("bgjobs") as HTMLDivElement;
+
+function bgJobsOf(session: Session): Map<string, BgJob> {
+  if (!session.bgJobs) session.bgJobs = new Map();
+  return session.bgJobs;
+}
+
+/// Turn a finished-but-still-running command card into a background job card.
+function markBackground(session: Session, card: HTMLElement, status: HTMLElement, item: any) {
+  const pid: string | undefined = item.processId ? String(item.processId) : undefined;
+  const key = pid ?? String(item.id ?? "");
+  if (!key) return;
+
+  status.textContent = "background";
+  status.className = "status bg";
+  card.classList.add("bg-live");
+
+  const jobs = bgJobsOf(session);
+  const existing = jobs.get(key);
+  if (existing) { existing.card = card; renderBgJobs(session); return; }
+  jobs.set(key, { key, processId: pid, command: item.command || "", startedMs: Date.now(), card });
+
+  // Named inside the card too: the strip says how many are running, the card
+  // says which command it was. The kill is only offered when codex named the
+  // process, because that id is the only thing terminate can address.
+  if (!card.querySelector(".bg-note")) {
+    const note = el("div", "bg-note");
+    note.innerHTML =
+      `<span class="bg-dot"></span>` +
+      `<span class="bg-msg">Still running in the background${pid ? ` · process ${escapeHtml(pid)}` : ""}</span>`;
+    if (pid) {
+      const kill = el("button", "bg-kill", "⏹ Stop");
+      kill.onclick = (e) => { e.stopPropagation(); void killBgJob(session, key); };
+      note.appendChild(kill);
+    }
+    card.appendChild(note);
+  }
+  renderBgJobs(session);
+}
+
+/// Drop a job once its process is gone, whether it exited or was killed.
+function clearBackground(session: Session, processId: string | undefined, card?: HTMLElement) {
+  const jobs = session.bgJobs;
+  if (!jobs?.size && !card) return;
+  // A completed item identifies its job by process id when there is one, but
+  // the card is what the non-id case has to match on.
+  let key: string | undefined = processId ? String(processId) : undefined;
+  if ((!key || !jobs?.has(key)) && card) {
+    for (const [k, job] of jobs ?? []) if (job.card === card) { key = k; break; }
+  }
+  const host = card ?? (key ? jobs?.get(key)?.card : undefined);
+  if (host) {
+    host.classList.remove("bg-live");
+    host.querySelector(".bg-note")?.remove();
+  }
+  if (key) jobs?.delete(key);
+  renderBgJobs(session);
+}
+
+/// Ask codex to kill one job. Best effort: `command/exec/terminate` addresses
+/// processes by the id codex reported, and a job it never named cannot be
+/// stopped from here at all — the UI says so rather than pretending.
+async function killBgJob(session: Session, key: string) {
+  const job = session.bgJobs?.get(key);
+  if (!job || job.killing) return;
+  if (!job.processId) {
+    addAutoNoteText(session, "⚠ That job has no process id from codex, so it cannot be stopped from here.");
+    return;
+  }
+  job.killing = true;
+  const msg = job.card.querySelector(".bg-msg");
+  if (msg) msg.textContent = "Stopping…";
+  renderBgJobs(session);
+  try {
+    await invoke("terminate_process", { processId: job.processId });
+  } catch (e) {
+    job.killing = false;
+    if (msg) msg.textContent = `Still running in the background · process ${job.processId}`;
+    addError(session, `Could not stop that background job (process ${job.processId}): ${String(e)}`);
+    renderBgJobs(session);
+    return;
+  }
+  addAutoNoteText(session, `⏹ Stopped background job: ${job.command || job.processId}`);
+  clearBackground(session, job.processId, job.card);
+}
+
+/// Terminate every live job of a session. Used by Stop, and reported once
+/// rather than once per process. What could not be stopped is named, so a
+/// scan still running in the runtime is never silently left behind.
+async function killAllBgJobs(session: Session) {
+  const jobs = [...(session.bgJobs?.values() ?? [])];
+  if (!jobs.length) return;
+  let stopped = 0;
+  const left: string[] = [];
+  for (const job of jobs) {
+    if (!job.processId) { left.push(job.command || job.key); continue; }
+    try {
+      await invoke("terminate_process", { processId: job.processId });
+      stopped++;
+      clearBackground(session, job.processId, job.card);
+    } catch {
+      left.push(`${job.command || job.processId} (process ${job.processId})`);
+    }
+  }
+  if (stopped) addAutoNoteText(session, `⏹ Stopped ${stopped} background job${stopped === 1 ? "" : "s"}.`);
+  if (left.length) {
+    addAutoNoteText(
+      session,
+      `⚠ ${left.length} background job${left.length === 1 ? "" : "s"} could not be stopped and may still be running: ${left.join(", ")}`,
+    );
+  }
+  renderBgJobs(session);
+}
+
+// Keeps the elapsed time honest once the turn is over and no events arrive.
+let bgJobsTick = 0;
+
+function renderBgJobs(session: Session | undefined) {
+  if (!session || session.id !== state.activeSessionId) return;
+  const jobs = [...(session.bgJobs?.values() ?? [])];
+  if (!jobs.length) {
+    bgJobsBar.hidden = true;
+    bgJobsBar.innerHTML = "";
+    if (bgJobsTick) { clearInterval(bgJobsTick); bgJobsTick = 0; }
+    return;
+  }
+  if (!bgJobsTick) bgJobsTick = window.setInterval(() => renderBgJobs(activeSession()), 1000);
+  bgJobsBar.hidden = false;
+  const one = jobs.length === 1 ? jobs[0] : undefined;
+  const label = one
+    ? `${one.command.slice(0, 80) || one.processId || one.key}${one.killing ? " · stopping…" : ""}`
+    : `${jobs.length} background jobs running`;
+  bgJobsBar.className = "bgjobs live";
+  bgJobsBar.innerHTML =
+    `<span class="bg-icon">⏵</span>` +
+    `<span class="bg-text" title="${escapeHtml(jobs.map((j) => j.command || j.processId || j.key).join("\n"))}">${escapeHtml(label)}</span>` +
+    `<span class="bg-age">${Math.max(1, Math.round((Date.now() - Math.min(...jobs.map((j) => j.startedMs))) / 1000))}s</span>` +
+    `<button class="bg-btn" id="bgjobs-stop">⏹ Stop ${jobs.length > 1 ? "all" : ""}</button>`;
+  const btn = bgJobsBar.querySelector("#bgjobs-stop") as HTMLButtonElement | null;
+  if (btn) btn.onclick = () => void killAllBgJobs(session);
+}
+
+// A finding the agent just recorded, pulled out of the `hacksor-findings add`
+// it ran. Severity and title are the two things worth seeing at a glance while
+// scrolling an engagement; the rest stays in the ledger and the report.
+interface ParsedFinding { title: string; severity: string; cvss: string; url: string; }
+function parseFindingAdd(cmd: string): ParsedFinding | null {
+  if (!/\bhacksor-findings\b[\s\S]*\badd\b/.test(cmd)) return null;
+  // Values may be quoted (single or double) or bare.
+  const grab = (flags: string[]): string => {
+    for (const f of flags) {
+      const re = new RegExp(`${f}\\s+(?:"([^"]*)"|'([^']*)'|(\\S+))`);
+      const m = cmd.match(re);
+      if (m) return (m[1] ?? m[2] ?? m[3] ?? "").trim();
+    }
+    return "";
+  };
+  const title = grab(["-t", "--title"]);
+  if (!title) return null;
+  return {
+    title,
+    severity: grab(["-s", "--severity"]).toLowerCase(),
+    cvss: grab(["--cvss"]),
+    url: grab(["-u", "--url"]),
+  };
+}
+
+function createBlock(session: Session, kind: string): ItemBlock {
   if (kind === "agentMessage") {
     const m = el("div", "msg assistant");
     const bubble = el("div", "bubble");
@@ -4488,30 +4699,6 @@ function createBlock(kind: string): ItemBlock {
     };
     return b;
   }
-// A finding the agent just recorded, pulled out of the `hacksor-findings add`
-// it ran. Severity and title are the two things worth seeing at a glance while
-// scrolling an engagement; the rest stays in the ledger and the report.
-interface ParsedFinding { title: string; severity: string; cvss: string; url: string; }
-function parseFindingAdd(cmd: string): ParsedFinding | null {
-  if (!/\bhacksor-findings\b[\s\S]*\badd\b/.test(cmd)) return null;
-  // Values may be quoted (single or double) or bare.
-  const grab = (flags: string[]): string => {
-    for (const f of flags) {
-      const re = new RegExp(`${f}\\s+(?:"([^"]*)"|'([^']*)'|(\\S+))`);
-      const m = cmd.match(re);
-      if (m) return (m[1] ?? m[2] ?? m[3] ?? "").trim();
-    }
-    return "";
-  };
-  const title = grab(["-t", "--title"]);
-  if (!title) return null;
-  return {
-    title,
-    severity: grab(["-s", "--severity"]).toLowerCase(),
-    cvss: grab(["--cvss"]),
-    url: grab(["-u", "--url"]),
-  };
-}
 
 function findingCard(f: ParsedFinding): HTMLElement {
   const sev = ["critical", "high", "medium", "low", "info"].includes(f.severity) ? f.severity : "info";
@@ -4575,7 +4762,7 @@ function findingCard(f: ParsedFinding): HTMLElement {
         pending += s;
         if (!raf) raf = requestAnimationFrame(flush);
       },
-      setFinal: (item) => {
+      setFinal: (item, final) => {
         if (raf) { cancelAnimationFrame(raf); raf = 0; }
         pending = "";
         if (item.command) {
@@ -4594,8 +4781,14 @@ function findingCard(f: ParsedFinding): HTMLElement {
         const code = item.exitCode, st = item.status;
         if (st === "failed" || (typeof code === "number" && code !== 0)) { status.textContent = `exit ${code ?? "?"}`; status.className = "status fail"; }
         else if (st === "declined") { status.textContent = "declined"; status.className = "status fail"; }
+        // `inProgress` on a COMPLETED item is the background case: the tool
+        // call returned and the process is still alive. On `item/started` the
+        // same status just means the command is streaming, which is why both
+        // used to read "running…" and a backgrounded scan looked identical to
+        // one the turn was still waiting on.
+        else if (st === "inProgress" && final) markBackground(session, card, status, item);
         else if (st === "inProgress") { status.textContent = "running…"; status.className = "status running"; }
-        else { status.textContent = `exit ${code ?? 0}`; status.className = "status ok"; }
+        else { status.textContent = `exit ${code ?? 0}`; status.className = "status ok"; clearBackground(session, item.processId, card); }
       },
     };
     return b;
@@ -4748,6 +4941,8 @@ listen<Notif>("hacksor://event", (evt) => {
     case "turn/started":
       setSessionRunning(session, true);
       session.sawOutputThisTurn = false;
+      session.turnCommands = 0;
+      session.turnFindings = 0;
       session.turnStartMs = Date.now();
       // The model this turn actually used: in Auto it's the auto-picked model
       // (tracked in autoModel), not the composer's state.model.
@@ -4805,6 +5000,15 @@ listen<Notif>("hacksor://event", (evt) => {
       break;
     }
     case "item/commandExecution/outputDelta": session.sawOutputThisTurn = true; ensureBlock(session, params.itemId, "commandExecution").appendDelta?.(params.delta); break;
+    // Input the agent writes into a process it left running. Unhandled, a
+    // background job's card showed output with no sign of what was typed into
+    // it, so an interactive session (msfconsole, a shell, sqlmap prompts) read
+    // as output appearing from nowhere. Echoed the way a terminal would.
+    case "item/commandExecution/terminalInteraction": {
+      const b = ensureBlock(session, params.itemId, "commandExecution");
+      if (typeof params.stdin === "string" && params.stdin.length) b.appendDelta?.(params.stdin);
+      break;
+    }
     case "item/started":
     case "item/completed": {
       const item = params.item;
@@ -4816,9 +5020,16 @@ listen<Notif>("hacksor://event", (evt) => {
       // Feed the context estimate from what actually passed through this turn:
       // assistant text, reasoning, and tool output all occupy the window.
       addCtxChars(session, item);
-      ensureBlock(session, item.id, item.type).setFinal?.(item);
+      // Only the live path reports completion: a command replayed from a
+      // transcript is not still running no matter what its saved status says.
+      ensureBlock(session, item.id, item.type).setFinal?.(item, method === "item/completed");
       if (method === "item/completed" && item.type === "commandExecution") {
         checkDoomLoop(session, item.command || "");
+        // Counted for goal mode: how much of this turn was work and how much
+        // of it was writing findings up. Recording a finding is itself a
+        // command, so it is not counted as work.
+        if (parseFindingAdd(item.command || "")) session.turnFindings = (session.turnFindings ?? 0) + 1;
+        else session.turnCommands = (session.turnCommands ?? 0) + 1;
       }
       // The agent can move the engagement by naming the new directory in its
       // reply; the UI follows so the panel opens what was asked for.

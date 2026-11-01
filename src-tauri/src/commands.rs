@@ -1458,6 +1458,16 @@ pub async fn interrupt(app: AppHandle, state: State<'_, AppState>, thread_id: St
 }
 
 #[tauri::command]
+pub async fn terminate_process(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    process_id: String,
+) -> Result<(), String> {
+    let harness = ensure_harness(&state, &app).await?;
+    harness.terminate_process(&process_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn list_threads(
     app: AppHandle,
     state: State<'_, AppState>,

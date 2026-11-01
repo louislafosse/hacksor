@@ -91,6 +91,7 @@ pub fn run() {
             commands::start_chat,
             commands::send_message,
             commands::interrupt,
+            commands::terminate_process,
             commands::branch_context,
             commands::list_threads,
             commands::resume_thread,

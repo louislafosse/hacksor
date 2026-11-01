@@ -573,6 +573,19 @@ impl Harness {
         Ok(())
     }
 
+    /// Kill one process the agent started through unified exec.
+    ///
+    /// `turn/interrupt` unwinds the turn; a unified-exec process outlives it by
+    /// design, so a stop that only interrupts leaves a scan running in the
+    /// runtime with nothing on screen attached to it. Codex kills it by the
+    /// `processId` it reports on the commandExecution item.
+    pub async fn terminate_process(&self, process_id: &str) -> Result<()> {
+        self.request("command/exec/terminate", json!({ "processId": process_id }))
+            .await
+            .map_err(|e| anyhow!(e))?;
+        Ok(())
+    }
+
     /// Resolve an approval request identified by the opaque `token`.
     pub async fn resolve_approval(&self, token: &str, approve: bool) -> Result<()> {
         let id = self
