@@ -1,3 +1,15 @@
+# [1.19.0](https://github.com/louislafosse/hacksor/compare/v1.18.0...v1.19.0) (2026-11-01)
+
+
+### Bug Fixes
+
+* **goal:** a finding is not a round ([129b222](https://github.com/louislafosse/hacksor/commit/129b222fec64d7a61ded41eff635e5f31c82cb58))
+
+
+### Features
+
+* **jobs:** show and stop the scans that outlive their turn ([ad21d17](https://github.com/louislafosse/hacksor/commit/ad21d1701d3dee6fd3b1e962f576b1da92f3cf5c))
+
 # [1.18.0](https://github.com/louislafosse/hacksor/compare/v1.17.0...v1.18.0) (2026-10-30)
 
 
