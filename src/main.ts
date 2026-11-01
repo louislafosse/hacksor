@@ -3807,6 +3807,8 @@ type GoalState = {
   running: boolean;
   /// Pushbacks spent on a premature "achieved"/"impossible", capped.
   challenges: number;
+  /// Turns sent on uncharged because they only recorded a finding and stopped.
+  shallow?: number;
   done?: "achieved" | "impossible" | "input" | "stopped" | "cap";
   detail?: string;
 };
@@ -3815,6 +3817,10 @@ type GoalState = {
 // a runaway. Reaching it stops and offers more rather than deciding for you.
 const GOAL_MAX_TURNS = 40;
 const GOAL_MAX_CHALLENGES = 2;
+// How many times a goal will send a report-only turn back for depth without
+// charging it a round. Past this the turn counts, so a model that answers every
+// nudge with one more finding still ends.
+const GOAL_MAX_SHALLOW_ROUNDS = 8;
 
 const GOAL_MARKERS: { kind: "achieved" | "impossible" | "input"; re: RegExp }[] = [
   // Anchored to the start of a line, so the same words inside a sentence
@@ -3850,7 +3856,10 @@ function goalPreamble(goal: string, max: number): string {
     "",
     "While working toward it:",
     "- Pick the highest-value next action yourself, every time. Never ask which lead to follow.",
-    "- A confirmed finding is progress toward the goal, not the goal. Record it and move on.",
+    "- A confirmed finding is progress toward the goal, not the goal. Record it and KEEP WORKING",
+    "  in the same turn: finding one bug is not a reason to hand back. Go deeper on the surface",
+    "  that produced it — its siblings, its parameters, its auth path — and chain it toward the",
+    "  goal before you move on. Ending a turn to announce a single finding wastes a round.",
     "- A dead end is information. Record the boundary that closed it and take the next route.",
     "- Long-running work (a scan, a fuzz, a crawl) is started and worked around, not waited on idly.",
     "- Keep the engagement directory current as you go; it is what survives a compaction.",
@@ -4009,6 +4018,27 @@ async function goalStep(session: Session, answer: string | undefined | null) {
     return;
   }
 
+  // A turn that recorded findings and then stopped is bookkeeping, not a round
+  // of work: the model treats writing a finding up as a natural place to hand
+  // back, and every one of those used to spend a round out of the budget. The
+  // budget is there to bound real rounds, so these are sent on uncharged and
+  // told to go deeper instead. Bounded, so a model that only ever reports
+  // cannot keep this up forever.
+  const findings = session.turnFindings ?? 0;
+  const worked = session.turnCommands ?? 0;
+  const reportedAndStopped = findings > 0 && worked <= findings;
+  if (reportedAndStopped && (g.shallow ?? 0) < GOAL_MAX_SHALLOW_ROUNDS) {
+    g.shallow = (g.shallow ?? 0) + 1;
+    persistOpenChats();
+    renderGoalBar(session);
+    addAutoNoteText(
+      session,
+      `◎ That turn recorded ${findings} finding${findings === 1 ? "" : "s"} and stopped — going deeper on the same surface instead of spending a round.`,
+    );
+    await goalContinue(session, goalDepthNudge(g.text, findings));
+    return;
+  }
+
   if (g.turns + 1 >= g.max) { endGoal(session, "cap"); return; }
   g.turns++;
   persistOpenChats();
@@ -4045,6 +4075,29 @@ function goalNudge(goal: string, lastAnswer: string | null): string {
     "- Take the highest-value untested surface or the strongest open lead and work it.",
     "- Do not summarise what you have done, do not restate the plan, do not ask which direction to take.",
     "- Record findings, boundaries and residual state in the engagement directory as you go.",
+    "",
+    "End the goal only with `GOAL ACHIEVED — <proof>`, `GOAL IMPOSSIBLE — <the closed boundary>`,",
+    "or `GOAL BLOCKED — <the one question only I can answer>`. Otherwise keep working.",
+  ].join("\n");
+}
+
+/// Sent when a turn recorded a finding and stopped. The point is depth on the
+/// surface that just produced something, not a fresh survey: a finding is
+/// evidence that the surface is weak, and the next bug is usually next to it.
+function goalDepthNudge(goal: string, findings: number): string {
+  return [
+    `GOAL (unchanged): ${goal}`,
+    "",
+    `You recorded ${findings === 1 ? "a finding" : `${findings} findings`} and ended the turn. Recording is not a stopping`,
+    "point — it is a side effect of working. Keep going now, in the same turn-length of effort.",
+    "",
+    "- Go DEEPER on the surface that just produced it before you move anywhere else.",
+    "  One finding on an endpoint means that endpoint, its siblings, its parameters and",
+    "  its auth path are all worth testing. Exhaust it.",
+    "- Chain it: what does this finding give you access to that you did not have before?",
+    "  Escalate it toward the goal rather than filing it and starting over somewhere else.",
+    "- Only when that surface is genuinely exhausted, take the next highest-value one.",
+    "- Do not summarise, do not restate the plan, do not ask which lead to follow.",
     "",
     "End the goal only with `GOAL ACHIEVED — <proof>`, `GOAL IMPOSSIBLE — <the closed boundary>`,",
     "or `GOAL BLOCKED — <the one question only I can answer>`. Otherwise keep working.",
