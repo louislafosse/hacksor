@@ -1,3 +1,10 @@
+## [1.20.1](https://github.com/louislafosse/hacksor/compare/v1.20.0...v1.20.1) (2026-11-08)
+
+
+### Bug Fixes
+
+* **runtime:** start even when a host service already holds the proxy port ([4078e97](https://github.com/louislafosse/hacksor/commit/4078e97308b603a610211a6a5acf4e23e88c8ccb))
+
 # [1.20.0](https://github.com/louislafosse/hacksor/compare/v1.19.0...v1.20.0) (2026-11-08)
 
 
