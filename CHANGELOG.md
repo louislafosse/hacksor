@@ -1,3 +1,10 @@
+# [1.21.0](https://github.com/louislafosse/hacksor/compare/v1.20.2...v1.21.0) (2026-11-08)
+
+
+### Features
+
+* **prompt:** turn a tech fingerprint into targets, not trivia ([ffbcff7](https://github.com/louislafosse/hacksor/commit/ffbcff71df5e27af1d7aaa1ef5ba561edde95116))
+
 ## [1.20.2](https://github.com/louislafosse/hacksor/compare/v1.20.1...v1.20.2) (2026-11-08)
 
 
