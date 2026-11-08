@@ -1789,3 +1789,19 @@ input[type="checkbox"]:disabled { opacity: .4; cursor: default; }
 @media (prefers-reduced-motion: reduce) {
   .bgjobs .bg-icon, .bg-note .bg-dot { animation: none; }
 }
+
+/* Re-authentication inside a chat: the sign-in page opens in the browser and
+   the code comes back here, so the whole repair happens without leaving the
+   window. Sits inside an .auto-note, hence the inherited width. */
+.reauth-box { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.reauth-hint { font-size: 11.5px; color: var(--muted-foreground); }
+.reauth-link { font-size: 11.5px; color: var(--muted-foreground); text-decoration: underline; width: fit-content; }
+.reauth-link:hover { color: var(--foreground); }
+.reauth-row { display: flex; gap: 6px; align-items: center; }
+.reauth-code {
+  flex: 1; min-width: 0; border: 1px solid var(--border); background: var(--background);
+  color: var(--foreground); border-radius: 7px; padding: 5px 8px; font-size: 11.5px;
+  font-family: var(--font-mono, monospace);
+}
+.reauth-code:focus { outline: none; border-color: var(--ring, var(--muted-foreground)); }
+.reauth-row .msg-act { border: 1px solid var(--border); }

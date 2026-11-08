@@ -3259,6 +3259,25 @@ async function noteEmptyResponse(session: Session, _sinceMs: number, requested?:
   // Name the model the turn actually used (what we sent = what declined). Don't
   // correlate against the usage log — it can grab a later/unrelated request.
   const name = requested || session.turnModel || "The model";
+
+  // An empty turn and a declined turn look identical from here, and a provider
+  // whose stored login needs re-authenticating produces empty turns forever.
+  // Blaming the model for that sends the user off changing models while the
+  // real cause sits in the credential, so the account is checked first and
+  // only a healthy one earns the "it declined" reading.
+  try {
+    const st = await invoke<OcxAuthState>("ocx_auth_check", { provider: session.provider, repair: false });
+    if (st?.needs_reauth) {
+      const note = el("div", "auto-note flagged");
+      note.innerHTML = `<b>${escapeHtml(name)}</b> returned nothing because your <b>${escapeHtml(session.provider)}</b> login needs re-authenticating${st.detail ? ` (${escapeHtml(st.detail)})` : ""} — the upstream rejected the stored token's refresh. This is not the model declining the request, and another model on the same provider will do the same.`;
+      note.appendChild(document.createTextNode(" "));
+      note.appendChild(reauthButton(session, session.provider));
+      session.turnsEl.appendChild(note);
+      scrollToBottom();
+      return;
+    }
+  } catch { /* no opinion: fall through to the decline reading */ }
+
   const note = el("div", "auto-note flagged");
   note.innerHTML = `<b>${escapeHtml(name)}</b> returned an empty response — it declined this request. Some models refuse the offensive-security persona and reply with nothing; try a different model (or, in Auto, it will move on).`;
   session.turnsEl.appendChild(note);
@@ -3277,6 +3296,8 @@ interface OcxAuthState {
   logged_in: boolean;
   detail: string;
   restarted: boolean;
+  needs_reauth: boolean;
+  account_id: string;
   proxy_version: string;
   host_version: string;
 }
@@ -3292,7 +3313,7 @@ function noteOcxAuthError(session: Session, msg: string): boolean {
   (async () => {
     let st: OcxAuthState | null = null;
     try {
-      st = await invoke<OcxAuthState>("ocx_auth_check", { provider });
+      st = await invoke<OcxAuthState>("ocx_auth_check", { provider, repair: true });
     } catch { /* fall through to the raw advice */ }
     if (!st) {
       note.innerHTML = `OpenCodex refused the request for <b>${escapeHtml(provider)}</b>: ${escapeHtml(msg)}`;
@@ -3301,6 +3322,16 @@ function noteOcxAuthError(session: Session, msg: string): boolean {
     const skew = st.proxy_version && st.host_version && st.proxy_version !== st.host_version
       ? ` The proxy runs ocx ${escapeHtml(st.proxy_version)} while the host CLI is ${escapeHtml(st.host_version)}; both share <code>~/.opencodex</code>, and a refresh by one invalidates the other's token.`
       : "";
+    if (st.needs_reauth) {
+      // The credential is stored but its refresh was rejected upstream, so no
+      // restart and no resend can help: saying "send it again" here is what
+      // made this error repeat on every single message.
+      note.innerHTML = `Your <b>${escapeHtml(provider)}</b> login needs re-authenticating${st.detail ? ` (${escapeHtml(st.detail)})` : ""}. The stored token is still there but the upstream rejected its refresh, so restarting the proxy and resending cannot fix it — the account has to be signed in again.${skew}`;
+      note.appendChild(document.createTextNode(" "));
+      note.appendChild(reauthButton(session, provider));
+      scrollToBottom();
+      return;
+    }
     if (st.logged_in && st.restarted) {
       note.innerHTML = `Your <b>${escapeHtml(provider)}</b> login is still stored${st.detail ? ` (${escapeHtml(st.detail)})` : ""}, so this was not a missing login: the proxy was holding a token the upstream had stopped accepting. Restarted it — send the message again.${skew}`;
       const b = el("button", "msg-act", "↻ Resend");
@@ -3319,6 +3350,68 @@ function noteOcxAuthError(session: Session, msg: string): boolean {
     scrollToBottom();
   })();
   return true;
+}
+
+/// Drive `ocx account reauth` from the chat: open the sign-in page, then take
+/// the code the browser ends on. The code goes to ocx through stdin, so it
+/// never lands in a process listing.
+function reauthButton(session: Session, provider: string): HTMLButtonElement {
+  const b = el("button", "msg-act", "↻ Sign in again");
+  b.onclick = async () => {
+    b.disabled = true;
+    b.textContent = "Opening sign-in…";
+    let url = "";
+    try {
+      url = await invoke<string>("ocx_reauth_start", { provider });
+    } catch (err) {
+      b.disabled = false;
+      b.textContent = "↻ Sign in again";
+      addError(session, `Could not start the ${provider} login: ${String(err)}`);
+      return;
+    }
+    b.remove();
+
+    const box = el("div", "reauth-box");
+    const link = el("a", "reauth-link", "Open the sign-in page again") as HTMLAnchorElement;
+    link.href = url;
+    link.target = "_blank";
+    box.appendChild(el("div", "reauth-hint", "Signed in? Paste the code — or the whole redirect URL — from the browser:"));
+    box.appendChild(link);
+    const row = el("div", "reauth-row");
+    const field = el("input", "reauth-code") as HTMLInputElement;
+    field.type = "text";
+    field.placeholder = "code or redirect URL";
+    field.autocomplete = "off";
+    field.spellcheck = false;
+    const send = el("button", "msg-act", "Finish");
+    const submit = async () => {
+      const code = field.value.trim();
+      if (!code) { flash(send, "Paste the code first"); return; }
+      send.disabled = true;
+      field.disabled = true;
+      send.textContent = "Checking…";
+      try {
+        await invoke<string>("ocx_reauth_submit", { provider, code });
+        box.replaceChildren(el("div", "reauth-hint", `✓ ${provider} is signed in again and the proxy was restarted. Resend your message.`));
+        // The code is short-lived and now spent; don't leave it on screen.
+        field.value = "";
+      } catch (err) {
+        send.disabled = false;
+        field.disabled = false;
+        send.textContent = "Finish";
+        addError(session, `${provider} re-authentication failed: ${String(err)}`);
+      }
+    };
+    send.onclick = submit;
+    field.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); void submit(); } };
+    row.appendChild(field);
+    row.appendChild(send);
+    box.appendChild(row);
+    (b.parentElement ?? session.turnsEl).appendChild(box);
+    field.focus();
+    scrollToBottom();
+  };
+  return b;
 }
 
 function ocxDashboardButton(): HTMLButtonElement {

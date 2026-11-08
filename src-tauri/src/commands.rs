@@ -546,6 +546,12 @@ pub struct OcxAuthState {
     pub detail: String,
     /// True when the proxy was restarted to drop the credential it was holding.
     pub restarted: bool,
+    /// True when the stored credential's refresh was rejected upstream. No
+    /// restart can fix that — the account has to be logged in again — so this
+    /// is what decides whether "send it again" is honest advice or a loop.
+    pub needs_reauth: bool,
+    /// ocx's id for the stored account, to reauth that one specifically.
+    pub account_id: String,
     /// ocx serving the proxy, and the host CLI, when both exist. Two different
     /// versions sharing `~/.opencodex` is its own source of auth flapping, so
     /// it is worth naming rather than leaving the user to guess.
@@ -572,13 +578,30 @@ fn safe_provider_name(raw: &str) -> Option<String> {
 ///
 /// A paused account is deliberately out of rotation: restarting the proxy would
 /// not bring it back, so it counts as not usable and is reported as it is.
-fn parse_account_row(listing: &str, name: &str) -> Option<(String, bool)> {
-    listing
+struct AccountRow {
+    row: String,
+    active: bool,
+    /// The stored credential is there but its refresh was rejected, so only an
+    /// interactive login can repair it. ocx prints this as the `needs-reauth`
+    /// status and follows it with the exact command to run.
+    needs_reauth: bool,
+    /// ocx's own id for the account, needed to reauth the right one.
+    id: String,
+}
+
+fn parse_account_row(listing: &str, name: &str) -> Option<AccountRow> {
+    let row = listing
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .find(|l| l.split_whitespace().next() == Some(name))
-        .map(|row| (row.to_string(), !row.contains("paused")))
+        .find(|l| l.split_whitespace().next() == Some(name))?;
+    // PROVIDER TYPE ID PLAN/LABEL PRIORITY STATUS…
+    let id = row.split_whitespace().nth(2).unwrap_or_default().to_string();
+    // The follow-up line ("refresh failed. Next: ocx account reauth …") is part
+    // of the same output, so the whole listing is searched, not just the row.
+    let low = listing.to_lowercase();
+    let needs_reauth = low.contains("needs-reauth") || low.contains("refresh failed");
+    Some(AccountRow { row: row.to_string(), active: !row.contains("paused"), needs_reauth, id })
 }
 
 /// Recover from OpenCodex's "run `ocx login <provider>`" error.
@@ -598,7 +621,14 @@ fn parse_account_row(listing: &str, name: &str) -> Option<(String, bool)> {
 /// So: ask ocx whether an account is still stored, and if one is, restart the
 /// proxy so the next request resolves the credential afresh.
 #[tauri::command]
-pub async fn ocx_auth_check(state: State<'_, AppState>, provider: String) -> Result<OcxAuthState, String> {
+pub async fn ocx_auth_check(
+    state: State<'_, AppState>,
+    provider: String,
+    // `repair`: whether a stale-token restart may be attempted. The error path
+    // wants the repair; a caller only asking "is this account healthy?" (an
+    // empty turn, say) must not restart the proxy as a side effect of looking.
+    repair: Option<bool>,
+) -> Result<OcxAuthState, String> {
     let Some(name) = safe_provider_name(&provider) else {
         return Err(format!("Not a provider name: {provider}"));
     };
@@ -609,9 +639,11 @@ pub async fn ocx_auth_check(state: State<'_, AppState>, provider: String) -> Res
     // A non-zero exit (no such provider configured) is a "no account" answer,
     // not a failure to report.
     let listing = run_ocx(&["account", "current", &name], None, docker).await.unwrap_or_default();
-    if let Some((row, active)) = parse_account_row(&listing, &name) {
-        out.detail = row;
-        out.logged_in = active;
+    if let Some(acc) = parse_account_row(&listing, &name) {
+        out.detail = acc.row;
+        out.logged_in = acc.active;
+        out.needs_reauth = acc.needs_reauth;
+        out.account_id = acc.id;
     }
 
     out.proxy_version = run_ocx(&["--version"], None, docker)
@@ -627,11 +659,161 @@ pub async fn ocx_auth_check(state: State<'_, AppState>, provider: String) -> Res
         }
     }
 
-    if out.logged_in {
+    // Restarting drops the token the proxy was holding so the next request
+    // resolves it afresh — which fixes a stale copy, and does nothing at all
+    // for a credential whose refresh the upstream has rejected. Restarting in
+    // that case is what turns one auth failure into the same message on every
+    // send, so it is skipped and the UI asks for a login instead.
+    if out.logged_in && !out.needs_reauth && repair.unwrap_or(true) {
         restart_opencodex(&state).await;
         out.restarted = opencodex_up().await;
     }
     Ok(out)
+}
+
+/// Where the pending reauth flow's output is kept, to read the URL back out.
+const OCX_REAUTH_LOG: &str = "/tmp/hacksor-ocx-reauth.log";
+
+/// Begin an interactive re-login for one upstream and return the URL to open.
+///
+/// `ocx account reauth` prints a sign-in URL and then waits on stdin for the
+/// code, so it cannot simply be run and read: with stdin closed it exits before
+/// anything can be submitted. It is started with stdin held open by a long
+/// `sleep`, which keeps the flow pending while the user signs in, and the code
+/// is delivered separately by `ocx account code` (which submits to the pending
+/// flow rather than to this process).
+///
+/// A flow left pending from an earlier attempt makes the next one fail with
+/// "the selected target refused a conflicting change", so any pending flow is
+/// cancelled first.
+#[tauri::command]
+pub async fn ocx_reauth_start(state: State<'_, AppState>, provider: String) -> Result<String, String> {
+    let Some(name) = safe_provider_name(&provider) else {
+        return Err(format!("Not a provider name: {provider}"));
+    };
+    let docker = docker_runtime(&state).await;
+
+    let listing = run_ocx(&["account", "current", &name], None, docker).await.unwrap_or_default();
+    let id = parse_account_row(&listing, &name).map(|a| a.id).unwrap_or_default();
+
+    let _ = run_ocx(&["account", "cancel", &name], None, docker).await;
+
+    if !docker {
+        // Host mode: ocx is a normal child process, so hold its stdin open by
+        // simply never writing to it and letting it live as long as the flow.
+        let bin = which_bin("ocx").ok_or_else(|| "OpenCodex (ocx) is not installed on the host.".to_string())?;
+        let mut cmd = tokio::process::Command::new(bin);
+        cmd.env("CODEX_HOME", ocx_codex_home(false));
+        cmd.args(["account", "reauth", &name]);
+        if !id.is_empty() {
+            cmd.args(["--id", &id]);
+        }
+        let out = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not start the login: {e}"))?
+            .wait_with_output()
+            .await
+            .map_err(|e| e.to_string())?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let url = first_url(&text).ok_or_else(|| {
+            format!("ocx did not print a sign-in URL: {}", truncate(text.trim(), 400))
+        })?;
+        // Opened here rather than handing the frontend a general-purpose URL
+        // opener: the only thing it can ever launch through this command is a
+        // sign-in page ocx itself just printed.
+        let _ = platform::open_url(&url);
+        return Ok(url);
+    }
+
+    let id_arg = if id.is_empty() { String::new() } else { format!(" --id {id}") };
+    let home = ocx_codex_home(true);
+    let _ = runtime::exec_detached(
+        RUNTIME_CONTAINER,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            // 15 minutes is longer than any sign-in takes and shorter than a
+            // forgotten process should live.
+            format!(
+                "mkdir -p {home} && export CODEX_HOME={home}; \
+                 sleep 900 | ocx account reauth {name}{id_arg} > {OCX_REAUTH_LOG} 2>&1"
+            ),
+        ],
+        exec_user(),
+    )
+    .await;
+
+    // The URL is printed as soon as the flow is registered; give it a few
+    // seconds and report what ocx said if it never arrives.
+    let mut last = String::new();
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Ok((text, _)) = runtime::exec_output(
+            RUNTIME_CONTAINER,
+            vec!["sh".into(), "-c".into(), format!("cat {OCX_REAUTH_LOG} 2>/dev/null")],
+            exec_user(),
+            None,
+        )
+        .await
+        {
+            if let Some(u) = first_url(&text) {
+                let _ = platform::open_url(&u);
+                return Ok(u);
+            }
+            last = text;
+        }
+    }
+    Err(format!(
+        "ocx did not print a sign-in URL: {}",
+        truncate(last.trim(), 400)
+    ))
+}
+
+/// The first http(s) URL in some output, with trailing punctuation trimmed.
+fn first_url(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|w| w.starts_with("http://") || w.starts_with("https://"))
+        .map(|u| u.trim_end_matches(['.', ',', ')', '"', '\'']).to_string())
+}
+
+/// Finish the re-login by submitting the code (or the whole redirect URL) the
+/// browser ended up with. Returns the account's status line afterwards, so the
+/// UI can say whether it actually took rather than claiming success blindly.
+#[tauri::command]
+pub async fn ocx_reauth_submit(
+    state: State<'_, AppState>,
+    provider: String,
+    code: String,
+) -> Result<String, String> {
+    let Some(name) = safe_provider_name(&provider) else {
+        return Err(format!("Not a provider name: {provider}"));
+    };
+    let code = code.trim().to_string();
+    if code.is_empty() {
+        return Err("Paste the code (or the whole redirect URL) from the browser first.".into());
+    }
+    let docker = docker_runtime(&state).await;
+    // Through stdin, never argv: ocx warns about that for exactly the reason
+    // that a short-lived credential should not land in a process listing.
+    run_ocx(&["account", "code", &name], Some(&code), docker).await?;
+
+    // ocx accepts the submission without judging it, so the only honest check
+    // is to read the account back.
+    let listing = run_ocx(&["account", "current", &name], None, docker).await.unwrap_or_default();
+    let still = parse_account_row(&listing, &name).map(|a| a.needs_reauth).unwrap_or(false);
+    if still {
+        return Err("ocx still reports this account as needing re-authentication — the code may have expired or belonged to a cancelled attempt. Start the login again.".into());
+    }
+    // The proxy is holding the credential that just got replaced.
+    restart_opencodex(&state).await;
+    Ok(listing.lines().take(2).collect::<Vec<_>>().join("\n"))
 }
 
 /// Make a configured provider the default upstream for OpenCodex.
@@ -5443,12 +5625,15 @@ mod transcript_tests {
 
     #[test]
     fn ocx_account_row_is_matched_on_the_provider_column() {
-        // Verbatim shape of `ocx account current anthropic` (2.88.0).
+        // Shape of `ocx account current anthropic` (2.88.0); the id is a
+        // placeholder of the real width.
         let listing = "PROVIDER   TYPE   ID                                PLAN/LABEL       PRIORITY  STATUS\n\
-                       anthropic  oauth  2f038da95488712dead06cf1004be7ce  l***8@gmail.com  -         active\n";
-        let (row, active) = parse_account_row(listing, "anthropic").unwrap();
-        assert!(row.starts_with("anthropic  oauth"));
-        assert!(active);
+                       anthropic  oauth  00000000000000000000000000000000  a***a@example.com  -       active\n";
+        let acc = parse_account_row(listing, "anthropic").unwrap();
+        assert!(acc.row.starts_with("anthropic  oauth"));
+        assert!(acc.active);
+        assert!(!acc.needs_reauth);
+        assert_eq!(acc.id, "00000000000000000000000000000000");
 
         // The header must never be mistaken for a row, and a different
         // provider's row must not answer for this one.
@@ -5457,9 +5642,45 @@ mod transcript_tests {
         assert!(parse_account_row("", "anthropic").is_none());
 
         // A paused account is stored but not usable.
-        let paused = "anthropic  oauth  abc  l***8@gmail.com  -  paused\n";
-        let (_, active) = parse_account_row(paused, "anthropic").unwrap();
-        assert!(!active);
+        let paused = "anthropic  oauth  abc  a***a@example.com  -  paused\n";
+        assert!(!parse_account_row(paused, "anthropic").unwrap().active);
+    }
+
+    #[test]
+    fn an_account_needing_reauth_is_not_reported_as_repairable() {
+        // Verbatim shape of what ocx prints once a refresh has been rejected:
+        // the account still reads "active", and the only usable signal is the
+        // `needs-reauth` status plus the follow-up line. Treating this as a
+        // healthy login is what made Hacksor restart the proxy and tell the
+        // user to resend, forever.
+        let listing = "PROVIDER   TYPE   ID                                PLAN/LABEL       PRIORITY  STATUS\n\
+                       anthropic  oauth  00000000000000000000000000000000  a***a@example.com  -       active needs-reauth\n\
+                       anthropic 00000000000000000000000000000000: refresh failed. Next: ocx account reauth anthropic --id 00000000000000000000000000000000\n";
+        let acc = parse_account_row(listing, "anthropic").unwrap();
+        assert!(acc.needs_reauth, "needs-reauth must be detected");
+        // Still "active" to ocx, which is exactly why `active` alone is not
+        // enough to decide whether a restart can help.
+        assert!(acc.active);
+        assert_eq!(acc.id, "00000000000000000000000000000000");
+
+        // The follow-up line alone (no status column) still counts.
+        let only_followup = "anthropic  oauth  abc  a***a@example.com  -  active\n\
+                             anthropic abc: refresh failed. Next: ocx account reauth anthropic --id abc\n";
+        assert!(parse_account_row(only_followup, "anthropic").unwrap().needs_reauth);
+    }
+
+    #[test]
+    fn a_sign_in_url_is_picked_out_of_ocx_output() {
+        let out = "Open this URL to sign in:\n\
+                   https://claude.ai/oauth/authorize?code=true&client_id=x&state=y\n\
+                   Complete Claude login in your browser.\n";
+        assert_eq!(
+            first_url(out).as_deref(),
+            Some("https://claude.ai/oauth/authorize?code=true&client_id=x&state=y")
+        );
+        // Trailing punctuation is not part of the URL.
+        assert_eq!(first_url("see https://example.com/a).").as_deref(), Some("https://example.com/a"));
+        assert!(first_url("Error: refresh failed. Next: ocx account reauth anthropic").is_none());
     }
 
     #[test]
