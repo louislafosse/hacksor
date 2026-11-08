@@ -177,10 +177,20 @@ The Docker runtime ships these on PATH (non-exhaustive):
   uncover, `cloudfish` (Cloudflare DNS-scanner subdomains, needs CF creds).
 - **Scanning:** nmap, naabu, masscan.
 - **Web probe / crawl / fuzz:** httpx-toolkit, katana, hakrawler, gau,
-  waybackurls, gobuster, feroxbuster, ffuf, arjun, gowitness, whatweb, wafw00f.
+  waybackurls, gobuster, feroxbuster, ffuf, arjun, paramspider, gowitness,
+  whatweb, wafw00f, puredns + massdns.
 - **Web vuln:** nuclei (templates pre-fetched), dalfox (XSS), sqlmap (SQLi),
   sstimap (SSTI), nikto, testssl.
-- **SAST / secrets:** semgrep, trufflehog, gitleaks.
+- **JavaScript analysis:** jsluice (AST-based URL/secret/param extraction),
+  sourcemapper (rebuild original sources from `.js.map`), subjs (collect script
+  URLs), wakaru and webcrack (unpack and unminify bundles), retire (known-
+  vulnerable libraries).
+- **SAST / secrets / supply chain:** semgrep, trufflehog, gitleaks, osv-scanner,
+  guarddog.
+- **Takeover / cache / GraphQL:** subjack, baddns, wcvs (web cache poisoning),
+  graphql-cop.
+- **Internet-wide pivots:** `hacksor-shodan` (favicon-hash discovery of staging
+  and origin hosts, keyless InternetDB lookups), uncover, shodan CLI.
 - **Reverse engineering:** rea (REA - binaries, JS/Electron bundles, .NET,
   APKs, firmware, pcaps), ghidra (decompiler, also REA's native backend),
   Unicorn (CPU emulation for shellcode and firmware), radare2.
@@ -191,7 +201,7 @@ The Docker runtime ships these on PATH (non-exhaustive):
 - **OOB / utility:** interactsh-client, socat, netcat, tcpdump, openssl, binwalk,
   exiftool, ripgrep, SecLists and wordlists under `/usr/share`.
 - **Hacksor CLIs:** hacksor-proxy, hacksor-findings, hacksor-session,
-  hacksor-subagent.
+  hacksor-subagent, hacksor-shodan.
 
 ## Install
 

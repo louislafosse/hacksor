@@ -77,7 +77,33 @@ RUN go install -v github.com/hahwul/dalfox/v2@latest 2>/dev/null; \
     go install -v github.com/gitleaks/gitleaks/v8@latest 2>/dev/null; \
     go install -v github.com/BishopFox/cloudfox@latest 2>/dev/null; \
     go install -v github.com/assetnote/kiterunner/cmd/kiterunner@latest 2>/dev/null; \
+    # JavaScript analysis. jsluice parses JS with tree-sitter instead of grepping
+    # it, so it finds URLs, paths, params and secrets that are assembled at
+    # runtime rather than spelled out; sourcemapper rebuilds the original source
+    # tree from a .js.map, which beats deobfuscating anything; subjs collects the
+    # script URLs to feed both.
+    go install -v github.com/BishopFox/jsluice/cmd/jsluice@latest 2>/dev/null; \
+    go install -v github.com/denandz/sourcemapper@latest 2>/dev/null; \
+    go install -v github.com/lc/subjs@latest 2>/dev/null; \
+    # Dependency vulnerabilities from a lockfile or a reconstructed bundle.
+    go install -v github.com/google/osv-scanner/v2/cmd/osv-scanner@latest 2>/dev/null; \
+    # Subdomain takeover (fingerprint-based; complements nuclei's templates).
+    go install -v github.com/haccer/subjack@latest 2>/dev/null; \
+    # Mass DNS resolution with wildcard filtering, so a big subfinder/amass run
+    # produces a list worth probing instead of thousands of wildcard hits.
+    go install -v github.com/d3mondev/puredns/v2@latest 2>/dev/null; \
+    # Web cache poisoning/deception. `go install` names the binary after the
+    # module, so link the name anyone would actually type.
+    (go install -v github.com/Hackmanit/Web-Cache-Vulnerability-Scanner@latest \
+      && ln -sf /usr/local/gopath/bin/Web-Cache-Vulnerability-Scanner /usr/local/gopath/bin/wcvs) 2>/dev/null; \
     rm -rf /usr/local/gopath/pkg /root/.cache/go-build || true
+
+# massdns backs puredns (it is a wrapper, not a resolver). Best-effort and in its
+# own layer: the base apt block has no `|| true`, so a package missing from the
+# mirror there would fail the whole build.
+RUN apt-get -o Acquire::Retries=5 update \
+ && apt-get -o Acquire::Retries=5 install -y --no-install-recommends massdns 2>/dev/null; \
+    rm -rf /var/lib/apt/lists/* 2>/dev/null || true
 
 # gf pattern set (xss/ssrf/sqli/lfi/redirect param greps)
 RUN git clone --depth 1 https://github.com/1ndianl33t/Gf-Patterns /root/.gf 2>/dev/null || true
@@ -166,6 +192,15 @@ RUN npm config set fetch-retries 6 \
  && npm config set fetch-timeout 600000 \
  && npm install -g @openai/codex @bitkyc08/opencodex @playwright/mcp agent-browser \
     camofox-mcp camofox-browser rea-agents \
+    `# JS unminification/unpacking, for bundles with no source map. wakaru and` \
+    `# webcrack overlap deliberately: they fail on different inputs, and a` \
+    `# bundle that defeats one often yields to the other. retire finds known-` \
+    `# vulnerable library versions straight from the shipped JS.` \
+    wakaru webcrack retire \
+    `# LLM/prompt-injection testing for AI-backed targets. promptfoo only: garak` \
+    `# and PyRIT pull torch/transformers and would add gigabytes to an image` \
+    `# that is already ~20GB.` \
+    promptfoo \
  && (PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/playwright npx -y playwright install chromium 2>/dev/null || true) \
  && npm cache clean --force
 
@@ -292,7 +327,8 @@ RUN printf 'export PATH=/usr/local/gopath/bin:/usr/local/sbin:/usr/local/bin:/us
 # permission-denied on the root-owned module cache.
 RUN chmod 0777 /usr/local/gopath 2>/dev/null || true; mkdir -p /usr/local/gopath/pkg && chmod -R 0777 /usr/local/gopath/pkg 2>/dev/null || true
 # Build-time assertion: fail loudly if any expected Go tool didn't resolve to PATH.
-RUN for t in gitleaks cloudfox kiterunner kr dalfox cvemap asnmap gau gf gowitness hakrawler uncover tlsx mapcidr assetfinder waybackurls; do \
+RUN for t in gitleaks cloudfox kiterunner kr dalfox cvemap asnmap gau gf gowitness hakrawler uncover tlsx mapcidr assetfinder waybackurls \
+             jsluice sourcemapper subjs osv-scanner subjack puredns wcvs; do \
       command -v "$t" >/dev/null || { echo "MISSING on PATH: $t"; exit 1; }; done && echo "go tools on PATH: ok"
 ENV GOFLAGS=-modcacherw
 

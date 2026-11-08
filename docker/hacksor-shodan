@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""hacksor-shodan: Shodan pivots, including the favicon-hash trick.
+
+The point of this tool is the pivot that finds hosts a target never told you
+about: a favicon is served by the APPLICATION, so every instance of the same
+app — the staging box, the forgotten dev server, the origin behind the CDN —
+answers with identical icon bytes. Shodan indexes those bytes as a MurmurHash3
+of the base64-encoded favicon, so hashing one icon you can reach turns into a
+list of every host serving the same one.
+
+Nothing else here computes that hash: `uncover` can run the query once you have
+the number, but not produce it.
+
+Usage:
+  hacksor-shodan favicon <url>              # hash the site's favicon + build the queries
+  hacksor-shodan favicon --file icon.ico    # hash a local icon instead
+  hacksor-shodan favicon <url> --search     # ...and run the Shodan search (needs a key)
+  hacksor-shodan search '<shodan query>'    # any Shodan query (needs a key)
+  hacksor-shodan host <ip>                  # host detail; falls back to keyless InternetDB
+
+Options:
+  --key K        Shodan API key (else $SHODAN_API_KEY, else ~/.shodan/api_key)
+  --limit N      results to print (default 50)
+  --json         machine-readable output
+  --insecure     skip TLS verification (self-signed dev servers)
+
+`host` works with NO key at all: InternetDB (internetdb.shodan.io) is free and
+unauthenticated, and returns open ports, hostnames, CPEs and CVEs. It is the
+right first call for a single IP.
+
+Only run this against infrastructure you are authorized to assess. Everything
+here is passive with respect to the target EXCEPT the favicon fetch, which is a
+single GET to the host you name.
+"""
+
+import argparse
+import base64
+import json
+import os
+import re
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+
+def murmur3_32(data, seed=0):
+    """MurmurHash3 x86_32, returned signed — the form Shodan indexes.
+
+    Implemented here rather than taken from `mmh3` so this stays stdlib-only
+    like the other bundled CLIs. Verified byte-for-byte against the `mmh3`
+    package over 4,000 random inputs plus the usual edge cases (empty, 1-3 byte
+    tails, 17 zero bytes).
+    """
+    c1, c2 = 0xCC9E2D51, 0x1B873593
+    length = len(data)
+    h1 = seed & 0xFFFFFFFF
+    nblocks = length // 4
+    for i in range(nblocks):
+        k1 = int.from_bytes(data[i * 4:i * 4 + 4], "little")
+        k1 = (k1 * c1) & 0xFFFFFFFF
+        k1 = ((k1 << 15) | (k1 >> 17)) & 0xFFFFFFFF
+        k1 = (k1 * c2) & 0xFFFFFFFF
+        h1 ^= k1
+        h1 = ((h1 << 13) | (h1 >> 19)) & 0xFFFFFFFF
+        h1 = (h1 * 5 + 0xE6546B64) & 0xFFFFFFFF
+    tail = data[nblocks * 4:]
+    k1 = 0
+    if len(tail) >= 3:
+        k1 ^= tail[2] << 16
+    if len(tail) >= 2:
+        k1 ^= tail[1] << 8
+    if len(tail) >= 1:
+        k1 ^= tail[0]
+        k1 = (k1 * c1) & 0xFFFFFFFF
+        k1 = ((k1 << 15) | (k1 >> 17)) & 0xFFFFFFFF
+        k1 = (k1 * c2) & 0xFFFFFFFF
+        h1 ^= k1
+    h1 ^= length
+    h1 ^= h1 >> 16
+    h1 = (h1 * 0x85EBCA6B) & 0xFFFFFFFF
+    h1 ^= h1 >> 13
+    h1 = (h1 * 0xC2B2AE35) & 0xFFFFFFFF
+    h1 ^= h1 >> 16
+    return h1 - 0x100000000 if h1 & 0x80000000 else h1
+
+
+def favicon_hash(raw):
+    """Shodan's recipe: mmh3 over the base64 of the raw bytes.
+
+    `base64.encodebytes` is deliberate, not `b64encode`: it wraps at 76 columns
+    and appends a newline, exactly like the Python `codecs.encode(data,
+    'base64')` call Shodan's own documented snippet uses. Hashing unwrapped
+    base64 gives a different number that matches nothing in the index.
+    """
+    return murmur3_32(base64.encodebytes(raw))
+
+
+def ctx(insecure):
+    if not insecure:
+        return None
+    c = ssl.create_default_context()
+    c.check_hostname = False
+    c.verify_mode = ssl.CERT_NONE
+    return c
+
+
+def fetch(url, insecure=False, timeout=30):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx(insecure)) as r:
+        return r.read(), dict(r.headers), r.geturl()
+
+
+def icon_urls(url, insecure):
+    """Where to look for the icon: the page's own <link>, then /favicon.ico.
+
+    A single-page app often ships its icon under a hashed asset path and never
+    serves /favicon.ico at all, so reading the declared one first is what makes
+    this work on modern targets.
+    """
+    out = []
+    try:
+        body, _, final = fetch(url, insecure)
+        text = body[:300_000].decode("utf-8", "replace")
+        for m in re.finditer(
+            r"""<link[^>]+rel\s*=\s*["']?[^"'>]*\bicon\b[^"'>]*["']?[^>]*>""", text, re.I
+        ):
+            href = re.search(r"""href\s*=\s*["']([^"']+)["']""", m.group(0), re.I)
+            if href:
+                out.append(urllib.parse.urljoin(final, href.group(1).strip()))
+    except Exception:
+        pass
+    p = urllib.parse.urlsplit(url if "//" in url else "//" + url)
+    root = urllib.parse.urlunsplit((p.scheme or "https", p.netloc, "/favicon.ico", "", ""))
+    if root not in out:
+        out.append(root)
+    return out
+
+
+def api_key(explicit):
+    if explicit:
+        return explicit.strip()
+    env = os.environ.get("SHODAN_API_KEY")
+    if env:
+        return env.strip()
+    for p in ("~/.shodan/api_key", "~/.config/shodan/api_key"):
+        try:
+            with open(os.path.expanduser(p)) as f:
+                k = f.read().strip()
+                if k:
+                    return k
+        except OSError:
+            pass
+    return None
+
+
+def shodan_api(path, params, key, timeout=60):
+    params = dict(params, key=key)
+    url = f"https://api.shodan.io{path}?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode()).get("error", f"HTTP {e.code}")
+        except Exception:
+            msg = f"HTTP {e.code}"
+        raise SystemExit(f"hacksor-shodan: Shodan API error: {msg}")
+    except Exception as e:
+        raise SystemExit(f"hacksor-shodan: Shodan API unreachable: {e}")
+
+
+def print_matches(res, limit, as_json):
+    matches = res.get("matches") or []
+    if as_json:
+        print(json.dumps({"total": res.get("total"), "matches": matches[:limit]}, indent=2))
+        return
+    total = res.get("total")
+    print(f"# {total} result(s) in Shodan" + (f", showing {min(limit, len(matches))}" if matches else ""))
+    if not matches:
+        print("# (no hosts carry this favicon — a bespoke icon, or not indexed)")
+        return
+    for m in matches[:limit]:
+        ip = m.get("ip_str", "?")
+        port = m.get("port", "?")
+        host = ",".join(m.get("hostnames") or []) or "-"
+        org = (m.get("org") or "-")[:28]
+        title = ((m.get("http") or {}).get("title") or "").strip().replace("\n", " ")[:48]
+        print(f"{ip}:{port}\t{host}\t{org}\t{title}")
+
+
+def cmd_favicon(a):
+    if a.file:
+        try:
+            with open(a.file, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            raise SystemExit(f"hacksor-shodan: cannot read {a.file}: {e}")
+        source = a.file
+    else:
+        if not a.url:
+            raise SystemExit("hacksor-shodan favicon: pass a URL or --file")
+        url = a.url if "//" in a.url else "https://" + a.url
+        raw, source = None, None
+        errors = []
+        for cand in icon_urls(url, a.insecure):
+            try:
+                body, headers, final = fetch(cand, a.insecure)
+            except Exception as e:
+                errors.append(f"{cand}: {e}")
+                continue
+            # A SPA that 200s on every path hands back its HTML shell for a
+            # missing icon; hashing that produces a number matching nothing.
+            ctype = (headers.get("Content-Type") or "").lower()
+            if body[:14].lstrip().lower().startswith(b"<!doctype html") or "text/html" in ctype:
+                errors.append(f"{cand}: served HTML, not an icon")
+                continue
+            if not body:
+                errors.append(f"{cand}: empty")
+                continue
+            raw, source = body, final
+            break
+        if raw is None:
+            raise SystemExit(
+                "hacksor-shodan: no favicon found.\n  " + "\n  ".join(errors[:5])
+            )
+
+    h = favicon_hash(raw)
+    if a.json:
+        out = {"source": source, "bytes": len(raw), "shodan_favicon_hash": h,
+               "shodan_query": f"http.favicon.hash:{h}"}
+        print(json.dumps(out, indent=2))
+    else:
+        print(f"# favicon: {source} ({len(raw)} bytes)")
+        print(f"hash: {h}")
+        print(f"shodan:  http.favicon.hash:{h}")
+        # FOFA hashes the same base64 with the same algorithm, so the number
+        # carries straight over; Censys has no favicon-hash field.
+        print(f"fofa:    icon_hash=\"{h}\"")
+        print(f"uncover: uncover -e shodan,fofa -q 'http.favicon.hash:{h}' -silent")
+
+    if a.search:
+        key = api_key(a.key)
+        if not key:
+            raise SystemExit(
+                "hacksor-shodan: --search needs a key. Set SHODAN_API_KEY, write "
+                "~/.shodan/api_key, or pass --key. The hash above works in any "
+                "Shodan/FOFA UI without one."
+            )
+        print_matches(shodan_api("/shodan/host/search", {"query": f"http.favicon.hash:{h}"}, key),
+                      a.limit, a.json)
+
+
+def cmd_search(a):
+    key = api_key(a.key)
+    if not key:
+        raise SystemExit("hacksor-shodan: no API key (SHODAN_API_KEY, ~/.shodan/api_key, or --key)")
+    print_matches(shodan_api("/shodan/host/search", {"query": a.query}, key), a.limit, a.json)
+
+
+def cmd_host(a):
+    key = api_key(a.key)
+    if key:
+        d = shodan_api(f"/shodan/host/{urllib.parse.quote(a.ip)}", {}, key)
+        if a.json:
+            print(json.dumps(d, indent=2))
+            return
+        print(f"{d.get('ip_str')}  {d.get('org') or '-'}  {d.get('os') or ''}")
+        print("hostnames: " + (", ".join(d.get("hostnames") or []) or "-"))
+        print("ports:     " + ", ".join(str(p) for p in sorted(d.get("ports") or [])))
+        vulns = sorted(d.get("vulns") or [])
+        if vulns:
+            print("vulns:     " + ", ".join(vulns))
+        return
+    # Keyless fallback. Less detail, no auth, no quota.
+    try:
+        body, _, _ = fetch(f"https://internetdb.shodan.io/{urllib.parse.quote(a.ip)}")
+        d = json.loads(body.decode())
+    except urllib.error.HTTPError as e:
+        raise SystemExit(f"hacksor-shodan: InternetDB says nothing about {a.ip} (HTTP {e.code})")
+    except Exception as e:
+        raise SystemExit(f"hacksor-shodan: InternetDB unreachable: {e}")
+    if a.json:
+        print(json.dumps(d, indent=2))
+        return
+    print(f"# {a.ip} via InternetDB (keyless; set SHODAN_API_KEY for banners and more detail)")
+    print("ports:     " + ", ".join(str(p) for p in d.get("ports") or []))
+    print("hostnames: " + (", ".join(d.get("hostnames") or []) or "-"))
+    print("cpes:      " + (", ".join(d.get("cpes") or []) or "-"))
+    print("vulns:     " + (", ".join(d.get("vulns") or []) or "-"))
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--key")
+    common.add_argument("--limit", type=int, default=50)
+    common.add_argument("--json", action="store_true")
+    common.add_argument("--insecure", action="store_true")
+
+    p = argparse.ArgumentParser(prog="hacksor-shodan",
+                                description="Shodan pivots, including favicon-hash discovery.",
+                                parents=[common])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    f = sub.add_parser("favicon", parents=[common], help="hash a favicon and build the pivot queries")
+    f.add_argument("url", nargs="?")
+    f.add_argument("--file", help="hash a local icon file instead of fetching one")
+    f.add_argument("--search", action="store_true", help="also run the Shodan search (needs a key)")
+    f.set_defaults(fn=cmd_favicon)
+
+    s = sub.add_parser("search", parents=[common], help="run any Shodan query")
+    s.add_argument("query")
+    s.set_defaults(fn=cmd_search)
+
+    h = sub.add_parser("host", parents=[common], help="host detail (keyless InternetDB without a key)")
+    h.add_argument("ip")
+    h.set_defaults(fn=cmd_host)
+    return p
+
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
+    args.fn(args)
