@@ -71,7 +71,11 @@ async fn wait_opencodex_ready(secs: u64) -> bool {
 /// process is checked alongside the port and a dead one ends the wait at once.
 async fn wait_ocx_ready_in_container(secs: u64) -> bool {
     for i in 0..(secs * 2) {
-        if opencodex_up().await {
+        // Either side answering is good enough to proceed: in-container means
+        // codex can reach it, and the published port means the app can. When
+        // the port could not be published (a host service holds it) only the
+        // in-container probe can ever succeed.
+        if opencodex_up_in_container().await || opencodex_up().await {
             return true;
         }
         // Every 5th second, and never on the first pass: the process needs a
@@ -98,6 +102,62 @@ async fn ocx_alive_in_container() -> bool {
     // An exec that cannot run says nothing about ocx; keep waiting rather than
     // reporting a failure the log will not explain.
     .unwrap_or(true)
+}
+
+/// Of `want`, the ports nothing is listening on at 127.0.0.1 yet.
+///
+/// Publishing a port the host already uses is a hard `docker run` failure, so
+/// the colliding one is dropped and reported instead of taking the runtime with
+/// it. A port that cannot be tested is treated as free: guessing "taken" would
+/// break the normal case to protect the rare one.
+fn free_host_ports(want: &[u16]) -> Vec<u16> {
+    want.iter()
+        .copied()
+        .filter(|p| {
+            match std::net::TcpListener::bind(("127.0.0.1", *p)) {
+                Ok(l) => {
+                    // Dropped at once: this only answers "is it free right
+                    // now", and Docker binds it a moment later.
+                    drop(l);
+                    true
+                }
+                Err(_) => {
+                    eprintln!(
+                        "hacksor: port {p} is already in use on 127.0.0.1 - not publishing it \
+                         from the runtime container (a host-side service is serving it)"
+                    );
+                    false
+                }
+            }
+        })
+        .collect()
+}
+
+/// Whether the proxy answers INSIDE the runtime container.
+///
+/// The host probe cannot answer this question. Without host networking the
+/// container has its own loopback, and a host-installed ocx serving 10100 makes
+/// the host probe succeed while in-container codex — which is configured
+/// against the container's own 127.0.0.1 — still has nothing to talk to. Asking
+/// from inside is the only check that matches what codex will experience.
+async fn opencodex_up_in_container() -> bool {
+    let port = models::OPENCODEX_PORT;
+    runtime::exec_output(
+        RUNTIME_CONTAINER,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!("curl -s -m 2 -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{port}/v1/models"),
+        ],
+        exec_user(),
+        None,
+    )
+    .await
+    .map(|(out, _)| {
+        let c = out.trim();
+        c == "200" || c == "401"
+    })
+    .unwrap_or(false)
 }
 
 /// True when the runtime is Docker (ocx runs inside the container) rather than
@@ -218,10 +278,20 @@ async fn restart_opencodex(state: &AppState) {
 /// it's the host `ocx`. Upstreams are configured from the stored keys BEFORE the
 /// server starts so it serves OpenRouter/Vercel/… without a further restart.
 async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
-    if opencodex_up().await {
+    let docker = docker_runtime(state).await;
+    // In Docker mode the question is whether the proxy answers INSIDE the
+    // container, which is where codex will call it from. The host probe answers
+    // a different question, and a host-installed ocx on the same port makes it
+    // answer "yes" while the container has nothing listening — so trusting it
+    // here skipped starting the proxy codex actually needs.
+    if docker {
+        if runtime_container_running().await && opencodex_up_in_container().await {
+            return Ok(());
+        }
+    } else if opencodex_up().await {
         return Ok(());
     }
-    if docker_runtime(state).await {
+    if docker {
         // The container hosts ocx (bundled). Make sure it's up, configure the
         // upstreams, then (re)start ocx in-container so it picks up the config.
         // Services pre-start is handled by ensure_runtime_ready; here we only need
@@ -3451,7 +3521,17 @@ async fn start_runtime(
             // Without host networking (Docker Desktop VM, or rootless Docker's
             // isolated namespace) publish the in-container ocx + intercepting-proxy
             // ports so the host app reaches them at 127.0.0.1.
-            publish_ports: if rootful_linux() { vec![] } else { vec![models::OPENCODEX_PORT, PROXY_PORT] },
+            // A port already bound on the host loopback is left unpublished
+            // rather than failing the whole container: `docker run` refuses the
+            // binding outright ("address already in use") and the app then
+            // cannot start at all. The common case is a host-installed `ocx`
+            // already serving 10100 — it reads the same `~/.opencodex`, so the
+            // host side loses nothing by talking to that one instead.
+            publish_ports: if rootful_linux() {
+                vec![]
+            } else {
+                free_host_ports(&[models::OPENCODEX_PORT, PROXY_PORT])
+            },
         };
         runtime::create_and_start(&spec).await?;
         // Linux only: register the host uid/gid in the container passwd + grant
@@ -5681,6 +5761,27 @@ mod transcript_tests {
         // Trailing punctuation is not part of the URL.
         assert_eq!(first_url("see https://example.com/a).").as_deref(), Some("https://example.com/a"));
         assert!(first_url("Error: refresh failed. Next: ocx account reauth anthropic").is_none());
+    }
+
+    #[test]
+    fn a_port_held_on_the_host_is_not_published_from_the_container() {
+        // Docker refuses the whole `docker run` when a published port is
+        // already bound, so this filter is what keeps a host-side service on
+        // 10100 (a host-installed ocx, typically) from making the app
+        // unstartable. Bind a real port to prove the taken case.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind a throwaway port");
+        let taken = held.local_addr().unwrap().port();
+
+        // ...and find one that is genuinely free by releasing it again.
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind to pick a free port");
+        let free = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        assert_eq!(free_host_ports(&[taken]), Vec::<u16>::new(), "a held port must be dropped");
+        assert_eq!(free_host_ports(&[free]), vec![free], "a free port must be kept");
+        // The point of the filter: the collision is removed, the rest survive.
+        assert_eq!(free_host_ports(&[taken, free]), vec![free]);
+        drop(held);
     }
 
     #[test]
