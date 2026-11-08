@@ -246,6 +246,10 @@ interface Session {
   /// to write a finding up.
   turnCommands?: number;
   turnFindings?: number;
+  /// Every assistant message of the turn in flight, joined. `lastAgentMessage`
+  /// is only the final one, so a goal marker written before a closing remark
+  /// used to be missed and the goal kept going after it was already met.
+  turnAgentText?: string;
   /// An active `/goal`: the session keeps working until it is met.
   goal?: GoalState;
   /// A `/goal` whose instructions have not ridden out yet.
@@ -3887,9 +3891,9 @@ const GOAL_MARKERS: { kind: "achieved" | "impossible" | "input"; re: RegExp }[] 
   // Anchored to the start of a line, so the same words inside a sentence
   // ("the goal is impossible to achieve without credentials") do not end a run.
   // Leading markdown, quoting and emoji are allowed because models add them.
-  { kind: "achieved", re: /^[\s>*_`#✅☑️✔️]*GOAL\s+ACHIEVED\b[\s:.—–-]*(.*)$/im },
-  { kind: "impossible", re: /^[\s>*_`#⛔🚫❌]*GOAL\s+IMPOSSIBLE\b[\s:.—–-]*(.*)$/im },
-  { kind: "input", re: /^[\s>*_`#❓❔🛑]*GOAL\s+BLOCKED\b[\s:.—–-]*(.*)$/im },
+  { kind: "achieved", re: /^[\s>*_`#✅☑️✔️]*GOAL[\s:：—–-]+ACHIEVED\b[\s:.—–-]*(.*)$/im },
+  { kind: "impossible", re: /^[\s>*_`#⛔🚫❌]*GOAL[\s:：—–-]+IMPOSSIBLE\b[\s:.—–-]*(.*)$/im },
+  { kind: "input", re: /^[\s>*_`#❓❔🛑]*GOAL[\s:：—–-]+BLOCKED\b[\s:.—–-]*(.*)$/im },
 ];
 
 function goalMarker(text: string) {
@@ -4054,7 +4058,15 @@ async function goalStep(session: Session, answer: string | undefined | null) {
   const g = session.goal;
   if (!g?.running) return;
   const text = (answer || "").trim();
-  const hit = text ? goalMarker(text) : null;
+  // The marker is looked for in the final message first, then across every
+  // message of the turn: a model that declares the goal met and then adds a
+  // closing remark (or a note about cleanup) puts the marker somewhere other
+  // than `lastAgentMessage`, and missing it meant the goal ran on past the
+  // point it was already achieved. None of the text Hacksor itself sends ever
+  // starts a line with the marker, so widening this does not make it fire on
+  // the instructions being quoted back.
+  const turnText = (session.turnAgentText || "").trim();
+  const hit = (text ? goalMarker(text) : null) ?? (turnText ? goalMarker(turnText) : null);
 
   if (hit?.kind === "input") { endGoal(session, "input", hit.detail); return; }
 
@@ -5057,6 +5069,7 @@ listen<Notif>("hacksor://event", (evt) => {
       session.sawOutputThisTurn = false;
       session.turnCommands = 0;
       session.turnFindings = 0;
+      session.turnAgentText = "";
       session.turnStartMs = Date.now();
       // The model this turn actually used: in Auto it's the auto-picked model
       // (tracked in autoModel), not the composer's state.model.
@@ -5148,6 +5161,7 @@ listen<Notif>("hacksor://event", (evt) => {
       // The agent can move the engagement by naming the new directory in its
       // reply; the UI follows so the panel opens what was asked for.
       if (method === "item/completed" && item.type === "agentMessage" && item.text) {
+        session.turnAgentText = `${session.turnAgentText ?? ""}\n${item.text}`;
         void switchLedgerFromMessage(session, item.text);
       }
       // Drain at the end of ANY item, not just a shell command: an MCP tool
