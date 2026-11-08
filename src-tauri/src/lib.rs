@@ -105,6 +105,7 @@ pub fn run() {
             commands::submit_approval,
             commands::pick_directory,
             commands::pick_files,
+            commands::save_pasted_file,
             commands::read_notes,
             commands::write_note,
             commands::delete_note,

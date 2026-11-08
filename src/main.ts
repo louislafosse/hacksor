@@ -996,6 +996,67 @@ function renderAttachments() {
   }
 }
 
+// ---- clipboard paste (⌘V / ctrl+V) ----
+//
+// Finder's ⌘C and a screenshot both put something on the clipboard that has no
+// path: the webview hands it over as a File it holds in memory. Everything
+// downstream — the chips, the harness, codex — deals in paths, so the bytes are
+// written to a file first and then attached exactly like a picked one.
+//
+// Plain text is left entirely alone: the handler only acts when the clipboard
+// actually carries files, so normal pasting keeps working, including pasting
+// text that happens to sit alongside a file on the clipboard.
+// The bytes cross the IPC boundary as a JSON array of numbers, so a very large
+// paste would freeze the window while it serialises. Anything this big belongs
+// in the engagement directory and is attached by path, not pasted.
+const PASTE_MAX_BYTES = 25 * 1024 * 1024;
+
+async function attachClipboardFiles(items: File[]): Promise<number> {
+  const saved: string[] = [];
+  for (const f of items) {
+    try {
+      if (f.size > PASTE_MAX_BYTES) {
+        addError(activeSession(), `${f.name || "That file"} is too large to paste (${Math.round(f.size / 1048576)} MB). Attach it with the paperclip instead.`);
+        continue;
+      }
+      const bytes = Array.from(new Uint8Array(await f.arrayBuffer()));
+      if (!bytes.length) continue;
+      // A screenshot arrives as "image.png" or with no name at all; give it one
+      // that says where it came from so the chip is readable.
+      const name = f.name && f.name !== "image.png"
+        ? f.name
+        : `pasted-${f.type.split("/")[1] || "bin"}.${(f.type.split("/")[1] || "bin").replace("jpeg", "jpg")}`;
+      const path = await invoke<string>("save_pasted_file", { name, bytes });
+      if (path) saved.push(path);
+    } catch (err) {
+      addError(activeSession(), `Could not attach ${f.name || "the pasted item"}: ${String(err)}`);
+    }
+  }
+  if (saved.length) addAttachments(saved);
+  return saved.length;
+}
+
+function onPasteFiles(e: ClipboardEvent) {
+  const dt = e.clipboardData;
+  if (!dt) return;
+  const files = Array.from(dt.files ?? []);
+  if (!files.length) return; // text paste: let the field handle it
+  e.preventDefault();
+  void attachClipboardFiles(files);
+}
+
+input.addEventListener("paste", onPasteFiles);
+
+// Same thing when nothing in particular has focus — the window is in front and
+// ⌘V should attach, not be swallowed. Other editable fields (search, rename)
+// keep their own paste: a file pasted into those means nothing.
+document.addEventListener("paste", (e) => {
+  const t = e.target as HTMLElement | null;
+  if (t === input) return; // already handled above
+  if (t && (t.isContentEditable || /^(input|textarea|select)$/i.test(t.tagName))) return;
+  onPasteFiles(e as ClipboardEvent);
+});
+
 getCurrentWindow().onDragDropEvent((e) => {
   const t = e.payload.type;
   if (t === "enter" || t === "over") dropOverlay.hidden = false;

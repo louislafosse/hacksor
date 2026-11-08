@@ -4815,6 +4815,49 @@ pub async fn save_text_dialog(app: AppHandle, default_name: String, content: Str
     }
 }
 
+/// Write bytes pasted or dropped from the clipboard to a real file and return
+/// its path.
+///
+/// Attachments are plumbed as paths the whole way down — the picker, drag and
+/// drop, and the `images` the harness forwards to codex all deal in paths, and
+/// the runtime container reads them through the mounted home. A clipboard image
+/// has no path at all (it is a blob the webview holds), so it needs one written
+/// before it can be attached like anything else. Kept under the app's own data
+/// directory, which is inside the mount, so the container can read it without
+/// widening anything.
+#[tauri::command]
+pub async fn save_pasted_file(
+    state: State<'_, AppState>,
+    name: String,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Err("nothing to save: the clipboard item was empty".into());
+    }
+    let dir = state.codex_home.join("pasted");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    // Keep only the basename, and only characters that cannot change where the
+    // file lands: the name comes from the clipboard, which is not ours.
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("pasted").trim().to_string();
+    let safe: String = base
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || "._- ".contains(c) { c } else { '_' })
+        .collect();
+    let safe = safe.trim_matches(['.', ' ']).to_string();
+    let safe = if safe.is_empty() { "pasted".to_string() } else { safe };
+
+    // Timestamped, so pasting the same screenshot twice keeps both and an
+    // earlier attachment is never overwritten while it is still referenced.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("{stamp}-{safe}"));
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 #[tauri::command]
 pub async fn pick_files(app: AppHandle) -> Result<Vec<String>, String> {
     use tauri_plugin_dialog::DialogExt;

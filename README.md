@@ -61,6 +61,9 @@ locally.
 - The model list is fetched live from the provider catalog and is searchable in
   the header. Reasoning effort and vision support are inferred per model, with
   auto-routing to a vision-capable model when you attach an image.
+- Attach files with the paperclip, by dragging them onto the window, or by
+  pasting them with ⌘V — a screenshot or a file copied in Finder is written out
+  and attached like any other.
 
 **Full penetration-testing platform** (in the bundled Docker runtime)
 - A complete Kali arsenal preinstalled and on PATH: recon, scanning, fuzzing,
