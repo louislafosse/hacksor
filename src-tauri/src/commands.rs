@@ -46,6 +46,60 @@ async fn opencodex_up() -> bool {
     }
 }
 
+/// Poll the proxy until it answers, for up to `secs` seconds.
+///
+/// A cold `ocx start` builds its provider catalog before it binds the port —
+/// measured at ~47s in the bundled runtime image. The old window was 12s, so a
+/// perfectly healthy start was reported as "didn't become ready" and the model
+/// list never loaded.
+async fn wait_opencodex_ready(secs: u64) -> bool {
+    for _ in 0..(secs * 2) {
+        if opencodex_up().await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    false
+}
+
+/// Wait for the in-container proxy, giving up early if ocx has died.
+///
+/// The ready window has to be long enough for a cold catalog build (~47s), but
+/// the failures that need reporting — a stale lease, an unreadable config — make
+/// ocx exit within a second. Waiting the full window for those would turn a
+/// fixable error into a minute and a half of staring at a placeholder, so the
+/// process is checked alongside the port and a dead one ends the wait at once.
+async fn wait_ocx_ready_in_container(secs: u64) -> bool {
+    for i in 0..(secs * 2) {
+        if opencodex_up().await {
+            return true;
+        }
+        // Every 5th second, and never on the first pass: the process needs a
+        // moment to appear before its absence means anything.
+        if i > 4 && i % 10 == 0 && !ocx_alive_in_container().await {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    false
+}
+
+/// Whether an `ocx start` process is still running in the runtime container.
+/// Bracketed so the pattern does not match the `sh -c` carrying it.
+async fn ocx_alive_in_container() -> bool {
+    runtime::exec_output(
+        RUNTIME_CONTAINER,
+        vec!["sh".into(), "-c".into(), "pgrep -f '[o]cx start' >/dev/null && echo yes".into()],
+        exec_user(),
+        None,
+    )
+    .await
+    .map(|(out, _)| out.contains("yes"))
+    // An exec that cannot run says nothing about ocx; keep waiting rather than
+    // reporting a failure the log will not explain.
+    .unwrap_or(true)
+}
+
 /// True when the runtime is Docker (ocx runs inside the container) rather than
 /// on the host.
 async fn docker_runtime(state: &AppState) -> bool {
@@ -218,11 +272,8 @@ async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
             )
             .await;
         }
-        for _ in 0..24 {
-            if opencodex_up().await {
-                return Ok(());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if wait_ocx_ready_in_container(OCX_READY_SECS).await {
+            return Ok(());
         }
         // Include what ocx actually printed: a bare "didn't become ready" hides
         // real, fixable causes (e.g. EACCES on a root-owned ~/.codex/config.toml).
@@ -236,16 +287,28 @@ async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
         .map(|(out, _)| out)
         .unwrap_or_default();
         let detail = log.trim();
-        // A leftover ocx from a previous run refuses to start a new one ("Proxy
-        // already running… Use 'ocx stop' first") — and if that old process is
-        // not actually reachable, nothing recovers on its own: the model list
-        // never loads and the composer sits on a placeholder until the user
-        // works out what to do. Clear it and try once more.
-        if detail.to_lowercase().contains("already running") {
+        // Two ways a previous run blocks the next one, both unrecoverable on
+        // their own — the model list never loads and the composer sits on a
+        // placeholder until the user works out what to do:
+        //
+        //  - a leftover ocx that is not actually reachable ("Proxy already
+        //    running… Use 'ocx stop' first");
+        //  - a mutation lease left behind by an ocx that was killed while
+        //    holding it (OWNERSHIP_MUTATION_LEASE_BUSY). ocx only reclaims one
+        //    30s after the recorded PID dies, and Hacksor restarts it well
+        //    inside that window, so a restart lands on the lease every time.
+        //
+        // Clear whichever applies and try once more.
+        let low = detail.to_lowercase();
+        if low.contains("already running") || low.contains("mutation lease") {
+            // The pattern is bracketed so `pkill -f` does not match this very
+            // shell: its own command line contains the pattern text, and an
+            // unbracketed one kills the shell before the restart is reached.
             let _ = runtime::exec_output(
                 RUNTIME_CONTAINER,
                 vec!["sh".into(), "-c".into(),
-                     "ocx stop >/dev/null 2>&1; pkill -f 'ocx start' >/dev/null 2>&1; true".into()],
+                     "ocx stop >/dev/null 2>&1; pkill -f '[o]cx start' >/dev/null 2>&1; \
+                      rm -rf \"${HOME:-/root}\"/.opencodex/service-state.json.mutation.lock; true".into()],
                 exec_user(),
                 None,
             )
@@ -264,11 +327,8 @@ async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
                 exec_user(),
             )
             .await;
-            for _ in 0..24 {
-                if opencodex_up().await {
-                    return Ok(());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if wait_ocx_ready_in_container(OCX_READY_SECS).await {
+                return Ok(());
             }
         }
         if detail.is_empty() {
@@ -295,11 +355,8 @@ async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("failed to start OpenCodex proxy: {e}"))?;
     *state.opencodex.lock().await = Some(child);
-    for _ in 0..24 {
-        if opencodex_up().await {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    if wait_opencodex_ready(OCX_READY_SECS).await {
+        return Ok(());
     }
     Err("OpenCodex proxy did not become ready. Check `ocx` and your OpenCodex config.".into())
 }
@@ -2710,6 +2767,9 @@ const RUNTIME_CONTAINER: &str = "hacksor-runtime";
 /// Where the in-container ocx writes its startup output, so a failure to come up
 /// can report ocx's own error instead of a bare timeout.
 const OCX_START_LOG: &str = "/tmp/hacksor-ocx-start.log";
+/// How long to wait for `ocx start` to answer before calling it a failure.
+/// Cold starts were measured at ~47s in the bundled image; 12s was not enough.
+const OCX_READY_SECS: u64 = 90;
 const RUNTIME_DOCKERFILE: &str = include_str!("../../docker/Dockerfile");
 /// Prebuilt image published to a public registry. When set (and reachable), the
 /// runtime is PULLED (fast, streamed progress) instead of built locally. Kept in
