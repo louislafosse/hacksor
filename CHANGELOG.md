@@ -1,3 +1,19 @@
+# [1.20.0](https://github.com/louislafosse/hacksor/compare/v1.19.0...v1.20.0) (2026-11-08)
+
+
+### Bug Fixes
+
+* **auth:** recognise a login that needs re-authenticating, and repair it ([855422d](https://github.com/louislafosse/hacksor/commit/855422d9cb063a6347ac06fcf55b2b97ed81919c))
+* **goal:** end the goal when the marker lands anywhere in the turn ([f486873](https://github.com/louislafosse/hacksor/commit/f48687335f67ad5fa50bad2e98854ed02f19c172))
+* **proxy:** survive a stale ocx lease and a slow cold start ([41e9e9b](https://github.com/louislafosse/hacksor/commit/41e9e9ba7e39afb6aece7dd62bbc0c64f3ad0a6e))
+* **runtime:** do not ship an image because a release download blinked ([ce63ae4](https://github.com/louislafosse/hacksor/commit/ce63ae47f7e56a9c28d3ef993a61da523726d524))
+
+
+### Features
+
+* **composer:** attach images and files pasted with the clipboard ([6bcfa3b](https://github.com/louislafosse/hacksor/commit/6bcfa3bf511e52b5d2986153de26083b122ec2ac))
+* **runtime:** read a site's JavaScript properly, and pivot on favicons ([f651fdf](https://github.com/louislafosse/hacksor/commit/f651fdf932d7a4c608bd4c6341aa8b0bd62641c8))
+
 # [1.19.0](https://github.com/louislafosse/hacksor/compare/v1.18.0...v1.19.0) (2026-11-01)
 
 
