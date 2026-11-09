@@ -1669,7 +1669,7 @@ pub async fn start_chat(
 
     let developer_instructions = build_developer_prompt(
         &effective_persona(&state),
-        &state.env_note,
+        &env_note_with_memory(&state),
         &args.mode,
         &args.model,
         personality.as_deref(),
@@ -1719,7 +1719,7 @@ fn turn_overrides_from(state: &AppState, args: &SendArgs, personality: Option<&s
     let dev = args.model.as_deref().map(|model| {
         build_developer_prompt(
             &effective_persona(state),
-            &state.env_note,
+            &env_note_with_memory(state),
             args.mode.as_deref().unwrap_or("agent"),
             model,
             personality,
@@ -5165,6 +5165,99 @@ async fn ensure_harness(state: &State<'_, AppState>, app: &AppHandle) -> Result<
 /// Assemble developer instructions: a runtime header (date, model, mode,
 /// personality) plus the ported HackerAI persona, and — for the models that
 /// ship one — that model's operating spec.
+/// The lessons + rejected-findings digest that rides on every turn.
+///
+/// Hacksor already had a place to persist this — a notes directory the agent was
+/// told to "read back when relevant" — and it does not work: the read is
+/// discretionary, made by a model with a fresh context and a task in front of
+/// it, and on this machine the notes had not been touched in eleven days of
+/// heavy use. `env_note` is the mechanism that DOES work, and the only
+/// difference is that it is pushed rather than pulled. So lessons are pushed the
+/// same way: the agent cannot forget to read what is already in its context.
+///
+/// Written by `hacksor-findings lesson add` and `triage <id> suppressed`, which
+/// run in the container; `~/.hacksor` is the same path on both sides because the
+/// runtime mounts the host home.
+fn memory_note() -> String {
+    const MAX_ENTRIES: usize = 12;
+    const MAX_CHARS: usize = 2400;
+
+    fn tail(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let mut rows: Vec<serde_json::Value> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        // Newest first, then capped: this is paid for on every turn.
+        rows.reverse();
+        rows.truncate(MAX_ENTRIES);
+        rows
+    }
+
+    let Some(home) = dirs::home_dir() else { return String::new() };
+    let base = home.join(".hacksor");
+    let lessons = tail(&base.join("lessons.jsonl"));
+    let fps = tail(&base.join("fp-memory.jsonl"));
+    if lessons.is_empty() && fps.is_empty() {
+        return String::new();
+    }
+
+    let str_of = |v: &serde_json::Value, k: &str| {
+        v.get(k).and_then(|x| x.as_str()).unwrap_or_default().trim().to_string()
+    };
+    let mut out = String::from(
+        "\n# What earlier engagements already established\n\n\
+         These come from `hacksor-findings lesson add` and findings an operator suppressed. \
+         They are not optional context: a mistake repeated here is one that was already paid for.\n",
+    );
+    if !lessons.is_empty() {
+        out.push_str("\nLessons (do not repeat these):\n");
+        for l in &lessons {
+            let title = str_of(l, "title");
+            if title.is_empty() {
+                continue;
+            }
+            let instead = str_of(l, "instead");
+            if instead.is_empty() {
+                out.push_str(&format!("- {title}\n"));
+            } else {
+                out.push_str(&format!("- {title} -> {instead}\n"));
+            }
+        }
+    }
+    if !fps.is_empty() {
+        out.push_str("\nRejected as false positives before — do not re-report without new evidence:\n");
+        for f in &fps {
+            let title = str_of(f, "title");
+            if title.is_empty() {
+                continue;
+            }
+            let reason = str_of(f, "reason");
+            if reason.is_empty() {
+                out.push_str(&format!("- {title}\n"));
+            } else {
+                out.push_str(&format!("- {title} ({reason})\n"));
+            }
+        }
+    }
+    if out.len() > MAX_CHARS {
+        // Cut on a line boundary so the digest never ends mid-entry.
+        let cut = out[..MAX_CHARS].rfind('\n').unwrap_or(MAX_CHARS);
+        out.truncate(cut);
+        out.push_str("\n- (older entries omitted)\n");
+    }
+    out
+}
+
+/// The environment note plus the cross-engagement memory digest.
+fn env_note_with_memory(state: &AppState) -> String {
+    format!("{}{}", state.env_note, memory_note())
+}
+
 fn build_developer_prompt(
     base: &str,
     env_note: &str,
@@ -5761,6 +5854,33 @@ mod transcript_tests {
         // Trailing punctuation is not part of the URL.
         assert_eq!(first_url("see https://example.com/a).").as_deref(), Some("https://example.com/a"));
         assert!(first_url("Error: refresh failed. Next: ocx account reauth anthropic").is_none());
+    }
+
+    #[test]
+    fn the_memory_digest_is_capped_and_cut_on_a_line_boundary() {
+        // The digest is injected into EVERY turn, so an uncapped one would eat
+        // the context window the engagement ledger exists to protect. The cap
+        // must also never leave a half-written entry behind.
+        //
+        // memory_note() reads the real home directory, so the cap logic is
+        // exercised directly here rather than by planting files in it.
+        const MAX_CHARS: usize = 2400;
+        let mut out = String::new();
+        for i in 0..400 {
+            out.push_str(&format!("- lesson number {i} with some explanatory text\n"));
+        }
+        assert!(out.len() > MAX_CHARS, "fixture must exceed the cap");
+
+        let cut = out[..MAX_CHARS].rfind('\n').unwrap_or(MAX_CHARS);
+        let mut capped = out[..cut].to_string();
+        capped.push_str("\n- (older entries omitted)\n");
+
+        assert!(capped.len() < MAX_CHARS + 64, "stays near the budget");
+        // Every line is whole: no entry is truncated mid-word.
+        for line in capped.lines().filter(|l| l.starts_with("- lesson")) {
+            assert!(line.ends_with("explanatory text"), "entry was cut mid-line: {line:?}");
+        }
+        assert!(capped.ends_with("(older entries omitted)\n"), "says that it elided");
     }
 
     #[test]
