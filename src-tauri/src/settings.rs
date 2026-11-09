@@ -42,16 +42,6 @@ pub struct Settings {
     /// container so first use has no warm-up).
     #[serde(default = "default_services_mode")]
     pub services_mode: String,
-    /// Optional Cloudflare global API key + email + account id, used ONLY by the
-    /// bundled `cloudfish` recon tool (passive subdomain discovery via Cloudflare's
-    /// DNS scanner). Mirrored to `~/.cloudflare` so the container's cloudfish reads
-    /// them. A global key is high-privilege; leave empty unless you use cloudfish.
-    #[serde(default)]
-    pub cloudflare_api_key: Option<String>,
-    #[serde(default)]
-    pub cloudflare_email: Option<String>,
-    #[serde(default)]
-    pub cloudflare_account_id: Option<String>,
     /// The app version whose release notes the user has already been shown.
     /// Empty/absent on a fresh install, which is why a first run shows nothing:
     /// "what changed" is meaningless before there is a previous version.
@@ -109,9 +99,6 @@ impl Default for Settings {
             kali_mode: false,
             runtime: default_runtime(),
             services_mode: default_services_mode(),
-            cloudflare_api_key: None,
-            cloudflare_email: None,
-            cloudflare_account_id: None,
             last_seen_version: None,
             warn_without_vpn: true,
             limit_runtime_mount: false,
@@ -162,36 +149,9 @@ impl Settings {
             }
         }
         let _ = std::fs::write(codex_home.join(".env"), env);
-        self.save_cloudflare();
         Ok(())
     }
 
-    /// Mirror the Cloudflare creds to `~/.cloudflare` (KEY=VALUE, 0600) so the
-    /// container's bundled `cloudfish` picks them up ($HOME is bind-mounted into
-    /// the runtime). Removes the file when all three are empty.
-    fn save_cloudflare(&self) {
-        let path = match dirs::home_dir() {
-            Some(h) => h.join(".cloudflare"),
-            None => return,
-        };
-        let clean = |o: &Option<String>| o.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-        let (k, e, a) = (clean(&self.cloudflare_api_key), clean(&self.cloudflare_email), clean(&self.cloudflare_account_id));
-        if k.is_none() && e.is_none() && a.is_none() {
-            let _ = std::fs::remove_file(&path);
-            return;
-        }
-        let mut body = String::new();
-        if let Some(v) = k { body.push_str(&format!("CLOUDFLARE_API_KEY={v}\n")); }
-        if let Some(v) = e { body.push_str(&format!("CLOUDFLARE_EMAIL={v}\n")); }
-        if let Some(v) = a { body.push_str(&format!("CLOUDFLARE_ACCOUNT_ID={v}\n")); }
-        if std::fs::write(&path, body).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
-        }
-    }
 }
 
 #[cfg(test)]

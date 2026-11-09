@@ -113,9 +113,6 @@ type SettingsView = {
   warn_without_vpn?: boolean;
   limit_runtime_mount?: boolean;
   services_mode?: string;
-  has_cloudflare?: boolean;
-  cloudflare_email?: string | null;
-  cloudflare_account_id?: string | null;
 };
 type Notif = { method: string; params: any };
 
@@ -5721,17 +5718,6 @@ function openSettings(force = false) {
             <button id="s-ocx-setup" class="ghost">Open provider dashboard (OAuth / advanced)</button>
           </div>
         </div>
-        <div class="field">
-          <label>Cloudflare (optional) <span id="s-cf-badge" class="unset-badge"></span></label>
-          <p style="margin:0 0 10px;opacity:.75">Only for the <code>cloudfish</code> recon tool — passive subdomain discovery via Cloudflare's DNS scanner, an extra source alongside subfinder/amass. Needs a <b>global</b> API key (high privilege); leave blank if you don't use it. Stored in <code>~/.cloudflare</code>.</p>
-          <div class="key-row">
-            <input id="s-cf-key" type="password" placeholder="Global API key" />
-          </div>
-          <div class="row" style="margin-top:8px">
-            <input id="s-cf-email" placeholder="Account email" style="flex:1" />
-            <input id="s-cf-acct" placeholder="Account ID" style="flex:1" />
-          </div>
-        </div>
       </div>
 
       <div class="tab-pane" data-pane="agent">
@@ -5840,16 +5826,6 @@ function openSettings(force = false) {
   vcInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveKeyInline("vercel_api_key", vcInput); } });
   ciInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveKeyInline("cheaper_inference_api_key", ciInput); } });
   abInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveKeyInline("abliteration_api_key", abInput); } });
-  // Cloudflare creds (for cloudfish): populate current state from get_settings.
-  const cfKey = bg.querySelector("#s-cf-key") as HTMLInputElement;
-  const cfEmail = bg.querySelector("#s-cf-email") as HTMLInputElement;
-  const cfAcct = bg.querySelector("#s-cf-acct") as HTMLInputElement;
-  const cfBadge = bg.querySelector("#s-cf-badge") as HTMLElement;
-  invoke<SettingsView>("get_settings").then((s) => {
-    if (s.cloudflare_email) cfEmail.value = s.cloudflare_email;
-    if (s.cloudflare_account_id) cfAcct.value = s.cloudflare_account_id;
-    if (s.has_cloudflare) { cfKey.placeholder = "•••••••••• — leave blank to keep"; cfBadge.textContent = "· configured"; cfBadge.className = "saved-badge"; }
-  }).catch(() => {});
   // Theme (live-applies on change; persisted by applyTheme).
   bg.querySelector("#s-theme")?.addEventListener("change", (e) =>
     applyTheme((e.target as HTMLSelectElement).value));
@@ -6151,11 +6127,6 @@ function openSettings(force = false) {
         working_dir: dirInput.value || null,
         kali_mode: (bg.querySelector("#s-kali") as HTMLInputElement).checked,
         runtime: newRuntime,
-        // Cloudflare (cloudfish): blank key keeps the saved one; email/account
-        // are sent as-is so edits and clears both apply.
-        cloudflare_api_key: cfKey.value ? cfKey.value : null,
-        cloudflare_email: cfEmail.value,
-        cloudflare_account_id: cfAcct.value,
       },
     });
     const s = await invoke<SettingsView>("get_settings");
