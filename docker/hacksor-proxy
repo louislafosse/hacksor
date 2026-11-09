@@ -299,6 +299,17 @@ def flow_request_parts(flow):
 # ---- subcommands ----------------------------------------------------------
 def cmd_history(a):
     flows = list(reversed(read_flows()))  # newest first
+    # One capture file serves every engagement, so a plain `history` used to show
+    # other clients' traffic. Default to this engagement's hosts; --all-hosts is
+    # the explicit opt-out.
+    eng = find_engagement()
+    target = engagement_target(eng)
+    if target and not getattr(a, "all_hosts", False):
+        before = len(flows)
+        flows = engagement_flows(flows, target)
+        if before != len(flows):
+            print(f"# {len(flows)} of {before} flows shown ({target}); --all-hosts for the rest",
+                  file=sys.stderr)
     rx = re.compile(a.search, re.I) if a.search else None
     grep = re.compile(a.grep, re.I) if a.grep else None
     rows = []
@@ -649,10 +660,63 @@ def cmd_stop(a):
     print("stopped")
 
 
+ENGAGEMENT_MARKER = "ENGAGEMENT_NOTES.md"
+
+
+def find_engagement(start=None):
+    """The engagement directory containing the cwd, or None. Same marker the app uses."""
+    cur = os.path.abspath(start or os.getcwd())
+    home = os.path.abspath(os.path.expanduser("~"))
+    for _ in range(8):
+        if os.path.isfile(os.path.join(cur, ENGAGEMENT_MARKER)):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur or cur == home:
+            return None
+        cur = parent
+    return None
+
+
+def engagement_target(d):
+    """The host an engagement directory is about, from its name.
+
+    Directories are named for the target with dots flattened
+    (`acme_example_com`), so this turns the name back into something that can
+    be matched against a flow's host.
+    """
+    if not d:
+        return None
+    base = os.path.basename(d).lower()
+    return base.replace("_", ".").replace(" ", "")
+
+
+def engagement_flows(flows, target):
+    """Flows whose host belongs to this engagement's target."""
+    if not target:
+        return flows
+    stem = target.rsplit(".", 2)[0] if target.count(".") >= 2 else target.split(".")[0]
+    return [f for f in flows
+            if target in (f.get("host") or "").lower() or stem in (f.get("host") or "").lower()]
+
+
 def cmd_status(a):
     ca = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
     print(f"proxy:   {'running' if _running() else 'stopped'} on 127.0.0.1:{proxy_port()}")
-    print(f"history: {log_path()} ({len(read_flows())} flows)")
+    flows = read_flows()
+    eng = find_engagement()
+    target = engagement_target(eng)
+    if eng:
+        mine = len(engagement_flows(flows, target))
+        print(f"history: {log_path()} ({len(flows)} flows, {mine} for {target})")
+        # The capture file is shared by every engagement, so say plainly that the
+        # rest belong to other targets rather than letting them read as yours.
+        if mine != len(flows):
+            print(f"         {len(flows) - mine} flow(s) belong to OTHER engagements and are not shown "
+                  "by default; `--all-hosts` to include them.")
+        print(f"engagement: {os.path.basename(eng)}")
+    else:
+        print(f"history: {log_path()} ({len(flows)} flows)")
+        print("engagement: (none open here — reads are not scoped to a target)")
     # A scope left over from an earlier engagement silently drops every capture
     # for any other host, which looks exactly like a dead proxy: status says
     # running, traffic gets a 200, and history never grows. Say it out loud.
@@ -660,6 +724,15 @@ def cmd_status(a):
     if scope:
         print(f"scope:   ONLY {', '.join(scope)} is captured. Anything else is DROPPED.")
         print("         `hacksor-proxy scope clear` to capture every host again.")
+        # The scope persists across engagements. Pointed at a previous target it
+        # drops everything for this one, which looks exactly like a working
+        # proxy that found nothing — the worst kind of stale state.
+        if target and not any(target in h.lower() or h.lower() in target for h in scope):
+            print(f"         WARNING: none of those hosts match this engagement ({target}). The scope "
+                  "is left over\n"
+                  "         from a different engagement and EVERY capture for this one is being "
+                  "dropped.\n"
+                  f"         Fix it: `hacksor-proxy scope clear` then `hacksor-proxy scope add {target}`")
     else:
         print("scope:   (none) every host is captured")
     print(f"rules:   {rules_path()}")
@@ -676,6 +749,8 @@ def build_parser():
     h.add_argument("--mime"); h.add_argument("--search", help="regex over url+headers+bodies")
     h.add_argument("--grep", help="regex that must match the response")
     h.add_argument("--in-scope", action="store_true", dest="in_scope")
+    h.add_argument("--all-hosts", action="store_true", dest="all_hosts",
+                   help="include flows from OTHER engagements (default: only this engagement's target)")
     h.add_argument("--limit", type=int, default=50); h.add_argument("--json", action="store_true")
     h.set_defaults(fn=cmd_history)
 

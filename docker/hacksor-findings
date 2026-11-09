@@ -66,15 +66,68 @@ MEM_MAX_ENTRIES = 12
 MEM_MAX_CHARS = 2400
 
 
-def store_path(explicit=None):
+# How the app itself decides a directory is an engagement. Kept identical so the
+# CLI and the UI never disagree about which engagement is open.
+ENGAGEMENT_MARKER = "ENGAGEMENT_NOTES.md"
+
+
+def find_engagement(start=None):
+    """The engagement directory containing `start`, or None.
+
+    Engagements live as sibling directories under a parent the agent often sits
+    in (it opens a chat in ~/sec and cd's into the target per command), so the
+    parent itself is NOT an engagement and must not resolve to one.
+    """
+    cur = os.path.abspath(start or os.getcwd())
+    home = os.path.abspath(os.path.expanduser("~"))
+    for _ in range(8):
+        if os.path.isfile(os.path.join(cur, ENGAGEMENT_MARKER)):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur or cur == home:
+            return None
+        cur = parent
+    return None
+
+
+def store_path(explicit=None, engagement=None):
+    """Where findings go, in order of how explicit the instruction was.
+
+    There is deliberately NO shared fallback. A single store under ~/.hacksor
+    accumulated 167 findings across 22 unrelated target domains, so a new
+    session's first `list` showed another client's criticals, and `next_id`
+    counted up across all of them. For pentest work that is a confidentiality
+    failure, not an inconvenience — so when no engagement is open this refuses
+    and says how to choose one.
+    """
     if explicit:
         return explicit
+    if engagement:
+        d = os.path.abspath(os.path.expanduser(engagement))
+        if not os.path.isdir(d):
+            raise SystemExit(f"hacksor-findings: no such engagement directory: {d}")
+        return os.path.join(d, "findings.jsonl")
     env = os.environ.get("HACKSOR_FINDINGS")
     if env:
         return env
+    eng = find_engagement()
+    if eng:
+        return os.path.join(eng, "findings.jsonl")
+    # An engagement directory that predates the marker still works if its store
+    # is right here.
     if os.path.exists("findings.jsonl"):
         return os.path.abspath("findings.jsonl")
-    return os.path.expanduser("~/.hacksor/findings.jsonl")
+    raise SystemExit(
+        "hacksor-findings: no engagement is open here, and there is no shared store to fall back "
+        "on (that is deliberate — it used to mix unrelated clients' findings).\n"
+        f"  cwd: {os.getcwd()}\n"
+        "Choose one explicitly:\n"
+        "  cd <engagement dir>                     # a directory holding " + ENGAGEMENT_MARKER + "\n"
+        "  hacksor-findings --engagement <dir> ... # work on that engagement from anywhere\n"
+        "  hacksor-findings --file <path> ...      # an explicit store\n"
+        "Cross-engagement knowledge is meant to travel through the shared notes and "
+        "`hacksor-findings lesson`/`memory`, not by reading another engagement's findings."
+    )
 
 
 def load(path):
@@ -191,7 +244,7 @@ def fp_matches(title):
 
 
 def cmd_add(a):
-    path = store_path(a.file)
+    path = store_path(a.file, a.engagement)
     items = load(path)
     sev = a.severity or sev_from_cvss(a.cvss) or "medium"
     if sev not in SEV:
@@ -219,12 +272,16 @@ def cmd_add(a):
     elif not (rec["poc_expect"] or rec["poc_expect_absent"]):
         print("  note: no --expect, so verification can only check the command's exit status.", file=sys.stderr)
     for hit in fp_matches(a.title):
-        print(f"  WARNING: an operator previously SUPPRESSED a similar finding: "
-              f"{hit.get('title')!r} ({hit.get('reason') or 'no reason given'})", file=sys.stderr)
+        # The reason, never the stored title: that title belongs to another
+        # engagement and naming it here would carry one client's finding into
+        # another client's session.
+        print(f"  WARNING: a similar finding was previously SUPPRESSED by an operator — reason: "
+              f"{hit.get('reason') or '(none recorded)'}. Read that reason before reporting this.",
+              file=sys.stderr)
 
 
 def cmd_update(a):
-    path = store_path(a.file)
+    path = store_path(a.file, a.engagement)
     items = load(path)
     it = find(items, a.id)
     for k in ("title", "cvss", "cvss_vector", "owasp", "url", "description", "evidence", "remediation", "status"):
@@ -242,7 +299,7 @@ def cmd_update(a):
 
 
 def cmd_rm(a):
-    path = store_path(a.file)
+    path = store_path(a.file, a.engagement)
     items = load(path)
     find(items, a.id)
     items = [x for x in items if x.get("id") != ("F" + a.id.lstrip("F"))]
@@ -251,7 +308,7 @@ def cmd_rm(a):
 
 
 def cmd_clear(a):
-    path = store_path(a.file)
+    path = store_path(a.file, a.engagement)
     save_all(path, [])
     print("cleared")
 
@@ -311,7 +368,7 @@ def run_poc(rec, timeout):
 
 
 def cmd_verify(a):
-    path = store_path(a.file)
+    path = store_path(a.file, a.engagement)
     items = load(path)
     targets = [x for x in items if x.get("poc")] if a.all else [find(items, a.id)]
     if a.all and not targets:
@@ -338,7 +395,7 @@ def cmd_verify(a):
 
 
 def cmd_triage(a):
-    path = store_path(a.file)
+    path = store_path(a.file, a.engagement)
     items = load(path)
     it = find(items, a.id)
     it["triage"] = a.state
@@ -400,12 +457,18 @@ def memory_digest():
                 bit += f" -> {rec['instead']}"
             lines.append(bit)
     if fps:
-        lines.append("Findings an operator previously rejected as false positives:")
+        # Reasons only. A suppressed finding's title names the client and the
+        # system it was found in, and this digest is injected into EVERY turn —
+        # including turns for a different client. The titles stay on disk for
+        # matching at `add` time, which is local to this machine.
+        lines.append("Why an operator rejected earlier findings (apply the same scrutiny here):")
+        seen = set()
         for rec in fps:
-            bit = f"- {rec.get('title')}"
-            if rec.get("reason"):
-                bit += f" ({rec['reason']})"
-            lines.append(bit)
+            reason = (rec.get("reason") or "").strip()
+            if not reason or reason.lower() in seen:
+                continue
+            seen.add(reason.lower())
+            lines.append(f"- {reason}")
     text = "\n".join(lines)
     if len(text) > MEM_MAX_CHARS:
         text = text[:MEM_MAX_CHARS].rsplit("\n", 1)[0] + "\n- (older entries omitted)"
@@ -437,8 +500,166 @@ def verdict(it):
     return "unverified" if it.get("poc") else "no PoC"
 
 
+def engagement_root(explicit=None):
+    """The directory engagements live under, for the cross-engagement listing."""
+    for cand in (explicit, os.environ.get("HACKSOR_ENGAGEMENTS")):
+        if cand:
+            d = os.path.abspath(os.path.expanduser(cand))
+            if os.path.isdir(d):
+                return d
+            raise SystemExit(f"hacksor-findings: no such directory: {d}")
+    # The engagement we are in sits under it; otherwise the cwd may be it.
+    eng = find_engagement()
+    if eng:
+        return os.path.dirname(eng)
+    if any(os.path.isfile(os.path.join(os.getcwd(), d, ENGAGEMENT_MARKER))
+           for d in os.listdir(os.getcwd()) if os.path.isdir(os.path.join(os.getcwd(), d))):
+        return os.getcwd()
+    raise SystemExit(
+        "hacksor-findings: cannot tell where engagements live. Pass --root <dir> or set "
+        "HACKSOR_ENGAGEMENTS."
+    )
+
+
+def all_engagements(root, max_depth=3):
+    """Engagement directories under `root`, at any depth up to `max_depth`.
+
+    Not just direct children: engagements are commonly grouped a level or two
+    down (`sec/<client>/<target>/`), and looking only at the top level found
+    none of them.
+    """
+    out = []
+
+    def walk(d, depth):
+        if depth > max_depth:
+            return
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            return
+        for name in names:
+            if name.startswith("."):
+                continue
+            sub = os.path.join(d, name)
+            if not os.path.isdir(sub) or os.path.islink(sub):
+                continue
+            if os.path.isfile(os.path.join(sub, ENGAGEMENT_MARKER)):
+                out.append(sub)
+                continue  # an engagement is a leaf; do not recurse into its artifacts
+            walk(sub, depth + 1)
+
+    walk(os.path.abspath(os.path.expanduser(root)), 1)
+    return out
+
+
+def target_of(rec):
+    """The registrable-ish domain a finding is about, from its url."""
+    u = (rec.get("url") or "").strip()
+    m = re.match(r"[a-z][a-z0-9+.-]*://([^/\s:]+)", u, re.I)
+    host = (m.group(1) if m else u.split("/")[0]).lower()
+    host = host.split("@")[-1]
+    parts = [x for x in host.split(".") if x]
+    if len(parts) >= 2 and not host.replace(".", "").isdigit():
+        return ".".join(parts[-2:])
+    return host or ""
+
+
+def slugs_of(dirname):
+    """Loose keys for matching an engagement directory name to a domain."""
+    base = os.path.basename(dirname).lower()
+    return {base, base.replace("_", "."), base.replace("-", "."), base.replace("_", "").replace("-", "")}
+
+
+def cmd_split(a):
+    """Partition a mixed store into per-engagement stores. Never destructive.
+
+    This exists because the shared store accumulated 167 findings across 22
+    unrelated targets before the default was fixed. The source file is left
+    untouched; separating it by hand would mean editing JSONL.
+    """
+    src = os.path.abspath(os.path.expanduser(a.source))
+    items = load(src)
+    if not items:
+        raise SystemExit(f"hacksor-findings: nothing to split in {src}")
+    root = engagement_root(a.root)
+    dirs = all_engagements(root)
+
+    groups = {}
+    for rec in items:
+        groups.setdefault(target_of(rec), []).append(rec)
+
+    plan, unmatched = [], []
+    for domain, recs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        hit = None
+        for d in dirs:
+            sl = slugs_of(d)
+            if domain and (domain in sl or any(domain.replace(".", s) in sl for s in ("_", "-", ""))):
+                hit = d
+                break
+            # Fall back to the leading label: "acme.example" -> a dir named "acme".
+            if domain and domain.split(".")[0] and domain.split(".")[0] in sl:
+                hit = d
+                break
+        (plan if hit else unmatched).append((domain or "(no url)", recs, hit))
+
+    for domain, recs, dest in plan:
+        print(f"{len(recs):4} finding(s)  {domain:32} -> {os.path.basename(dest)}")
+    for domain, recs, _ in unmatched:
+        print(f"{len(recs):4} finding(s)  {domain:32} -> (no engagement directory found)")
+
+    if not a.apply:
+        print("\nDry run. Nothing written. Re-run with --apply to write the matched groups.")
+        print("The source file is never modified, so this is safe to repeat.")
+        return
+
+    written = 0
+    for domain, recs, dest in plan:
+        target = os.path.join(dest, "findings.jsonl")
+        existing = load(target)
+        have = {(x.get("title"), x.get("url")) for x in existing}
+        fresh = [r for r in recs if (r.get("title"), r.get("url")) not in have]
+        if not fresh:
+            print(f"  {os.path.basename(dest)}: already has all {len(recs)}")
+            continue
+        # Re-number into the destination so ids are per-engagement again.
+        merged = list(existing)
+        for r in fresh:
+            r = dict(r)
+            r["id"] = next_id(merged)
+            merged.append(r)
+        save_all(target, merged)
+        written += len(fresh)
+        print(f"  {os.path.basename(dest)}: +{len(fresh)} (now {len(merged)})")
+    print(f"\nwrote {written} finding(s). {src} left intact — delete it yourself once you have checked.")
+    if unmatched:
+        print(f"{sum(len(r) for _, r, _ in unmatched)} finding(s) had no matching engagement directory "
+              "and were NOT written anywhere.")
+
+
+def cmd_engagements(a):
+    """List engagements and what each holds. Reading ACROSS them is opt-in."""
+    root = engagement_root(a.root)
+    rows = []
+    for d in all_engagements(root):
+        items = load(os.path.join(d, "findings.jsonl"))
+        counts = {s: sum(1 for x in items if x.get("severity") == s) for s in SEV}
+        rows.append((os.path.basename(d), len(items), counts))
+    if a.json:
+        print(json.dumps([{"engagement": n, "findings": c, "by_severity": s} for n, c, s in rows], indent=2))
+        return
+    if not rows:
+        print(f"(no engagements under {root})")
+        return
+    print(f"{'ENGAGEMENT':38}  {'FINDINGS':8}  BY SEVERITY")
+    for n, c, counts in rows:
+        bits = ", ".join(f"{counts[s]} {s}" for s in SEV if counts[s]) or "-"
+        print(f"{n[:38]:38}  {c:<8}  {bits}")
+    print(f"\n{len(rows)} engagement(s) under {root}")
+    print("Read one with: hacksor-findings --engagement <dir> list")
+
+
 def cmd_list(a):
-    path = store_path(a.file)
+    path = store_path(a.file, a.engagement)
     items = sorted(load(path), key=sort_key)
     if a.severity:
         items = [x for x in items if x.get("severity") == a.severity]
@@ -458,12 +679,12 @@ def cmd_list(a):
 
 
 def cmd_show(a):
-    it = find(load(store_path(a.file)), a.id)
+    it = find(load(store_path(a.file, a.engagement)), a.id)
     print(json.dumps(it, indent=2))
 
 
 def cmd_report(a):
-    path = store_path(a.file)
+    path = store_path(a.file, a.engagement)
     items = sorted(load(path), key=sort_key)
     if not a.include_suppressed:
         items = [x for x in items if x.get("triage") != "suppressed"]
@@ -529,6 +750,7 @@ def cmd_report(a):
 def build_parser():
     p = argparse.ArgumentParser(prog="hacksor-findings", description="Structured findings + report generator.")
     p.add_argument("--file", help="findings JSONL path (overrides default)")
+    p.add_argument("--engagement", help="work on another engagement's store, by directory (explicit opt-in)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_common(sp):
@@ -588,6 +810,17 @@ def build_parser():
     lb = lnsub.add_parser("list", help="list lessons")
     lb.add_argument("--json", action="store_true")
     ln.set_defaults(fn=cmd_lesson)
+
+    en = sub.add_parser("engagements", help="list engagements and their finding counts (reading one is opt-in)")
+    en.add_argument("--root", help="directory engagements live under")
+    en.add_argument("--json", action="store_true")
+    en.set_defaults(fn=cmd_engagements)
+
+    sp = sub.add_parser("split", help="partition a mixed store into per-engagement stores (non-destructive)")
+    sp.add_argument("source", nargs="?", default=os.path.expanduser("~/.hacksor/findings.jsonl"))
+    sp.add_argument("--root", help="directory engagements live under")
+    sp.add_argument("--apply", action="store_true", help="actually write (default is a dry run)")
+    sp.set_defaults(fn=cmd_split)
 
     mm = sub.add_parser("memory", help="show the digest Hacksor injects into every turn")
     mm.add_argument("--json", action="store_true")
