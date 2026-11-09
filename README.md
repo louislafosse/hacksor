@@ -200,8 +200,9 @@ The Docker runtime ships these on PATH (non-exhaustive):
 - **CVE intel / exploits:** cvemap, searchsploit, gh (GitHub CLI).
 - **OOB / utility:** interactsh-client, socat, netcat, tcpdump, openssl, binwalk,
   exiftool, ripgrep, SecLists and wordlists under `/usr/share`.
-- **Hacksor CLIs:** hacksor-proxy, hacksor-findings, hacksor-session,
-  hacksor-subagent, hacksor-shodan.
+- **Hacksor CLIs:** hacksor-proxy, hacksor-findings (findings carry a re-runnable
+  PoC that `verify` re-executes, plus triage, cross-engagement false-positive
+  memory and lessons), hacksor-session, hacksor-subagent, hacksor-shodan.
 
 ## Install
 

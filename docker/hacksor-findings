@@ -4,30 +4,66 @@
 Record findings as you confirm them (severity, CVSS, OWASP category, affected URL,
 repro/evidence), then generate a clean Markdown pentest report. Stdlib-only.
 
+A finding should carry a PROOF, not a description of one. `--poc` stores a command
+that re-demonstrates the issue and `--expect` the string or pattern that proves it
+worked; `verify` re-runs that command and records what actually happened. An
+unverified finding is a claim, and the report says so.
+
 Storage: JSONL, resolved in order: --file, $HACKSOR_FINDINGS, ./findings.jsonl if a
 findings.jsonl already exists in the CWD, else ~/.hacksor/findings.jsonl.
+
+Two stores live OUTSIDE the engagement directory, in ~/.hacksor, because they are
+the only things meant to outlive one target: `lessons.jsonl` (what went wrong and
+what to do instead) and `fp-memory.jsonl` (findings an operator rejected). Hacksor
+injects a capped digest of both into every turn, so they are read without anyone
+having to remember to look.
 
 Usage:
   hacksor-findings add -t "IDOR on /api/orders" -s high --cvss 8.1 \
       --owasp "A01: Broken Access Control" -u https://t/api/orders/123 \
       -d "User A reads user B's orders by changing the id" \
-      -e "GET /api/orders/124 -> 200 with B's data"
-  hacksor-findings list [--severity high] [--json]
+      -e "GET /api/orders/124 -> 200 with B's data" \
+      --poc 'curl -s -H "Cookie: $A" https://t/api/orders/124' --expect '"owner":"userB"'
+  hacksor-findings verify <id> | --all [--timeout 120] [--dry-run]
+  hacksor-findings triage <id> accepted|suppressed|new [--reason "..."]
+  hacksor-findings lesson add -t "..." -w "what went wrong" -i "what to do instead"
+  hacksor-findings lesson list [--json]
+  hacksor-findings memory [--json]          # the digest Hacksor injects
+  hacksor-findings list [--severity high] [--json] [--include-suppressed]
   hacksor-findings show <id>
   hacksor-findings update <id> [-s critical] [--cvss 9.1] ...
   hacksor-findings rm <id>
-  hacksor-findings report [-o report.md] [--json]
+  hacksor-findings report [-o report.md] [--json] [--include-suppressed]
   hacksor-findings clear
+
+`verify` RUNS the stored command, so it sends traffic to the target again. Only
+verify something you are still authorized to touch; --dry-run prints without running.
 """
 
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 
 SEV = ["critical", "high", "medium", "low", "info"]
 SEV_RANK = {s: i for i, s in enumerate(SEV)}
+TRIAGE = ["new", "accepted", "suppressed"]
+
+# Cross-engagement stores. Deliberately not in the engagement directory: a lesson
+# learned on one target is worth nothing if it is filed where only that target's
+# work can see it, which is how every mistake got repeated.
+MEM_DIR = os.path.expanduser("~/.hacksor")
+LESSONS = os.path.join(MEM_DIR, "lessons.jsonl")
+FP_MEMORY = os.path.join(MEM_DIR, "fp-memory.jsonl")
+
+# What the injected digest is allowed to cost. It rides on EVERY turn, so an
+# uncapped file would quietly eat the context the engagement ledger exists to
+# protect. Newest entries win.
+MEM_MAX_ENTRIES = 12
+MEM_MAX_CHARS = 2400
 
 
 def store_path(explicit=None):
@@ -97,6 +133,63 @@ def find(items, fid):
     raise SystemExit(f"hacksor-findings: no finding '{fid}'")
 
 
+def read_poc(val):
+    """A PoC given inline, or read from a file with @path, or from stdin with @-."""
+    if not val:
+        return None
+    if val == "@-":
+        return sys.stdin.read().strip() or None
+    if val.startswith("@"):
+        try:
+            with open(os.path.expanduser(val[1:])) as f:
+                return f.read().strip() or None
+        except OSError as e:
+            raise SystemExit(f"hacksor-findings: cannot read PoC file {val[1:]}: {e}")
+    return val
+
+
+def append_jsonl(path, rec):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def signature(title):
+    """A loose key for 'the same kind of finding', for false-positive memory.
+
+    Deliberately crude — lowercase alphanumeric words, order-independent. The
+    point is to catch "Missing X header on Y" reported again next week against a
+    different host, which an exact-match key never would.
+    """
+    words = [w for w in re.split(r"[^a-z0-9]+", (title or "").lower()) if len(w) > 2]
+    return " ".join(sorted(set(words)))
+
+
+def fp_matches(title):
+    """Previously suppressed findings whose signature overlaps this title."""
+    sig = set(signature(title).split())
+    if not sig:
+        return []
+    out = []
+    for rec in load(FP_MEMORY):
+        other = set(signature(rec.get("title")).split())
+        if not other:
+            continue
+        shared = sig & other
+        # Containment against the SHORTER title, not Jaccard over the union: the
+        # same finding written out at more length ("Admin panel accessible
+        # without authentication" vs "Admin panel without auth") scores 0.5 on
+        # Jaccard and gets missed, but 0.75 here.
+        #
+        # The three-word floor is what stops the obvious false alarm:
+        # "Missing CSP header" and "Missing HSTS header" share only two words, so
+        # they are left alone despite high containment.
+        containment = len(shared) / max(min(len(sig), len(other)), 1)
+        if len(shared) >= 3 and containment >= 0.6:
+            out.append(rec)
+    return out
+
+
 def cmd_add(a):
     path = store_path(a.file)
     items = load(path)
@@ -108,11 +201,26 @@ def cmd_add(a):
         "cvss": a.cvss, "cvss_vector": a.cvss_vector, "owasp": a.owasp, "url": a.url,
         "description": a.description, "evidence": a.evidence,
         "remediation": a.remediation, "status": a.status or "open",
+        # A command that re-demonstrates the issue, and what its output must
+        # contain to count as a pass. Without these the finding cannot be
+        # re-proved by anyone — including the next session.
+        "poc": read_poc(a.poc), "poc_expect": a.expect, "poc_expect_absent": a.expect_absent,
+        # Operator judgement, kept separate from whether it reproduces: a human
+        # accepting a finding and a machine re-running it are different facts.
+        "triage": "new", "triage_reason": None,
+        "verification": None,
         "ts": time.time(),
     }
     items.append(rec)
     save_all(path, items)
     print(f"{rec['id']}  [{sev}] {a.title}")
+    if not rec["poc"]:
+        print("  note: no --poc, so this finding cannot be verified or re-proved later.", file=sys.stderr)
+    elif not (rec["poc_expect"] or rec["poc_expect_absent"]):
+        print("  note: no --expect, so verification can only check the command's exit status.", file=sys.stderr)
+    for hit in fp_matches(a.title):
+        print(f"  WARNING: an operator previously SUPPRESSED a similar finding: "
+              f"{hit.get('title')!r} ({hit.get('reason') or 'no reason given'})", file=sys.stderr)
 
 
 def cmd_update(a):
@@ -148,8 +256,185 @@ def cmd_clear(a):
     print("cleared")
 
 
+def run_poc(rec, timeout):
+    """Re-run a finding's PoC and judge the result.
+
+    `shell=True` is the point, not an oversight: the PoC *is* a shell command the
+    operator or agent wrote to demonstrate the issue. Nothing here comes from the
+    target.
+    """
+    poc = rec.get("poc")
+    if not poc:
+        return {"state": "error", "reason": "no PoC recorded", "at": time.time()}
+    try:
+        r = subprocess.run(poc, shell=True, capture_output=True, text=True, timeout=timeout)
+        out = (r.stdout or "") + (r.stderr or "")
+        exit_code = r.returncode
+    except subprocess.TimeoutExpired:
+        return {"state": "error", "reason": f"PoC timed out after {timeout}s", "at": time.time()}
+    except Exception as e:
+        return {"state": "error", "reason": f"PoC could not run: {e}", "at": time.time()}
+
+    want, want_absent = rec.get("poc_expect"), rec.get("poc_expect_absent")
+    reasons = []
+    ok = True
+    if want:
+        # Matched as a regex, falling back to a literal substring when the
+        # pattern is not valid regex — a PoC expectation is usually a snippet of
+        # a response body, and demanding escaped regex would be a trap.
+        try:
+            hit = re.search(want, out, re.S) is not None
+        except re.error:
+            hit = want in out
+        ok = ok and hit
+        reasons.append(("found" if hit else "DID NOT find") + f" expected {want!r}")
+    if want_absent:
+        try:
+            gone = re.search(want_absent, out, re.S) is None
+        except re.error:
+            gone = want_absent not in out
+        ok = ok and gone
+        reasons.append(("absent as required" if gone else "UNEXPECTEDLY present") + f": {want_absent!r}")
+    if not want and not want_absent:
+        # Nothing to match on, so the exit status is the only signal available.
+        ok = exit_code == 0
+        reasons.append(f"no expectation recorded; judged on exit status {exit_code}")
+
+    return {
+        "state": "confirmed" if ok else "failed",
+        "at": time.time(),
+        "exit": exit_code,
+        "reason": "; ".join(reasons),
+        # Capped: a verification record is evidence, not a log file.
+        "output": out[:2000],
+    }
+
+
+def cmd_verify(a):
+    path = store_path(a.file)
+    items = load(path)
+    targets = [x for x in items if x.get("poc")] if a.all else [find(items, a.id)]
+    if a.all and not targets:
+        print("(no finding has a PoC to verify)")
+        return
+    if a.dry_run:
+        for it in targets:
+            print(f"--- {it.get('id')} {it.get('title')}")
+            print(it.get("poc") or "(no PoC)")
+        return
+
+    worst = 0
+    for it in targets:
+        print(f"verifying {it.get('id')} — {it.get('title')}", file=sys.stderr)
+        res = run_poc(it, a.timeout)
+        it["verification"] = res
+        mark = {"confirmed": "CONFIRMED", "failed": "NOT REPRODUCED", "error": "ERROR"}[res["state"]]
+        print(f"{it.get('id')}  {mark}  {res.get('reason','')}")
+        worst = max(worst, {"confirmed": 0, "failed": 1, "error": 2}[res["state"]])
+    save_all(path, items)
+    # A non-zero exit lets a caller refuse to ship a report whose findings did
+    # not reproduce, instead of discovering it in review.
+    raise SystemExit(worst)
+
+
+def cmd_triage(a):
+    path = store_path(a.file)
+    items = load(path)
+    it = find(items, a.id)
+    it["triage"] = a.state
+    it["triage_reason"] = a.reason
+    save_all(path, items)
+    print(f"{it['id']} triaged {a.state}" + (f": {a.reason}" if a.reason else ""))
+    if a.state == "suppressed":
+        # Remembered across engagements, so the same false positive does not come
+        # back with full confidence next session.
+        append_jsonl(FP_MEMORY, {
+            "title": it.get("title"), "signature": signature(it.get("title")),
+            "reason": a.reason, "url": it.get("url"), "ts": time.time(),
+        })
+        print(f"  remembered as a false positive in {FP_MEMORY}")
+
+
+def cmd_lesson(a):
+    if a.lesson_cmd == "list":
+        items = load(LESSONS)
+        if a.json:
+            print(json.dumps(items, indent=2))
+            return
+        if not items:
+            print("(no lessons recorded yet)")
+            return
+        for rec in items:
+            when = time.strftime("%Y-%m-%d", time.localtime(rec.get("ts", 0)))
+            print(f"- [{when}] {rec.get('title')}")
+            if rec.get("wrong"):
+                print(f"    went wrong: {rec['wrong']}")
+            if rec.get("instead"):
+                print(f"    instead:    {rec['instead']}")
+        print(f"\n{len(items)} lesson(s) at {LESSONS}")
+        return
+    append_jsonl(LESSONS, {
+        "title": a.title, "wrong": a.wrong, "instead": a.instead,
+        "tags": [t.strip() for t in (a.tags or "").split(",") if t.strip()],
+        "ts": time.time(),
+    })
+    print(f"recorded lesson: {a.title}")
+
+
+def memory_digest():
+    """The capped text Hacksor injects into every turn.
+
+    Newest first and truncated to a budget, because this is paid for on every
+    single turn whether it is relevant or not.
+    """
+    lessons = load(LESSONS)[-MEM_MAX_ENTRIES:][::-1]
+    fps = load(FP_MEMORY)[-MEM_MAX_ENTRIES:][::-1]
+    if not lessons and not fps:
+        return ""
+    lines = []
+    if lessons:
+        lines.append("Lessons from earlier engagements (do not repeat these):")
+        for rec in lessons:
+            bit = f"- {rec.get('title')}"
+            if rec.get("instead"):
+                bit += f" -> {rec['instead']}"
+            lines.append(bit)
+    if fps:
+        lines.append("Findings an operator previously rejected as false positives:")
+        for rec in fps:
+            bit = f"- {rec.get('title')}"
+            if rec.get("reason"):
+                bit += f" ({rec['reason']})"
+            lines.append(bit)
+    text = "\n".join(lines)
+    if len(text) > MEM_MAX_CHARS:
+        text = text[:MEM_MAX_CHARS].rsplit("\n", 1)[0] + "\n- (older entries omitted)"
+    return text
+
+
+def cmd_memory(a):
+    if a.json:
+        print(json.dumps({"lessons": load(LESSONS), "false_positives": load(FP_MEMORY)}, indent=2))
+        return
+    d = memory_digest()
+    print(d if d else "(nothing remembered yet — record with `hacksor-findings lesson add`)")
+
+
 def sort_key(it):
     return (SEV_RANK.get(it.get("severity", "info"), 99), it.get("id", ""))
+
+
+def verdict(it):
+    """One word for where a finding stands, for a human scanning a list."""
+    v = it.get("verification") or {}
+    state = v.get("state")
+    if state == "confirmed":
+        return "reproduced"
+    if state == "failed":
+        return "NOT REPRO"
+    if state == "error":
+        return "verify error"
+    return "unverified" if it.get("poc") else "no PoC"
 
 
 def cmd_list(a):
@@ -157,16 +442,18 @@ def cmd_list(a):
     items = sorted(load(path), key=sort_key)
     if a.severity:
         items = [x for x in items if x.get("severity") == a.severity]
+    if not a.include_suppressed:
+        items = [x for x in items if x.get("triage") != "suppressed"]
     if a.json:
         print(json.dumps(items, indent=2))
         return
     if not items:
         print("(no findings — record them with `hacksor-findings add`)")
         return
-    print(f"{'ID':4}  {'SEVERITY':9}  {'CVSS':4}  {'OWASP':22}  TITLE")
+    print(f"{'ID':4}  {'SEVERITY':9}  {'VERIFIED':14}  {'CVSS':4}  TITLE")
     for it in items:
-        print(f"{it.get('id',''):4}  {it.get('severity',''):9}  "
-              f"{str(it.get('cvss') or ''):4}  {(it.get('owasp') or '')[:22]:22}  {it.get('title','')}")
+        print(f"{it.get('id',''):4}  {it.get('severity',''):9}  {verdict(it):14}  "
+              f"{str(it.get('cvss') or ''):4}  {it.get('title','')}")
     print(f"\n{len(items)} finding(s) at {path}")
 
 
@@ -178,17 +465,21 @@ def cmd_show(a):
 def cmd_report(a):
     path = store_path(a.file)
     items = sorted(load(path), key=sort_key)
+    if not a.include_suppressed:
+        items = [x for x in items if x.get("triage") != "suppressed"]
     if a.json:
         out = json.dumps(items, indent=2)
     else:
         counts = {s: sum(1 for x in items if x.get("severity") == s) for s in SEV}
+        repro = sum(1 for x in items if (x.get("verification") or {}).get("state") == "confirmed")
         lines = ["# Penetration Test Findings", "",
                  f"_{len(items)} finding(s) — " +
                  ", ".join(f"{counts[s]} {s}" for s in SEV if counts[s]) + "_", "",
-                 "## Summary", "", "| ID | Severity | CVSS | OWASP | Title |",
-                 "|----|----------|------|-------|-------|"]
+                 f"_{repro} of {len(items)} reproduced by a recorded PoC._", "",
+                 "## Summary", "", "| ID | Severity | Verified | CVSS | OWASP | Title |",
+                 "|----|----------|----------|------|-------|-------|"]
         for it in items:
-            lines.append(f"| {it.get('id','')} | {it.get('severity','')} | "
+            lines.append(f"| {it.get('id','')} | {it.get('severity','')} | {verdict(it)} | "
                          f"{it.get('cvss') or ''} | {it.get('owasp') or ''} | {it.get('title','')} |")
         lines += ["", "## Details", ""]
         for it in items:
@@ -211,6 +502,18 @@ def cmd_report(a):
                 lines.append(f"**Description**\n\n{it['description']}\n")
             if it.get("evidence"):
                 lines.append(f"**Evidence / Reproduction**\n\n```\n{it['evidence']}\n```\n")
+            if it.get("poc"):
+                lines.append(f"**Proof of concept** (re-runnable)\n\n```sh\n{it['poc']}\n```\n")
+                v = it.get("verification") or {}
+                if v.get("state"):
+                    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(v.get("at", 0)))
+                    lines.append(f"**Verification:** {verdict(it)} at {when} — {v.get('reason','')}\n")
+                else:
+                    lines.append("**Verification:** not yet re-run (`hacksor-findings verify "
+                                 f"{it.get('id','')}`)\n")
+            else:
+                lines.append("**Verification:** no PoC recorded, so this finding has not been "
+                             "mechanically reproduced.\n")
             if it.get("remediation"):
                 lines.append(f"**Remediation**\n\n{it['remediation']}\n")
             lines.append("")
@@ -238,6 +541,10 @@ def build_parser():
         sp.add_argument("-e", "--evidence")
         sp.add_argument("--remediation")
         sp.add_argument("--status")
+        sp.add_argument("--poc", help="a command that re-demonstrates the issue; @file or @- to read it")
+        sp.add_argument("--expect", help="string/regex the PoC output MUST contain to count as proof")
+        sp.add_argument("--expect-absent", dest="expect_absent",
+                        help="string/regex the PoC output must NOT contain")
 
     ad = sub.add_parser("add", help="record a finding")
     ad.add_argument("-t", "--title", required=True)
@@ -255,12 +562,42 @@ def build_parser():
 
     ls = sub.add_parser("list", help="list findings")
     ls.add_argument("--severity", choices=SEV); ls.add_argument("--json", action="store_true")
+    ls.add_argument("--include-suppressed", action="store_true", dest="include_suppressed")
     ls.set_defaults(fn=cmd_list)
+
+    vf = sub.add_parser("verify", help="re-run a finding's PoC and record whether it still reproduces")
+    vf.add_argument("id", nargs="?")
+    vf.add_argument("--all", action="store_true", help="verify every finding that has a PoC")
+    vf.add_argument("--timeout", type=int, default=120)
+    vf.add_argument("--dry-run", action="store_true", dest="dry_run", help="print the PoC without running it")
+    vf.set_defaults(fn=cmd_verify)
+
+    tr = sub.add_parser("triage", help="record the operator's judgement (separate from verification)")
+    tr.add_argument("id")
+    tr.add_argument("state", choices=TRIAGE)
+    tr.add_argument("--reason")
+    tr.set_defaults(fn=cmd_triage)
+
+    ln = sub.add_parser("lesson", help="record or list cross-engagement lessons")
+    lnsub = ln.add_subparsers(dest="lesson_cmd", required=True)
+    la = lnsub.add_parser("add", help="record what went wrong and what to do instead")
+    la.add_argument("-t", "--title", required=True)
+    la.add_argument("-w", "--wrong", help="what went wrong")
+    la.add_argument("-i", "--instead", help="what to do instead next time")
+    la.add_argument("--tags")
+    lb = lnsub.add_parser("list", help="list lessons")
+    lb.add_argument("--json", action="store_true")
+    ln.set_defaults(fn=cmd_lesson)
+
+    mm = sub.add_parser("memory", help="show the digest Hacksor injects into every turn")
+    mm.add_argument("--json", action="store_true")
+    mm.set_defaults(fn=cmd_memory)
 
     sh = sub.add_parser("show", help="show one finding"); sh.add_argument("id"); sh.set_defaults(fn=cmd_show)
 
     rp = sub.add_parser("report", help="generate a Markdown/JSON report")
     rp.add_argument("-o", "--output"); rp.add_argument("--json", action="store_true")
+    rp.add_argument("--include-suppressed", action="store_true", dest="include_suppressed")
     rp.set_defaults(fn=cmd_report)
 
     cl = sub.add_parser("clear", help="delete all findings"); cl.set_defaults(fn=cmd_clear)
@@ -269,4 +606,6 @@ def build_parser():
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
+    if getattr(args, "cmd", None) == "verify" and not args.all and not args.id:
+        raise SystemExit("hacksor-findings verify: pass a finding id or --all")
     args.fn(args)
