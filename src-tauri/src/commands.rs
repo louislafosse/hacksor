@@ -1439,9 +1439,6 @@ pub struct SettingsView {
     pub services_mode: String,
     pub warn_without_vpn: bool,
     pub limit_runtime_mount: bool,
-    pub has_cloudflare: bool,
-    pub cloudflare_email: Option<String>,
-    pub cloudflare_account_id: Option<String>,
 }
 
 #[tauri::command]
@@ -1461,9 +1458,6 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<SettingsView, St
         services_mode: s.services_mode.clone(),
         warn_without_vpn: s.warn_without_vpn,
         limit_runtime_mount: s.limit_runtime_mount,
-        has_cloudflare: s.cloudflare_api_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false),
-        cloudflare_email: s.cloudflare_email.clone(),
-        cloudflare_account_id: s.cloudflare_account_id.clone(),
     })
 }
 
@@ -1482,9 +1476,6 @@ pub struct SaveSettingsArgs {
     pub services_mode: Option<String>,
     pub warn_without_vpn: Option<bool>,
     pub limit_runtime_mount: Option<bool>,
-    pub cloudflare_api_key: Option<String>,
-    pub cloudflare_email: Option<String>,
-    pub cloudflare_account_id: Option<String>,
 }
 
 #[tauri::command]
@@ -1564,14 +1555,6 @@ pub async fn save_settings(
         // Takes effect when the container is next created, not mid-session.
         s.limit_runtime_mount = v;
     }
-    // Cloudflare creds for the `cloudfish` recon tool. Empty string clears. No
-    // harness restart — they're just mirrored to ~/.cloudflare on save() below.
-    let cf_set = |cur: &mut Option<String>, v: Option<String>| {
-        if let Some(v) = v { *cur = if v.trim().is_empty() { None } else { Some(v.trim().to_string()) }; }
-    };
-    cf_set(&mut s.cloudflare_api_key, args.cloudflare_api_key);
-    cf_set(&mut s.cloudflare_email, args.cloudflare_email);
-    cf_set(&mut s.cloudflare_account_id, args.cloudflare_account_id);
     s.save(&state.codex_home).map_err(|e| e.to_string())?;
     s.export_env();
     drop(s);
@@ -5230,18 +5213,27 @@ fn memory_note() -> String {
         }
     }
     if !fps.is_empty() {
-        out.push_str("\nRejected as false positives before — do not re-report without new evidence:\n");
+        // Reasons only, never the stored titles. A suppressed finding's title
+        // names the client and the system it was found in, and this digest goes
+        // into EVERY turn — including turns for an unrelated target. The titles
+        // stay on disk, where `hacksor-findings add` matches against them
+        // locally and reports the reason without naming the other engagement.
+        out.push_str(
+            "\nWhy an operator rejected earlier findings elsewhere — apply the same scrutiny, \
+             and do not re-report one of these shapes without new evidence:\n",
+        );
+        let mut seen: Vec<String> = Vec::new();
         for f in &fps {
-            let title = str_of(f, "title");
-            if title.is_empty() {
-                continue;
-            }
             let reason = str_of(f, "reason");
             if reason.is_empty() {
-                out.push_str(&format!("- {title}\n"));
-            } else {
-                out.push_str(&format!("- {title} ({reason})\n"));
+                continue;
             }
+            let key = reason.to_lowercase();
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            out.push_str(&format!("- {reason}\n"));
         }
     }
     if out.len() > MAX_CHARS {
