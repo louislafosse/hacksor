@@ -1,3 +1,23 @@
+# [1.22.0](https://github.com/louislafosse/hacksor/compare/v1.21.0...v1.22.0) (2026-11-09)
+
+
+### Bug Fixes
+
+* **prompt:** one engagement at a time, and nothing of this machine leaves ([fdc68c2](https://github.com/louislafosse/hacksor/commit/fdc68c2896fb5863bf0edb4683bbdee070262840))
+* **prompt:** the JavaScript pass belongs in recon, not at the end ([1b857e7](https://github.com/louislafosse/hacksor/commit/1b857e756b1bc1eba325c455f1f366d2713affd8))
+
+
+### Features
+
+* **findings:** make a finding carry a proof that can be re-run ([05b0dfb](https://github.com/louislafosse/hacksor/commit/05b0dfb1747769d60091775a07b8de56ce428965))
+* **findings:** scope findings and proxy history to the open engagement ([913ee4d](https://github.com/louislafosse/hacksor/commit/913ee4d5179e7e71331d1947a02aac799d981142))
+* **memory:** push what earlier engagements learned into every turn ([471a40b](https://github.com/louislafosse/hacksor/commit/471a40b69f9f61a3173f51fa94b188c0739a55ee))
+
+
+### Performance Improvements
+
+* **docker:** cut the runtime image from 21.7GB to 18.8GB ([a8d752e](https://github.com/louislafosse/hacksor/commit/a8d752ec84e302d9ce52a82d81fc8c837accd706))
+
 # [1.21.0](https://github.com/louislafosse/hacksor/compare/v1.20.2...v1.21.0) (2026-11-08)
 
 
