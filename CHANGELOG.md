@@ -1,3 +1,11 @@
+## [1.23.1](https://github.com/louislafosse/hacksor/compare/v1.23.0...v1.23.1) (2026-11-15)
+
+
+### Bug Fixes
+
+* **re:** start the Camoufox daemon when the forum server needs it ([06c8a9d](https://github.com/louislafosse/hacksor/commit/06c8a9df3fdf67e2890814bf496b9c4aa544be30))
+* **ui:** open a link from an answer in the user's browser, not in this window ([4797356](https://github.com/louislafosse/hacksor/commit/47973561ae6ee307c50bc3e59d56cbdd5d4187e0))
+
 # [1.23.0](https://github.com/louislafosse/hacksor/compare/v1.22.0...v1.23.0) (2026-11-15)
 
 
