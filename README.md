@@ -215,7 +215,7 @@ Non-exhaustive, all on PATH in the Docker runtime:
 - **JavaScript** — jsluice, sourcemapper, subjs, wakaru, webcrack, retire
 - **SAST / secrets / supply chain** — semgrep, trufflehog, gitleaks, osv-scanner, guarddog
 - **Takeover** — subjack, baddns
-- **Reverse engineering** — rea, ghidra, radare2, Unicorn
+- **Reverse engineering** — rea (REA, drives Ghidra), mcp-reverse (RE skill corpus + offset cross-reference + binary parsers, as an MCP server), ghidra, radare2, capstone (`cstool`), floss, Unicorn
 - **Auth / crypto / API** — jwt_tool, phpggc, ysoserial, kiterunner, hydra, john, hashid
 - **Cloud / CVE intel** — cloudfox, scoutsuite, cvemap, searchsploit, gh
 - **OOB / utility** — interactsh-client, socat, netcat, tcpdump, openssl, binwalk, exiftool, ripgrep, SecLists and wordlists under `/usr/share`
