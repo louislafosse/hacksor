@@ -1,3 +1,15 @@
+# [1.23.0](https://github.com/louislafosse/hacksor/compare/v1.22.0...v1.23.0) (2026-11-15)
+
+
+### Bug Fixes
+
+* **runtime:** REA had no decompiler, and nothing provisioned the browser ([f34998b](https://github.com/louislafosse/hacksor/commit/f34998b4dc0d40c6c9375b53d71d0da36a87fd92))
+
+
+### Features
+
+* **re:** forum research through Camoufox, and RE tools for every model ([b42130b](https://github.com/louislafosse/hacksor/commit/b42130bd1fc040990b890da30423daf8ca71bfb3))
+
 # [1.22.0](https://github.com/louislafosse/hacksor/compare/v1.21.0...v1.22.0) (2026-11-09)
 
 
