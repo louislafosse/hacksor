@@ -879,6 +879,45 @@ function toggleSidebar() {
   sidebar.classList.toggle("collapsed");
 }
 
+// A link in an answer belongs in the user's own browser, not in this window.
+//
+// Answers are rendered markdown, so a citation is an ordinary <a href> and a
+// click navigated the app's webview: the chat was replaced by the page, with no
+// back button and no way to return to the thread. Intercept in the CAPTURE
+// phase, before anything else sees the click, and hand the link to the OS.
+//
+// Only http/https/mailto travel outwards. Anchors the app uses for its own
+// behaviour keep working untouched, because they are href="#" or in-page ids
+// rather than absolute URLs.
+function externalHref(target: EventTarget | null): string | null {
+  const el = target as HTMLElement | null;
+  const a = el?.closest?.("a") as HTMLAnchorElement | null;
+  if (!a) return null;
+  const raw = (a.getAttribute("href") ?? "").trim();
+  return /^(https?:|mailto:)/i.test(raw) ? raw : null;
+}
+
+function openLinkOutside(e: MouseEvent) {
+  const href = externalHref(e.target);
+  if (!href) return;
+  e.preventDefault();
+  e.stopPropagation();
+  invoke("open_external", { url: href }).catch((err) => {
+    console.error("open_external failed", err);
+  });
+}
+
+document.addEventListener("click", openLinkOutside, true);
+// Middle-click is "open in a new tab" everywhere else; there are no tabs here,
+// so treat it as the same request.
+document.addEventListener(
+  "auxclick",
+  (e) => {
+    if ((e as MouseEvent).button === 1) openLinkOutside(e as MouseEvent);
+  },
+  true,
+);
+
 document.getElementById("sidetoggle")!.addEventListener("click", toggleSidebar);
 document.getElementById("win-min")!.addEventListener("click", () => getCurrentWindow().minimize().catch(() => {}));
 document.getElementById("win-max")!.addEventListener("click", () => getCurrentWindow().toggleMaximize().catch(() => {}));

@@ -454,6 +454,38 @@ pub async fn ensure_opencodex_cmd(state: State<'_, AppState>) -> Result<(), Stri
     ensure_opencodex(&state).await
 }
 
+/// Open a link from the chat in the user's own browser, not in this window.
+///
+/// Rendered markdown produces ordinary `<a href>` anchors, and a click on one
+/// navigates the app's webview — the chat disappears and is replaced by the
+/// page. The frontend intercepts those clicks and routes them here instead.
+///
+/// Only schemes a chat link legitimately uses are accepted. `file://` is
+/// refused because a link in an answer is attacker-influenced text (a target's
+/// page, a forum post, a decompiled string), and handing the OS an arbitrary
+/// local path to open is a different thing entirely from opening a web page.
+#[tauri::command]
+pub fn open_external(url: String) -> Result<(), String> {
+    let url = url.trim();
+    if url.len() > 4096 {
+        return Err("link too long".into());
+    }
+    let lower = url.to_ascii_lowercase();
+    let allowed = ["http://", "https://", "mailto:"];
+    if !allowed.iter().any(|scheme| lower.starts_with(scheme)) {
+        return Err(format!(
+            "refusing to open {}: only http, https and mailto links open externally",
+            lower.split(':').next().unwrap_or("that scheme")
+        ));
+    }
+    // A control character or whitespace could split the argument on some
+    // platforms' shells; a legitimate URL has none.
+    if url.chars().any(|c| c.is_control() || c == '"' || c.is_whitespace()) {
+        return Err("link contains characters that are not valid in a URL".into());
+    }
+    platform::open_url(url).map_err(|e| e.to_string())
+}
+
 /// Open OpenCodex's setup GUI (`ocx gui`) so the user can add providers/keys.
 #[tauri::command]
 pub fn open_opencodex_setup() -> Result<(), String> {

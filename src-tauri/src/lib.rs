@@ -116,6 +116,7 @@ pub fn run() {
             commands::opencodex_status,
             commands::ensure_opencodex_cmd,
             commands::open_opencodex_setup,
+            commands::open_external,
             commands::ocx_provider_list,
             commands::ocx_add_provider,
             commands::ocx_set_default,
