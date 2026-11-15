@@ -3532,24 +3532,34 @@ async fn start_runtime(
             );
             let _ = runtime::exec_output(RUNTIME_CONTAINER, vec!["bash".into(), "-lc".into(), setup], Some("0".into()), None).await;
         }
-        // The image pre-fetches the ~1.3 GB Camoufox engine at BUILD time
-        // (`camofox-browser fetch` in the Dockerfile), which runs as root and
-        // lands in `/root/.cache/camoufox`. At RUNTIME, `$HOME` is the
-        // bind-mounted user home (identity on Linux/macOS, `/hacksorhome` on
-        // Windows) — never `/root` — so that cache is invisible to the running
-        // container and every fresh install fails Camoufox's own version check
-        // ("installed Camoufox version could not be determined") instead of
-        // silently downloading. Seed the runtime cache from the build-time one
-        // once per fresh container so the prefetch is actually used. Detached
-        // and best-effort: if it's still copying (or missing) when the agent
-        // first opens a browser tab, camofox-browser falls back to its normal
-        // on-demand download — same as before this seed step existed.
+        // Provision the Camoufox engine into the runtime HOME if it is absent.
+        //
+        // Camoufox is the stealth Firefox behind every browser tool, and the
+        // engine is a separate 2.5 GB download that the npm package normally
+        // pulls in a postinstall. In this image that postinstall never ran (npm
+        // 12 blocks install scripts unless approved) and the old build-time
+        // `camofox-browser fetch` was a no-op against a subcommand that no
+        // longer exists, so a fresh install failed its FIRST browser call with
+        // "installed Camoufox version could not be determined" and nothing
+        // downloaded anything. Nothing in the logs said why.
+        //
+        // Install it where it belongs instead: $HOME is bind-mounted, so one
+        // copy under $HOME/.cache/camoufox survives every container and every
+        // image upgrade, and the 2.5 GB does not ride along in each image pull.
+        // Detached and idempotent — the version.json check makes repeat starts
+        // free, and a browser call that lands mid-download fails the way it
+        // always did rather than hanging the session.
         let _ = runtime::exec_detached(
             RUNTIME_CONTAINER,
             vec![
                 "sh".into(),
                 "-c".into(),
-                "[ -f \"$HOME/.cache/camoufox/version.json\" ] || { mkdir -p \"$HOME/.cache\" && cp -r /root/.cache/camoufox \"$HOME/.cache/camoufox\" 2>/dev/null; }".into(),
+                "[ -f \"$HOME/.cache/camoufox/version.json\" ] && exit 0; \
+                 mkdir -p \"$HOME/.cache\"; \
+                 cd /usr/local/lib/node_modules/camofox-browser || exit 0; \
+                 CAMOUFOX_INSTALL_DIR=\"$HOME/.cache/camoufox\" node bin/install-browser.js \
+                   >/tmp/hacksor-camoufox-engine.log 2>&1"
+                    .into(),
             ],
             exec_user(),
         )

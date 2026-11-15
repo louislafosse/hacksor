@@ -683,6 +683,8 @@ enabled = true\n",
         toml.push_str("sandbox_mode = \"danger-full-access\"\n");
     }
     let browser_mcp = is_docker;
+    // Both bundled MCP servers live in the runtime image, not on the host.
+    let in_container = is_docker;
     // In Docker mode the OpenCodex proxy runs INSIDE the same container as the
     // app-server, so it's reached at the container's own `127.0.0.1` on every
     // platform. In host mode both are on the host — also `127.0.0.1`. So the
@@ -720,6 +722,72 @@ enabled = true\n",
         toml.push_str(
             "\n[mcp_servers.camofox]\ncommand = \"camofox-mcp\"\nargs = []\nstartup_timeout_ms = 180000\ntool_timeout_sec = 300\n[mcp_servers.camofox.env]\nCAMOFOX_URL = \"http://127.0.0.1:9377\"\n",
         );
+    }
+
+    // mcp-reverse (1llu50ry/Decompile): the reverse-engineering tool surface.
+    //
+    // Registered for EVERY model rather than described in the persona, because a
+    // model only reaches a tool it can see: the model picker changes the model,
+    // not the config, so one registration here is what makes "reverse this app"
+    // behave the same on every one of them. Its catalog is 211 tools in ~93 KB,
+    // which is the reason REA is NOT registered the same way — REA advertises
+    // 255 tools in 4.6 MB (~1.1M tokens, measured against its 6.9.0 server), so
+    // it stays a CLI (`rea`), where it costs no context and works identically
+    // under every model.
+    //
+    // Only in Docker: `mcp-reverse` is installed in the runtime image, and a
+    // host-mode session has no such binary. GHIDRA_INSTALL_DIR comes from the
+    // image environment.
+    if in_container {
+        toml.push_str(
+            "\n[mcp_servers.reverse]\ncommand = \"mcp-reverse\"\nargs = []\nstartup_timeout_ms = 60000\ntool_timeout_sec = 600\n",
+        );
+        // Its memory, agent-mesh and audit directories default to its own
+        // install root, which is read-only to the agent uid, so point them at
+        // the home directory instead — the container's HOME is this same path
+        // (the host home is bind-mounted at its own location), so one value is
+        // correct on both sides.
+        if let Some(home) = dirs::home_dir() {
+            let base = home.join(".hacksor").join("mcp-reverse");
+            let p = |leaf: &str| base.join(leaf).to_string_lossy().to_string();
+            toml.push_str(&format!(
+                "[mcp_servers.reverse.env]\nMCP_MEMORY_DIR = \"{}\"\nMCP_AGENT_MESH_DIR = \"{}\"\nMCP_AUDIT_DIR = \"{}\"\n",
+                p("memory"),
+                p("agent-mesh"),
+                p("audit"),
+            ));
+        }
+    }
+
+    // mcp-unknowncheat, re-pointed at Camoufox in the image: 16 tools over the
+    // UnknownCheats forum (search, threads, code blocks, offsets, local index).
+    //
+    // Cheap enough to always advertise — 16 tools in ~13 KB, against
+    // mcp-reverse's 93 KB — and it is only useful as a tool the model can see:
+    // the forum answers a plain HTTP client with a Cloudflare challenge, so
+    // there is no curl fallback for the model to improvise.
+    //
+    // Its own browser layer was replaced at build time, so it drives the same
+    // Camoufox service as the agent's browser tools; CAMOFOX_URL points at it
+    // and one stable profile keeps a cleared challenge and a forum login.
+    if in_container {
+        toml.push_str(
+            "\n[mcp_servers.unknowncheat]\ncommand = \"mcp-unknowncheat\"\nargs = []\nstartup_timeout_ms = 60000\ntool_timeout_sec = 300\n",
+        );
+        let mut env = String::from(
+            "[mcp_servers.unknowncheat.env]\nCAMOFOX_URL = \"http://127.0.0.1:9377\"\nUC_CAMOFOX_USER = \"unknowncheats\"\n",
+        );
+        // Its sqlite index and caches default to the install root, which is
+        // read-only to the agent uid.
+        if let Some(home) = dirs::home_dir() {
+            let base = home.join(".hacksor").join("mcp-unknowncheat");
+            env.push_str(&format!(
+                "UC_HOME = \"{}\"\nXDG_DATA_HOME = \"{}\"\n",
+                base.to_string_lossy(),
+                base.to_string_lossy(),
+            ));
+        }
+        toml.push_str(&env);
     }
     std::fs::write(codex_home.join("config.toml"), toml)?;
     Ok(())
@@ -784,6 +852,19 @@ mod tests {
         assert!(!toml.contains("env_key"));
         // Camoufox stealth-browser MCP server is registered.
         assert!(toml.contains("[mcp_servers.camofox]"));
+        assert!(toml.contains("CAMOFOX_URL = \"http://127.0.0.1:9377\""));
+        // Reverse-engineering MCP server is registered for every model: the
+        // picker swaps the model, not this config.
+        assert!(toml.contains("[mcp_servers.reverse]"));
+        assert!(toml.contains("command = \"mcp-reverse\""));
+        // Its writable directories must land outside its read-only install root.
+        assert!(toml.contains("[mcp_servers.reverse.env]"));
+        assert!(toml.contains("MCP_MEMORY_DIR = "));
+        assert!(!toml.contains("MCP_MEMORY_DIR = \"/opt/mcp-reverse"));
+        // REA stays a CLI; its MCP catalog is 4.6 MB of tool schemas.
+        assert!(!toml.contains("[mcp_servers.rea]"));
+        // Forum research server, driving the same Camoufox the browser tools use.
+        assert!(toml.contains("[mcp_servers.unknowncheat]"));
         assert!(toml.contains("CAMOFOX_URL = \"http://127.0.0.1:9377\""));
         std::fs::remove_dir_all(&dir).ok();
     }
