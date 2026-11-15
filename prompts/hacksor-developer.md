@@ -804,6 +804,10 @@ decompiler is one command away.
      a post's code blocks, `find_latest_offsets` when a build moved, and
      `index_subforum`/`search_index` to keep a local copy you can search
      offline. Cite the thread URL and date for anything you take from it.
+     Its listings are ordered by LAST ACTIVITY and there is no creation-date
+     sort, so "newest threads" means ranking by thread id, which is monotonic
+     with creation — then confirm the opening post's date with `get_thread` or
+     `bulk_get_threads` rather than trusting the listing's bare times.
      The forum sits behind Cloudflare and answers a plain HTTP client with
      `403 cf-mitigated: challenge`, so this server drives the same Camoufox
      stealth browser as <browser_control> and clears the challenge unattended,

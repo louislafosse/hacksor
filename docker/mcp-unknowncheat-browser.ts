@@ -65,7 +65,83 @@ export function validateUrl(url: string): void {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 
+let daemonEnsured = false;
+let daemonStartTried = false;
+
+const isLoopback = (): boolean => /\/\/(127\.0\.0\.1|localhost|\[?::1\]?)(:|\/|$)/.test(BASE);
+
+async function pingDaemon(): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1_500);
+    const res = await fetch(`${BASE}/health`, { signal: controller.signal });
+    clearTimeout(timer);
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Start the Camoufox daemon if it is not up, then wait for it.
+ *
+ * The daemon is deliberately LAZY in this image — Firefox is heavy, so nothing
+ * starts it with the container and camofox-mcp is patched to bring it up on its
+ * own first request. This server talks to the same service directly, so without
+ * the same courtesy its first tool call failed with ECONNREFUSED on
+ * 127.0.0.1:9377 whenever no browser tool had run yet in the session, and that
+ * reads as "the MCP server is broken" rather than "the browser is not up".
+ *
+ * `--background` matters: the daemon started from a shell with a plain `&` dies
+ * with that shell, so a health probe succeeds and the next call fails again.
+ * The RAM caps match the ones camofox-mcp's patch uses.
+ */
+async function ensureDaemon(): Promise<void> {
+  if (daemonEnsured) return;
+  if (await pingDaemon()) {
+    daemonEnsured = true;
+    return;
+  }
+  if (!isLoopback()) {
+    throw new Error(`Camoufox service at ${BASE} is not answering, and it is not local to start.`);
+  }
+  if (!daemonStartTried) {
+    daemonStartTried = true;
+    const port = (BASE.match(/:(\d+)/) ?? [])[1] ?? "9377";
+    console.error(`[browser] Camoufox daemon is down; starting it on port ${port}`);
+    try {
+      const { spawn } = await import("node:child_process");
+      spawn("camofox-browser", ["server", "start", "--port", port, "--background"], {
+        env: {
+          ...process.env,
+          CAMOFOX_HOST: "127.0.0.1",
+          CAMOFOX_AUTH_MODE: "disabled",
+          CAMOFOX_MAX_SESSIONS: "3",
+          CAMOFOX_IDLE_TIMEOUT_MS: "300000",
+        },
+        detached: true,
+        stdio: "ignore",
+      }).unref();
+    } catch (error) {
+      console.error(`[browser] could not spawn camofox-browser: ${(error as Error).message}`);
+    }
+  }
+  for (let i = 0; i < 60; i++) {
+    await sleep(750);
+    if (await pingDaemon()) {
+      daemonEnsured = true;
+      console.error("[browser] Camoufox daemon is up");
+      return;
+    }
+  }
+  throw new Error(
+    `Camoufox service never came up at ${BASE}. Start it by hand with ` +
+      "`camofox-browser server start --port 9377 --background` and check /tmp for its log.",
+  );
+}
+
 async function api(path: string, init: { method?: string; body?: unknown } = {}): Promise<any> {
+  await ensureDaemon();
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (API_KEY) headers["x-camofox-api-key"] = API_KEY;
   let response: Response;
@@ -76,10 +152,23 @@ async function api(path: string, init: { method?: string; body?: unknown } = {})
       ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
     });
   } catch (error) {
-    throw new Error(
-      `Camoufox service unreachable at ${BASE} (${(error as Error).message}). ` +
-        "It is started with the runtime container; check `camofox-browser server start --port 9377`.",
-    );
+    // The daemon can be recycled between calls (idle timeout, a crash); bring
+    // it back once rather than failing the tool.
+    daemonEnsured = false;
+    daemonStartTried = false;
+    await ensureDaemon();
+    try {
+      response = await fetch(`${BASE}${path}`, {
+        method: init.method ?? "GET",
+        headers,
+        ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+      });
+    } catch (retryError) {
+      throw new Error(
+        `Camoufox service unreachable at ${BASE} (${(retryError as Error).message}, ` +
+          `first attempt: ${(error as Error).message}).`,
+      );
+    }
   }
   const text = await response.text();
   if (!response.ok) {
