@@ -79,6 +79,32 @@ fn extra_tool_dirs() -> Vec<PathBuf> {
     out
 }
 
+/// A `std::process::Command` that never flashes a console window on Windows.
+///
+/// A GUI app that spawns a console program gets a console window for it, and the
+/// window appears and vanishes on every call. The VPN route check runs on every
+/// Send, so a PowerShell window blinked on the user's screen once per message
+/// until this was applied everywhere.
+pub fn quiet_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    #[allow(unused_mut)]
+    let mut c = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    c
+}
+
+/// The same, for the async spawns.
+pub fn quiet_tokio<S: AsRef<std::ffi::OsStr>>(program: S) -> tokio::process::Command {
+    #[allow(unused_mut)]
+    let mut c = tokio::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    c
+}
+
 /// Open a URL in the user's default browser, per platform. Detached, no console.
 pub fn open_url(url: &str) -> std::io::Result<()> {
     let mut cmd = if IS_WINDOWS {
@@ -119,7 +145,7 @@ pub fn docker_exec_user() -> Option<String> {
 
 #[cfg(unix)]
 fn id_flag(flag: &str) -> Option<String> {
-    let o = Command::new("id").arg(flag).output().ok()?;
+    let o = quiet_command("id").arg(flag).output().ok()?;
     let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
     if s.is_empty() { None } else { Some(s) }
 }
@@ -142,7 +168,7 @@ pub fn process_cmdline(pid: i64) -> Option<String> {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        let out = Command::new("ps")
+        let out = quiet_command("ps")
             .args(["-p", &pid.to_string(), "-o", "command="])
             .output()
             .ok()?;
@@ -162,11 +188,11 @@ pub fn process_cmdline(pid: i64) -> Option<String> {
 /// Kill a process by PID (host side). `kill` on Unix, `taskkill /F` on Windows.
 pub fn kill_pid(pid: i64) {
     let mut cmd = if IS_WINDOWS {
-        let mut c = Command::new("taskkill");
+        let mut c = quiet_command("taskkill");
         c.args(["/PID", &pid.to_string(), "/F"]);
         c
     } else {
-        let mut c = Command::new("kill");
+        let mut c = quiet_command("kill");
         c.arg(pid.to_string());
         c
     };

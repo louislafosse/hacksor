@@ -30,6 +30,192 @@ fn which_bin(tool: &str) -> Option<String> {
     platform::which(tool)
 }
 
+/// Is this container path the home root itself?
+///
+/// Split out so the rule is testable without a container: codex writes a trust
+/// entry for a thread's cwd, and a trust entry for the home root is the one that
+/// makes codex refuse to start. Trailing slashes differ by platform, so compare
+/// without them.
+fn is_container_home_root(cwd: &str, container_home: &str) -> bool {
+    let norm = |p: &str| p.trim_end_matches(['/', '\\']).to_string();
+    !container_home.is_empty() && norm(cwd) == norm(container_home)
+}
+
+/// Create the directories the bundled MCP servers are pointed at.
+///
+/// codex treats a failed MCP server spawn as FATAL: the session never starts,
+/// the UI thinks forever, and the only clue is
+/// "Error: No such file or directory (os error 2)". The forum server opens its
+/// sqlite index under `UC_HOME`/`XDG_DATA_HOME` and dies exactly that way when
+/// the directory is absent — and nothing created it, so every fresh install
+/// broke the moment the server was registered. mcp-reverse happened to survive
+/// because it `mkdir -p`s its own paths, which is luck, not a design.
+///
+/// Cheap and idempotent, so it runs on every harness start rather than once.
+pub async fn ensure_mcp_state_dirs(docker: bool) {
+    let base = format!(
+        "{}/.hacksor",
+        crate::platform::container_home_env().trim_end_matches(['/', '\\'])
+    );
+    let dirs = [
+        format!("{base}/mcp-reverse/memory"),
+        format!("{base}/mcp-reverse/agent-mesh"),
+        format!("{base}/mcp-reverse/audit"),
+        format!("{base}/mcp-unknowncheat"),
+    ];
+    if docker {
+        let _ = runtime::exec_output(
+            RUNTIME_CONTAINER,
+            vec![
+                "sh".into(),
+                "-lc".into(),
+                // Quoted for the same reason the catalog copy is: a home with a
+                // space in it would otherwise create a scatter of wrong
+                // directories and leave the real ones missing.
+                format!(
+                    "mkdir -p {}",
+                    dirs.iter().map(|d| sh_quote(d)).collect::<Vec<_>>().join(" ")
+                ),
+            ],
+            None,
+            None,
+        )
+        .await;
+    } else {
+        for d in &dirs {
+            let _ = std::fs::create_dir_all(d);
+        }
+    }
+}
+
+/// Take our OWN copy of ocx's model catalog, and return the path codex should
+/// read it from.
+///
+/// ocx writes `opencodex-catalog.json` into its codex home after model
+/// discovery and removes or rewrites it on its own schedule — observed present,
+/// then gone minutes later on the same machine. codex treats a
+/// `model_catalog_json` it cannot open as a configuration failure, so pointing
+/// at a file another process owns means the config is only valid until that
+/// process changes its mind. Copying it into the app's own codex home (stable,
+/// bind-mounted, written by nobody else) makes the pointer durable for the life
+/// of the session.
+///
+/// `None` means the catalog was not available, and the caller leaves the
+/// pointer out entirely rather than naming a file that is not there.
+/// Quote a path for a `sh -c` script.
+///
+/// Single quotes stop every expansion a path can trigger — spaces above all,
+/// since the macOS codex home lives under "Application Support" — and an
+/// embedded single quote is closed, escaped and reopened.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// What a single catalog-copy attempt managed to produce.
+///
+/// A copy from an earlier run is worth keeping rather than discarding: context
+/// windows rarely change, and a slightly old number beats codex's generic
+/// default of 272_000 — which is what silently compacted a 1M-context model at
+/// 258_400 whenever the file was absent.
+#[derive(Debug, PartialEq, Eq)]
+enum Have {
+    Fresh,
+    Stale,
+    Nothing,
+}
+
+/// Copy ocx's catalog over the one codex reads, or report what is already there.
+fn copy_catalog_once(source: &std::path::Path, dest: &std::path::Path) -> Have {
+    // Size, not existence: ocx creates the file before it finishes writing it,
+    // and an empty catalog teaches codex nothing.
+    let usable = |p: &std::path::Path| p.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    if usable(source) && std::fs::copy(source, dest).is_ok() {
+        Have::Fresh
+    } else if usable(dest) {
+        Have::Stale
+    } else {
+        Have::Nothing
+    }
+}
+
+pub async fn ocx_catalog_snapshot(docker: bool, codex_home: &std::path::Path) -> Option<String> {
+    const NAME: &str = "opencodex-catalog.json";
+    // ocx writes this file once model discovery finishes, which was measured at
+    // ~10 s after the container starts — the previous 7.5 s of polling lost that
+    // race by about three seconds, every cold start. Losing it is not cosmetic:
+    // with no catalog, codex falls back to its built-in 272_000-token window and
+    // compacts a 1M-context model at 258_400.
+    const COLD_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
+    // When a copy from an earlier run is already in place, codex has a correct
+    // window to read and startup must not stall on a refresh.
+    const WARM_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+    let source = format!("{}/{NAME}", ocx_codex_home(docker));
+    let dest = if docker {
+        format!("{}/{NAME}", crate::platform::container_codex_home(codex_home))
+    } else {
+        codex_home.join(NAME).to_string_lossy().into_owned()
+    };
+
+    let attempt = || async {
+        if docker {
+            // Quote both paths. macOS puts the codex home under
+            // "Application Support", and an unquoted path split at that space:
+            // `cp` reported "missing destination file operand" and the copy
+            // failed on every start, so this machine never had a catalog and
+            // every model fell back to codex's 272_000-token default.
+            let (src_q, dst_q) = (sh_quote(&source), sh_quote(&dest));
+            let script = format!(
+                "if [ -s {src_q} ] && cp -f {src_q} {dst_q}; then echo fresh; \
+                 elif [ -s {dst_q} ]; then echo stale; fi"
+            );
+            let out = runtime::exec_output(
+                RUNTIME_CONTAINER,
+                vec!["sh".into(), "-lc".into(), script],
+                None,
+                None,
+            )
+            .await
+            .map(|(out, _)| out)
+            .unwrap_or_default();
+            if out.contains("fresh") {
+                Have::Fresh
+            } else if out.contains("stale") {
+                Have::Stale
+            } else {
+                Have::Nothing
+            }
+        } else {
+            copy_catalog_once(std::path::Path::new(&source), std::path::Path::new(&dest))
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let mut budget = COLD_BUDGET;
+    let mut have_stale = false;
+    loop {
+        match attempt().await {
+            Have::Fresh => return Some(dest),
+            // Shorten the wait as soon as something usable is there.
+            Have::Stale => {
+                if !have_stale {
+                    have_stale = true;
+                    budget = WARM_BUDGET;
+                }
+            }
+            Have::Nothing => {}
+        }
+        if started.elapsed() >= budget {
+            // Returning the stale path still produces a pointer codex can open.
+            // Returning None omits the pointer entirely, which is what keeps a
+            // missing file from being fatal (it was, on Windows).
+            return if have_stale { Some(dest) } else { None };
+        }
+        tokio::time::sleep(INTERVAL).await;
+    }
+}
+
 async fn opencodex_up() -> bool {
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
@@ -415,7 +601,7 @@ async fn ensure_opencodex(state: &AppState) -> Result<(), String> {
     let bin = which_bin("ocx").ok_or_else(|| {
         "OpenCodex is not installed on the host. Switch Runtime to Docker (it's bundled there), or run `npm i -g @bitkyc08/opencodex`.".to_string()
     })?;
-    let child = tokio::process::Command::new(bin)
+    let child = platform::quiet_tokio(bin)
         .env("CODEX_HOME", ocx_codex_home(false))
         .args(["start", "--port", &models::OPENCODEX_PORT.to_string()])
         .stdin(std::process::Stdio::null())
@@ -586,7 +772,7 @@ async fn run_ocx(args: &[&str], stdin_data: Option<&str>, docker: bool) -> Resul
         let bin = which_bin("ocx").ok_or_else(|| {
             "OpenCodex (ocx) is not installed on the host. Use the Docker runtime (it's bundled there) or `npm i -g @bitkyc08/opencodex`.".to_string()
         })?;
-        let mut cmd = tokio::process::Command::new(bin);
+        let mut cmd = platform::quiet_tokio(bin);
         cmd.env("CODEX_HOME", ocx_codex_home(false))
             .args(args)
             .stdout(std::process::Stdio::piped())
@@ -755,7 +941,7 @@ pub async fn ocx_auth_check(
         .to_string();
     if docker {
         if let Some(bin) = which_bin("ocx") {
-            if let Ok(o) = tokio::process::Command::new(bin).arg("--version").output().await {
+            if let Ok(o) = platform::quiet_tokio(bin).arg("--version").output().await {
                 out.host_version = String::from_utf8_lossy(&o.stdout).trim().to_string();
             }
         }
@@ -804,7 +990,7 @@ pub async fn ocx_reauth_start(state: State<'_, AppState>, provider: String) -> R
         // Host mode: ocx is a normal child process, so hold its stdin open by
         // simply never writing to it and letting it live as long as the flow.
         let bin = which_bin("ocx").ok_or_else(|| "OpenCodex (ocx) is not installed on the host.".to_string())?;
-        let mut cmd = tokio::process::Command::new(bin);
+        let mut cmd = platform::quiet_tokio(bin);
         cmd.env("CODEX_HOME", ocx_codex_home(false));
         cmd.args(["account", "reauth", &name]);
         if !id.is_empty() {
@@ -1471,6 +1657,7 @@ pub struct SettingsView {
     pub services_mode: String,
     pub warn_without_vpn: bool,
     pub limit_runtime_mount: bool,
+    pub allow_host_commands: bool,
 }
 
 #[tauri::command]
@@ -1490,6 +1677,7 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<SettingsView, St
         services_mode: s.services_mode.clone(),
         warn_without_vpn: s.warn_without_vpn,
         limit_runtime_mount: s.limit_runtime_mount,
+        allow_host_commands: s.allow_host_commands,
     })
 }
 
@@ -1508,6 +1696,7 @@ pub struct SaveSettingsArgs {
     pub services_mode: Option<String>,
     pub warn_without_vpn: Option<bool>,
     pub limit_runtime_mount: Option<bool>,
+    pub allow_host_commands: Option<bool>,
 }
 
 #[tauri::command]
@@ -1583,6 +1772,11 @@ pub async fn save_settings(
     if let Some(v) = args.warn_without_vpn {
         s.warn_without_vpn = v;
     }
+    if let Some(v) = args.allow_host_commands {
+        // Takes effect on the next host request; the bridge reads the switch
+        // per request rather than caching it.
+        s.allow_host_commands = v;
+    }
     if let Some(v) = args.limit_runtime_mount {
         // Takes effect when the container is next created, not mid-session.
         s.limit_runtime_mount = v;
@@ -1657,7 +1851,6 @@ pub async fn start_chat(
         .filter(|d| !d.trim().is_empty())
         .unwrap_or(default_working_dir);
     let host_cwd = PathBuf::from(&working_dir);
-    pub allow_host_commands: bool,
     if !host_cwd.is_dir() {
         return Err(format!("Working directory does not exist: {working_dir}"));
     }
@@ -1666,7 +1859,32 @@ pub async fn start_chat(
     // host path unchanged.
     let docker_mode = { state.settings.lock().await.runtime == "docker" };
     let cwd = if docker_mode {
-        PathBuf::from(platform::container_working_dir(&host_cwd))
+        let container = platform::container_working_dir(&host_cwd);
+        // NEVER hand codex the bind-mount root as a thread's cwd.
+        //
+        // codex records the cwd as a trusted project in its config
+        // (`[projects."<cwd>"] trust_level = "trusted"`, written by codex, not
+        // by us), and a trust entry for the container HOME makes codex 0.169
+        // die on the next config read with "No such file or directory (os error
+        // 2)" — the session never starts, so the UI thinks forever. Measured on
+        // Windows, where the home IS the mount root (`C:\` -> /hacksorhome) and
+        // is also the default working directory: trusting /hacksorhome fails,
+        // while trusting ANY subdirectory of it works.
+        //
+        // So when the working directory resolves to the home root, put the
+        // thread one level down instead. Everything else is untouched, and the
+        // agent can still reach the rest of the home by path.
+        if is_container_home_root(&container, &platform::container_home_env()) {
+            let sub = host_cwd.join("hacksor");
+            let _ = std::fs::create_dir_all(&sub);
+            if sub.is_dir() {
+                PathBuf::from(platform::container_working_dir(&sub))
+            } else {
+                PathBuf::from(container)
+            }
+        } else {
+            PathBuf::from(container)
+        }
     } else {
         host_cwd.clone()
     };
@@ -1677,7 +1895,6 @@ pub async fn start_chat(
         let _ = start_kali(working_dir.clone()).await;
     }
 
-        allow_host_commands: s.allow_host_commands,
     let permission = if args.mode == "ask" {
         Permission::ReadOnly
     } else {
@@ -1696,7 +1913,6 @@ pub async fn start_chat(
     );
 
     harness
-    pub allow_host_commands: Option<bool>,
         .start_thread(StartParams {
             provider,
             model_slug: args.model.clone(),
@@ -1772,11 +1988,6 @@ pub async fn send_message(app: AppHandle, state: State<'_, AppState>, args: Send
     };
     let overrides = turn_overrides_from(&state, &args, personality.as_deref(), kali_mode, custom.as_deref(), docker_mode);
     let harness = ensure_harness(&state, &app).await?;
-    if let Some(v) = args.allow_host_commands {
-        // Takes effect on the next host request; the bridge reads the switch
-        // per request rather than caching it.
-        s.allow_host_commands = v;
-    }
     harness
         .send_message(&args.thread_id, args.text, overrides, args.images)
         .await
@@ -3594,11 +3805,39 @@ async fn start_runtime(
             vec![
                 "sh".into(),
                 "-c".into(),
-                "[ -f \"$HOME/.cache/camoufox/version.json\" ] && exit 0; \
+                // Install if absent, and UPGRADE if the engine has gone stale.
+                //
+                // "A version.json exists" is not the same as "the browser still
+                // works": Camoufox is a stealth build, and its ability to pass a
+                // Cloudflare challenge decays as the challenge changes. Measured
+                // on a real install, an engine left from an earlier month
+                // (152.0.4-beta.30 against a current 158.0.1-beta.41) stopped
+                // clearing challenges that the current build clears first pass,
+                // and nothing ever replaced it because the file was there.
+                //
+                // Age is the heuristic because the installer resolves the target
+                // release from upstream rather than pinning it, so the only way
+                // to ask "is there something newer" is to fetch. 30 days keeps a
+                // 2.5 GB download rare while never leaving a season-old build in
+                // place. The old engine is moved aside, not deleted, and goes
+                // back if the download fails — a failed upgrade must not leave
+                // the user with no browser at all.
+                "set -e; \
+                 ENG=\"$HOME/.cache/camoufox\"; MAXAGE=${HACKSOR_CAMOUFOX_MAX_AGE_DAYS:-30}; \
+                 if [ -f \"$ENG/version.json\" ]; then \
+                   [ -z \"$(find \"$ENG/version.json\" -mtime +$MAXAGE 2>/dev/null)\" ] && exit 0; \
+                   OLD=\"$ENG.old.$$\"; mv \"$ENG\" \"$OLD\" || exit 0; \
+                 fi; \
                  mkdir -p \"$HOME/.cache\"; \
                  cd /usr/local/lib/node_modules/camofox-browser || exit 0; \
-                 CAMOUFOX_INSTALL_DIR=\"$HOME/.cache/camoufox\" node bin/install-browser.js \
-                   >/tmp/hacksor-camoufox-engine.log 2>&1"
+                 CAMOUFOX_INSTALL_DIR=\"$ENG\" node bin/install-browser.js \
+                   >/tmp/hacksor-camoufox-engine.log 2>&1 || true; \
+                 if [ -f \"$ENG/version.json\" ]; then \
+                   rm -rf \"$ENG\".old.* 2>/dev/null || true; \
+                 else \
+                   OLD=$(ls -d \"$ENG\".old.* 2>/dev/null | head -1); \
+                   [ -n \"$OLD\" ] && mv \"$OLD\" \"$ENG\"; \
+                 fi"
                     .into(),
             ],
             exec_user(),
@@ -3707,13 +3946,13 @@ pub async fn refresh_intel(state: State<'_, AppState>) -> Result<String, String>
         }
         let mut out = String::new();
         if which_bin("nuclei").is_some() {
-            if let Ok(o) = tokio::process::Command::new("nuclei").args(["-update-templates", "-silent"]).output().await {
+            if let Ok(o) = platform::quiet_tokio("nuclei").args(["-update-templates", "-silent"]).output().await {
                 out.push_str(String::from_utf8_lossy(&o.stderr).trim());
                 out.push('\n');
             }
         }
         if which_bin("searchsploit").is_some() {
-            if let Ok(o) = tokio::process::Command::new("searchsploit").arg("-u").output().await {
+            if let Ok(o) = platform::quiet_tokio("searchsploit").arg("-u").output().await {
                 out.push_str(String::from_utf8_lossy(&o.stdout).trim());
             }
         }
@@ -4700,11 +4939,11 @@ pub struct VpnStatus {
 /// whether the DEFAULT ROUTE goes through one.
 fn default_route_iface() -> String {
     #[cfg(target_os = "macos")]
-    let out = std::process::Command::new("route").args(["-n", "get", "default"]).output();
+    let out = platform::quiet_command("route").args(["-n", "get", "default"]).output();
     #[cfg(target_os = "linux")]
-    let out = std::process::Command::new("ip").args(["route", "show", "default"]).output();
+    let out = platform::quiet_command("ip").args(["route", "show", "default"]).output();
     #[cfg(target_os = "windows")]
-    let out = std::process::Command::new("powershell")
+    let out = platform::quiet_command("powershell")
         .args(["-NoProfile", "-Command",
                "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).InterfaceAlias"])
         .output();
@@ -5360,6 +5599,107 @@ fn personality_section(personality: Option<&str>) -> String {
         _ => return String::new(),
     };
     format!("\n\n<personality>\n{body}\n</personality>")
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::{copy_catalog_once, Have};
+    use std::io::Write;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("hacksor-catalog-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn write(path: &std::path::Path, body: &str) {
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn a_path_with_a_space_survives_the_shell() {
+        // The macOS codex home is under "Application Support"; unquoted, the
+        // copy command split there and failed silently on every start.
+        let q = super::sh_quote("/Users/me/Library/Application Support/app/codex-home");
+        assert_eq!(q, "'/Users/me/Library/Application Support/app/codex-home'");
+        // An embedded quote must not end the quoting early.
+        assert_eq!(super::sh_quote("/tmp/it's"), "'/tmp/it'\\''s'");
+    }
+
+    #[test]
+    fn ocx_catalog_is_copied_over_the_one_codex_reads() {
+        let d = tmpdir("fresh");
+        let src = d.join("src.json");
+        let dst = d.join("dst.json");
+        write(&src, r#"[{"slug":"anthropic/claude-opus-5","context_window":1000000}]"#);
+        assert_eq!(copy_catalog_once(&src, &dst), Have::Fresh);
+        assert!(std::fs::read_to_string(&dst).unwrap().contains("1000000"));
+    }
+
+    #[test]
+    fn a_copy_from_an_earlier_run_is_kept_when_ocx_has_not_written_one_yet() {
+        // The race this exists for: on a cold start ocx publishes its catalog
+        // about ten seconds in. Until then the previous copy is the best window
+        // information available, and dropping it costs the real window.
+        let d = tmpdir("stale");
+        let src = d.join("missing.json");
+        let dst = d.join("dst.json");
+        write(&dst, r#"[{"slug":"anthropic/claude-opus-5","context_window":1000000}]"#);
+        assert_eq!(copy_catalog_once(&src, &dst), Have::Stale);
+        assert!(std::fs::read_to_string(&dst).unwrap().contains("1000000"));
+    }
+
+    #[test]
+    fn nothing_usable_is_reported_as_nothing_so_the_pointer_can_be_omitted() {
+        // With no file at all the config must leave `model_catalog_json` out
+        // entirely: codex treats a path it cannot open as fatal.
+        let d = tmpdir("none");
+        assert_eq!(
+            copy_catalog_once(&d.join("a.json"), &d.join("b.json")),
+            Have::Nothing
+        );
+    }
+
+    #[test]
+    fn a_half_written_catalog_does_not_count() {
+        // ocx creates the file before filling it; a zero-byte catalog would
+        // satisfy an existence check and teach codex nothing.
+        let d = tmpdir("empty");
+        let src = d.join("src.json");
+        let dst = d.join("dst.json");
+        write(&src, "");
+        assert_eq!(copy_catalog_once(&src, &dst), Have::Nothing);
+    }
+}
+
+#[cfg(test)]
+mod home_root_tests {
+    use super::is_container_home_root;
+
+    #[test]
+    fn the_home_root_is_recognised_with_or_without_a_trailing_slash() {
+        assert!(is_container_home_root("/hacksorhome", "/hacksorhome"));
+        assert!(is_container_home_root("/hacksorhome/", "/hacksorhome"));
+        assert!(is_container_home_root("/Users/someone", "/Users/someone/"));
+    }
+
+    #[test]
+    fn a_subdirectory_is_left_alone() {
+        // Trusting a subdirectory is fine; only the root breaks codex, so the
+        // guard must not relocate anything else.
+        assert!(!is_container_home_root("/hacksorhome/Desktop", "/hacksorhome"));
+        assert!(!is_container_home_root("/hacksorhome/hacksor", "/hacksorhome"));
+        assert!(!is_container_home_root("/Users/someone/sec/target", "/Users/someone"));
+    }
+
+    #[test]
+    fn an_empty_home_never_matches() {
+        // A platform that could not resolve a home must not cause every cwd to
+        // be treated as the root and silently relocated.
+        assert!(!is_container_home_root("/anything", ""));
+    }
 }
 
 #[cfg(test)]

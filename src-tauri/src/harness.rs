@@ -140,12 +140,17 @@ impl Harness {
         // namespace") and blocks every command. Also enables the Playwright MCP
         // browser server there (pre-installed).
         let is_docker = matches!(launch, LaunchMode::Docker { .. });
-        write_provider_config(&codex_home, is_docker).context("write codex config.toml")?;
+        // Before the config names them: a server pointed at a directory that
+        // does not exist fails to spawn, and codex makes that fatal.
+        crate::commands::ensure_mcp_state_dirs(is_docker).await;
+        let catalog = crate::commands::ocx_catalog_snapshot(is_docker, &codex_home).await;
+        write_provider_config(&codex_home, is_docker, catalog.as_deref())
+            .context("write codex config.toml")?;
 
         let mut cmd = match &launch {
             LaunchMode::Host => {
                 let bin = codex_binary();
-                let mut c = tokio::process::Command::new(&bin);
+                let mut c = crate::platform::quiet_tokio(&bin);
                 c.arg("app-server").env("CODEX_HOME", &codex_home);
                 c
             }
@@ -634,7 +639,51 @@ fn codex_binary() -> String {
 
 /// Write every supported provider block into `codex_home/config.toml`. All
 /// providers use the OpenAI-compatible `responses` wire API.
-fn write_provider_config(codex_home: &PathBuf, is_docker: bool) -> Result<()> {
+/// Escape a value for a TOML basic string.
+///
+/// This is not decoration. A Windows path goes into the config as
+/// `C:\Users\someone\...`, and TOML reads `\U` inside a double-quoted string
+/// as a unicode escape: codex then refused the WHOLE file with
+/// "too few unicode value digits, expected unicode hexadecimal value", so every
+/// turn sat there with no model behind it. Any path written into config.toml
+/// goes through here.
+fn toml_str(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 8);
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Where a bundled MCP server keeps its own state, as the CONTAINER sees it.
+///
+/// `dirs::home_dir()` is the HOST home, which is only the same path inside the
+/// container on Linux and macOS (identity bind mount). On Windows the home is
+/// mounted at `/hacksorhome`, so a host path there is both unusable by the
+/// server and the source of the escaping bug above.
+fn container_state_dir(leaf: &str) -> String {
+    let home = crate::platform::container_home_env();
+    let home = home.trim_end_matches(['/', '\\']);
+    format!("{home}/.hacksor/{leaf}")
+}
+
+/// `catalog` is the path codex should read ocx's model catalog from — a copy the
+/// app owns, taken by `ocx_catalog_snapshot`. `None` leaves the pointer out.
+fn write_provider_config(
+    codex_home: &PathBuf,
+    is_docker: bool,
+    catalog: Option<&str>,
+) -> Result<()> {
     std::fs::create_dir_all(codex_home)?;
     let mut toml = String::from(
         "# Managed by Hacksor. Do not edit the provider blocks by hand.\n\
@@ -663,10 +712,18 @@ model_auto_compact_token_limit_scope = \"body_after_prefix\"\n",
     // The catalog carries a real window per model, so this fixes every model
     // at once instead of forcing one global number that would be wrong for
     // the 128k ones.
-    toml.push_str(&format!(
-        "model_catalog_json = \"{}/opencodex-catalog.json\"\n",
-        crate::commands::ocx_codex_home(is_docker)
-    ));
+    // Only point at the catalog when the file EXISTS.
+    //
+    // ocx writes it after its model discovery finishes, which on a cold start
+    // lands seconds AFTER the proxy answers as ready. codex treats a
+    // `model_catalog_json` it cannot open as a fatal config error — "failed to
+    // load configuration: no such file or directory" — so pointing at a file
+    // that is still being written turned a slow start into a dead turn. A
+    // missing pointer only costs codex's own default context window until the
+    // next harness start, which is a degradation rather than a failure.
+    if let Some(path) = catalog {
+        toml.push_str(&format!("model_catalog_json = \"{}\"\n", toml_str(path)));
+    }
     toml.push_str(
         "\
 # codex 0.152+ ships update_plan disabled by default (it must be opted back in\n\
@@ -744,19 +801,16 @@ enabled = true\n",
         );
         // Its memory, agent-mesh and audit directories default to its own
         // install root, which is read-only to the agent uid, so point them at
-        // the home directory instead — the container's HOME is this same path
-        // (the host home is bind-mounted at its own location), so one value is
-        // correct on both sides.
-        if let Some(home) = dirs::home_dir() {
-            let base = home.join(".hacksor").join("mcp-reverse");
-            let p = |leaf: &str| base.join(leaf).to_string_lossy().to_string();
-            toml.push_str(&format!(
-                "[mcp_servers.reverse.env]\nMCP_MEMORY_DIR = \"{}\"\nMCP_AGENT_MESH_DIR = \"{}\"\nMCP_AUDIT_DIR = \"{}\"\n",
-                p("memory"),
-                p("agent-mesh"),
-                p("audit"),
-            ));
-        }
+        // the home directory instead — as the CONTAINER sees it, and escaped,
+        // because this server runs inside the container and a raw host path
+        // broke the config outright on Windows.
+        let base = container_state_dir("mcp-reverse");
+        toml.push_str(&format!(
+            "[mcp_servers.reverse.env]\nMCP_MEMORY_DIR = \"{}\"\nMCP_AGENT_MESH_DIR = \"{}\"\nMCP_AUDIT_DIR = \"{}\"\n",
+            toml_str(&format!("{base}/memory")),
+            toml_str(&format!("{base}/agent-mesh")),
+            toml_str(&format!("{base}/audit")),
+        ));
     }
 
     // mcp-unknowncheat, re-pointed at Camoufox in the image: 16 tools over the
@@ -779,14 +833,8 @@ enabled = true\n",
         );
         // Its sqlite index and caches default to the install root, which is
         // read-only to the agent uid.
-        if let Some(home) = dirs::home_dir() {
-            let base = home.join(".hacksor").join("mcp-unknowncheat");
-            env.push_str(&format!(
-                "UC_HOME = \"{}\"\nXDG_DATA_HOME = \"{}\"\n",
-                base.to_string_lossy(),
-                base.to_string_lossy(),
-            ));
-        }
+        let base = toml_str(&container_state_dir("mcp-unknowncheat"));
+        env.push_str(&format!("UC_HOME = \"{base}\"\nXDG_DATA_HOME = \"{base}\"\n"));
         toml.push_str(&env);
     }
     std::fs::write(codex_home.join("config.toml"), toml)?;
@@ -803,7 +851,7 @@ mod tests {
         // default window (272_000), 95% of which is the 258_400 a 1M-context
         // model was compacting at.
         let dir = std::env::temp_dir().join(format!("hacksor-cat-{}", std::process::id()));
-        write_provider_config(&dir, true).unwrap();
+        write_provider_config(&dir, true, Some("/tmp/hacksor-ocx-codex/opencodex-catalog.json")).unwrap();
         let toml = std::fs::read_to_string(dir.join("config.toml")).unwrap();
         assert!(
             toml.contains("model_catalog_json = \"/tmp/hacksor-ocx-codex/opencodex-catalog.json\""),
@@ -819,9 +867,76 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_catalog_omits_the_pointer_instead_of_poisoning_the_config() {
+        // codex refuses to start on a model_catalog_json it cannot open, and ocx
+        // writes that file seconds after the proxy answers as ready. So a cold
+        // start must leave the pointer OUT rather than name a file that is not
+        // there yet.
+        let dir = std::env::temp_dir().join(format!("hacksor-cat2-{}", std::process::id()));
+        write_provider_config(&dir, true, None).unwrap();
+        let without = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+        assert!(!without.contains("model_catalog_json"), "pointer written with no catalog:\n{without}");
+        toml::from_str::<toml::Value>(&without).unwrap();
+
+        write_provider_config(&dir, true, Some("/tmp/hacksor-ocx-codex/opencodex-catalog.json")).unwrap();
+        let with = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+        assert!(with.contains("model_catalog_json"), "pointer missing when the catalog is there");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generated_config_is_valid_toml() {
+        // The regression this guards: a Windows home went into an env value as
+        // `C:\Users\…`, TOML read `\U` as a unicode escape, and codex refused the
+        // whole file — "too few unicode value digits". Every turn then hung with
+        // no model behind it, and the only visible symptom was silence.
+        let dir = std::env::temp_dir().join(format!("hacksor-parse-{}", std::process::id()));
+        for docker in [true, false] {
+            write_provider_config(&dir, docker, Some("/tmp/hacksor-ocx-codex/opencodex-catalog.json")).unwrap();
+            let text = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            toml::from_str::<toml::Value>(&text)
+                .unwrap_or_else(|e| panic!("generated config.toml does not parse (docker={docker}): {e}\n{text}"));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn toml_str_escapes_a_windows_path() {
+        // `\U` is what broke it; `\h` and a quote are the same class of problem.
+        assert_eq!(toml_str(r"C:\Users\someone\.hacksor"), r"C:\\Users\\someone\\.hacksor");
+        assert_eq!(toml_str(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(toml_str("tab\there"), r"tab\there");
+        // And the escaped form must survive a round trip through a parser.
+        let v: toml::Value =
+            toml::from_str(&format!("p = \"{}\"\n", toml_str(r"C:\Users\x\.hacksor"))).unwrap();
+        assert_eq!(v["p"].as_str().unwrap(), r"C:\Users\x\.hacksor");
+    }
+
+    #[test]
+    fn mcp_state_dirs_use_the_container_home_not_the_host_one() {
+        // On Windows the container home is /hacksorhome; a host path there is
+        // both unusable inside the container and the source of the escape bug.
+        let dir = std::env::temp_dir().join(format!("hacksor-home-{}", std::process::id()));
+        write_provider_config(&dir, true, Some("/tmp/hacksor-ocx-codex/opencodex-catalog.json")).unwrap();
+        let text = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+        let expected = crate::platform::container_home_env();
+        for key in ["MCP_MEMORY_DIR", "UC_HOME"] {
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(key))
+                .unwrap_or_else(|| panic!("{key} missing:\n{text}"));
+            assert!(
+                line.contains(expected.trim_end_matches('/')),
+                "{key} is not under the container home ({expected}): {line}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn config_toml_has_all_providers_and_hardening() {
         let dir = std::env::temp_dir().join(format!("hacksor-cfg-{}", std::process::id()));
-        write_provider_config(&dir, true).unwrap();
+        write_provider_config(&dir, true, Some("/tmp/hacksor-ocx-codex/opencodex-catalog.json")).unwrap();
         let toml = std::fs::read_to_string(dir.join("config.toml")).unwrap();
 
         // Anti prompt-injection: never load a target repo's AGENTS.md/CLAUDE.md.

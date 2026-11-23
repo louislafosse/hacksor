@@ -44,3 +44,8 @@ tar = "0.4"
 codegen-units = 1
 lto = "thin"
 opt-level = 2
+
+[dev-dependencies]
+# Already vendored (tauri pulls it); used to PARSE the generated config.toml in
+# tests, because a config that merely "looks right" was what shipped broken.
+toml = "0.8"
