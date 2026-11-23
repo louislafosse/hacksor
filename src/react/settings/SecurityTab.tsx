@@ -52,17 +52,21 @@ function Toggle({
 export function SecurityTab({
   warnWithoutVpn, onWarnChange,
   limitRuntimeMount, onMountChange,
+  allowHostCommands, onHostCommandsChange,
   checkVpn, describeVpn,
 }: {
   warnWithoutVpn: boolean;
   onWarnChange: (v: boolean) => void;
   limitRuntimeMount: boolean;
   onMountChange: (v: boolean) => void;
+  allowHostCommands: boolean;
+  onHostCommandsChange: (v: boolean) => void;
   checkVpn: () => Promise<VpnStatus>;
   describeVpn: (v: VpnStatus) => string;
 }) {
   const [warn, setWarn] = useState(warnWithoutVpn);
   const [narrow, setNarrow] = useState(limitRuntimeMount);
+  const [hostCmds, setHostCmds] = useState(allowHostCommands);
   const [note, setNote] = useState("");
   const [checking, setChecking] = useState(false);
 
@@ -109,6 +113,18 @@ export function SecurityTab({
           The container otherwise mounts your whole home directory. Hacksor's own
           config is still mounted — the agent needs it. Applies next time the
           container starts.
+        </Toggle>
+        <Toggle
+          checked={hostCmds}
+          onChange={(v) => { setHostCmds(v); onHostCommandsChange(v); }}
+          title="Allow host commands"
+        >
+          Lets the agent run a command on this machine through{" "}
+          <code>hacksor-host</code>, for the things a Linux container cannot do:
+          a Windows process's memory, a driver, the registry, installing host
+          tooling. Every command asks you first and is written to{" "}
+          <code>~/.hacksor/host-bridge/audit.log</code>. With this on, the
+          container is no longer a boundary — it is a prompt.
         </Toggle>
       </section>
     </div>

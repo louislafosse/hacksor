@@ -42,6 +42,16 @@ pub struct Settings {
     /// container so first use has no warm-up).
     #[serde(default = "default_services_mode")]
     pub services_mode: String,
+    /// Let the agent run commands on the HOST while it runs in the container.
+    ///
+    /// Off by default, and deliberately so: the container is the isolation
+    /// boundary, and this punches a door through it. With it on, every host
+    /// command still has to be approved in the window (or allowed for the
+    /// session), and each one is written to the audit log. It exists for the
+    /// things a Linux container genuinely cannot do — read a Windows process's
+    /// memory, load a driver, touch the registry, install host tooling.
+    #[serde(default)]
+    pub allow_host_commands: bool,
     /// The app version whose release notes the user has already been shown.
     /// Empty/absent on a fresh install, which is why a first run shows nothing:
     /// "what changed" is meaningless before there is a previous version.
@@ -97,6 +107,7 @@ impl Default for Settings {
             custom_instructions: None,
             working_dir: default_working_dir(),
             kali_mode: false,
+            allow_host_commands: false,
             runtime: default_runtime(),
             services_mode: default_services_mode(),
             last_seen_version: None,

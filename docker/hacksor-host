@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""hacksor-host: run one command on the HOST machine, from inside the container.
+
+You are in a Linux container. Some things only exist on the host: a Windows
+process's memory, a kernel driver, the registry, the host's own installed
+tooling. This asks the Hacksor app — which runs on the host — to execute one
+command there and return its output.
+
+It is NOT a general shell. Every request is either approved by the user in the
+window, covered by an "allow for this session" they granted, or refused. A
+refusal is a normal outcome: read stderr, tell the user what you wanted to run
+and why, and carry on with what the container can do.
+
+Usage:
+  hacksor-host "Get-Process game"
+  hacksor-host --cwd 'C:\\Users\\me\\game' --timeout 300 "frida-ps"
+  echo 'ls' | hacksor-host -            # read the command from stdin
+
+Exit code is the host command's own exit code. 126 means the request was
+refused or never answered; 127 means the bridge is not reachable at all.
+
+The transport is a file queue under ~/.hacksor/host-bridge, which is the same
+directory on both sides because the home is bind-mounted. No ports, no tokens.
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import uuid
+
+BRIDGE = os.path.join(os.path.expanduser("~"), ".hacksor", "host-bridge")
+REQUESTS = os.path.join(BRIDGE, "requests")
+RESULTS = os.path.join(BRIDGE, "results")
+# The host side polls every 150 ms; match it rather than busy-waiting.
+POLL = 0.15
+# A request waits for a human for up to two minutes on the host side. Allow for
+# that plus the command's own budget before giving up here, so this never
+# reports "no answer" while the host is still legitimately working.
+APPROVAL_GRACE = 150
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="hacksor-host",
+        description="Run one command on the host machine (needs the user's approval).",
+    )
+    ap.add_argument("command", help="the command line to run on the host, or - to read it from stdin")
+    ap.add_argument("--cwd", help="host-side working directory (a HOST path, not a container path)")
+    ap.add_argument("--timeout", type=int, default=120, help="seconds the host gives the command (max 900)")
+    ap.add_argument("--json", action="store_true", help="print the raw result object instead of its streams")
+    a = ap.parse_args()
+
+    command = sys.stdin.read() if a.command == "-" else a.command
+    command = command.strip()
+    if not command:
+        print("hacksor-host: empty command", file=sys.stderr)
+        return 127
+
+    try:
+        os.makedirs(REQUESTS, exist_ok=True)
+        os.makedirs(RESULTS, exist_ok=True)
+    except OSError as e:
+        print(
+            f"hacksor-host: cannot reach the bridge directory {BRIDGE} ({e}).\n"
+            "That directory lives in the user's home, which is bind-mounted into this "
+            "container — if it is missing, the app is not running or the mount is narrowed.",
+            file=sys.stderr,
+        )
+        return 127
+
+    rid = uuid.uuid4().hex
+    req = {"id": rid, "command": command, "timeout_secs": max(1, min(a.timeout, 900))}
+    if a.cwd:
+        req["cwd"] = a.cwd
+
+    # Write beside the final name and rename: the watcher must never read a
+    # half-written request and discard it as malformed.
+    tmp = os.path.join(REQUESTS, rid + ".part")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(req, f)
+    os.replace(tmp, os.path.join(REQUESTS, rid + ".json"))
+
+    result_path = os.path.join(RESULTS, rid + ".json")
+    deadline = time.time() + req["timeout_secs"] + APPROVAL_GRACE
+    while time.time() < deadline:
+        if os.path.exists(result_path):
+            break
+        time.sleep(POLL)
+    else:
+        print(
+            "hacksor-host: the host never answered. The app may have been closed, or "
+            "nobody was at the window to approve it.",
+            file=sys.stderr,
+        )
+        return 126
+
+    try:
+        with open(result_path, "r", encoding="utf-8") as f:
+            res = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"hacksor-host: unreadable result ({e})", file=sys.stderr)
+        return 127
+    finally:
+        try:
+            os.unlink(result_path)
+        except OSError:
+            pass
+
+    if a.json:
+        print(json.dumps(res, indent=2))
+        return 0 if res.get("status") == "ok" else 126
+
+    sys.stdout.write(res.get("stdout", ""))
+    if res.get("stderr"):
+        sys.stderr.write(res["stderr"])
+    if res.get("truncated"):
+        print(
+            "\nhacksor-host: output was truncated at 256 KB — redirect to a file on the "
+            "host and read it in pieces instead.",
+            file=sys.stderr,
+        )
+    status = res.get("status", "error")
+    if status == "ok":
+        return int(res.get("exit_code", 0))
+    # denied / disabled / timeout / error: the stderr above already explains it.
+    return 126
+
+
+if __name__ == "__main__":
+    sys.exit(main())

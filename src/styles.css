@@ -1468,6 +1468,26 @@ input[type="checkbox"]:disabled { opacity: .4; cursor: default; }
 /* ---- VPN confirmation ----
    Anchored over the composer rather than centred as a modal: it confirms the
    keystroke that was just pressed, so it belongs where that happened. */
+/* The host-command prompt: the one dialog that stands between an agent in a
+   container and the real machine, so the command is shown verbatim and
+   monospaced rather than summarised. */
+.host-confirm {
+  position: absolute; bottom: 100%; right: 0; margin-bottom: 8px; z-index: 40;
+  width: min(520px, 92vw); padding: 12px 13px;
+  background: var(--popover); color: var(--popover-foreground);
+  border: 1px solid var(--destructive); border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.35);
+}
+.host-confirm .hc-head { font-size: 13px; font-weight: 600; color: var(--destructive); }
+.host-confirm .hc-cmd {
+  margin-top: 8px; padding: 8px 9px; border-radius: 7px;
+  background: var(--muted); color: var(--foreground);
+  font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px;
+  white-space: pre-wrap; word-break: break-all; max-height: 180px; overflow: auto;
+}
+.host-confirm .hc-cwd { margin-top: 6px; font-size: 11px; opacity: .75; }
+.host-confirm .hc-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 10px; }
+
 .vpn-confirm {
   position: absolute;
   right: 14px;

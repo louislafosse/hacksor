@@ -5,6 +5,7 @@
 
 mod commands;
 mod harness;
+mod hostbridge;
 mod models;
 mod platform;
 mod runtime;
@@ -66,6 +67,12 @@ pub fn run() {
                 env_note,
                 opencodex: Mutex::new(None),
             });
+
+            // The host-command bridge: a file queue the container writes into.
+            // Started unconditionally so the agent always gets an ANSWER (a
+            // refusal that says how to enable it) rather than a request that
+            // sits unread forever; the switch is checked per request.
+            hostbridge::start(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -117,6 +124,9 @@ pub fn run() {
             commands::ensure_opencodex_cmd,
             commands::open_opencodex_setup,
             commands::open_external,
+            hostbridge::host_cmd_decide,
+            hostbridge::host_cmd_session_allowed,
+            hostbridge::host_cmd_revoke_session,
             commands::ocx_provider_list,
             commands::ocx_add_provider,
             commands::ocx_set_default,

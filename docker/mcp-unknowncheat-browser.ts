@@ -244,6 +244,18 @@ class CamofoxPage {
   }
 
   async goto(url: string, _options?: unknown): Promise<null> {
+    // Say it out loud when the agent is pulling a FILE off the forum rather
+    // than reading a page. Attachments and downloads there are anonymous
+    // binaries and loaders; the agent sees this on stderr and is told by its
+    // instructions to quarantine them, never execute them, and name the thread
+    // they came from when reporting.
+    if (/attachment\.php|downloads\.php|act=down|\.(exe|dll|sys|zip|rar|7z|msi|jar)(\?|$)/i.test(url)) {
+      console.error(
+        `[browser] UNTRUSTED DOWNLOAD from the forum: ${url}\n` +
+          "[browser] Treat it as hostile: keep it in a quarantine directory, do not run it, " +
+          "scan it (guarddog / trufflehog / floss / rea) and tell the user where it came from.",
+      );
+    }
     const res = await api(`/tabs/${encodeURIComponent(this.tabId)}/navigate`, {
       method: "POST",
       body: { url, userId: USER_ID },

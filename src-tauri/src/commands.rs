@@ -1657,6 +1657,7 @@ pub async fn start_chat(
         .filter(|d| !d.trim().is_empty())
         .unwrap_or(default_working_dir);
     let host_cwd = PathBuf::from(&working_dir);
+    pub allow_host_commands: bool,
     if !host_cwd.is_dir() {
         return Err(format!("Working directory does not exist: {working_dir}"));
     }
@@ -1676,6 +1677,7 @@ pub async fn start_chat(
         let _ = start_kali(working_dir.clone()).await;
     }
 
+        allow_host_commands: s.allow_host_commands,
     let permission = if args.mode == "ask" {
         Permission::ReadOnly
     } else {
@@ -1694,6 +1696,7 @@ pub async fn start_chat(
     );
 
     harness
+    pub allow_host_commands: Option<bool>,
         .start_thread(StartParams {
             provider,
             model_slug: args.model.clone(),
@@ -1769,6 +1772,11 @@ pub async fn send_message(app: AppHandle, state: State<'_, AppState>, args: Send
     };
     let overrides = turn_overrides_from(&state, &args, personality.as_deref(), kali_mode, custom.as_deref(), docker_mode);
     let harness = ensure_harness(&state, &app).await?;
+    if let Some(v) = args.allow_host_commands {
+        // Takes effect on the next host request; the bridge reads the switch
+        // per request rather than caching it.
+        s.allow_host_commands = v;
+    }
     harness
         .send_message(&args.thread_id, args.text, overrides, args.images)
         .await

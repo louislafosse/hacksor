@@ -112,6 +112,7 @@ type SettingsView = {
   runtime: string;
   warn_without_vpn?: boolean;
   limit_runtime_mount?: boolean;
+  allow_host_commands?: boolean;
   services_mode?: string;
 };
 type Notif = { method: string; params: any };
@@ -315,6 +316,7 @@ const state = {
   runtime: "host",
   warnWithoutVpn: true,
   limitRuntimeMount: false,
+  allowHostCommands: false,
   sessions: [] as Session[],
   activeSessionId: "",
   attachments: [] as { path: string; name: string; isImage: boolean }[],
@@ -878,6 +880,56 @@ function showBuildLog() {
 function toggleSidebar() {
   sidebar.classList.toggle("collapsed");
 }
+
+// A host command the agent asked for, waiting on the user.
+//
+// The agent runs in a container; this is the one path that reaches the real
+// machine, so the prompt shows the EXACT command and never summarises it. "Allow
+// for this session" is deliberately session-only — a blanket allow should not
+// outlive the window that granted it.
+type HostPrompt = { id: string; command: string; cwd?: string | null };
+
+function hostCmdPrompt(req: HostPrompt) {
+  const pop = el("div", "host-confirm");
+  pop.innerHTML =
+    `<div class="hc-head">Run on your machine?</div>` +
+    `<div class="hc-cmd"></div>` +
+    (req.cwd ? `<div class="hc-cwd"></div>` : "") +
+    `<div class="hc-actions">` +
+      `<button class="ghost" id="hc-no">Deny</button>` +
+      `<button class="ghost" id="hc-session">Allow this session</button>` +
+      `<button class="primary danger" id="hc-yes">Run once</button>` +
+    `</div>`;
+  // textContent, not innerHTML: the command is attacker-influenced text (it can
+  // come from a page or a forum post the agent read), and it must be shown as
+  // characters rather than parsed as markup.
+  (pop.querySelector(".hc-cmd") as HTMLElement).textContent = req.command;
+  if (req.cwd) (pop.querySelector(".hc-cwd") as HTMLElement).textContent = `in ${req.cwd}`;
+  (document.querySelector(".composer-wrap") ?? app).appendChild(pop);
+
+  const decide = (approve: boolean, remember: boolean) => {
+    pop.remove();
+    void invoke("host_cmd_decide", { id: req.id, approve, remember }).catch((e) =>
+      console.error("host_cmd_decide failed", e),
+    );
+  };
+  (pop.querySelector("#hc-yes") as HTMLButtonElement).onclick = () => decide(true, false);
+  (pop.querySelector("#hc-session") as HTMLButtonElement).onclick = () => decide(true, true);
+  (pop.querySelector("#hc-no") as HTMLButtonElement).onclick = () => decide(false, false);
+  (pop.querySelector("#hc-no") as HTMLButtonElement).focus();
+
+  // The host side stops waiting after two minutes; drop the prompt with it so a
+  // stale dialog can never approve a request that has already been refused.
+  const expiry = setTimeout(() => pop.remove(), 120_000);
+  pop.addEventListener("remove", () => clearTimeout(expiry));
+}
+
+void listen<HostPrompt>("host-cmd-request", (e) => hostCmdPrompt(e.payload));
+void listen<string>("host-cmd-expired", (e) => {
+  document.querySelectorAll(".host-confirm").forEach((n) => {
+    if ((n as HTMLElement).dataset.id === e.payload) n.remove();
+  });
+});
 
 // A link in an answer belongs in the user's own browser, not in this window.
 //
@@ -2144,6 +2196,7 @@ async function boot() {
   state.kaliMode = s.kali_mode;
   state.runtime = s.runtime;
   state.warnWithoutVpn = s.warn_without_vpn !== false;
+  state.allowHostCommands = s.allow_host_commands === true;
   state.limitRuntimeMount = !!s.limit_runtime_mount;
   state.keys = { openrouter: s.has_openrouter_key, vercel: s.has_vercel_key, cheaperInference: s.has_cheaper_inference_key, abliteration: s.has_abliteration_key };
 
@@ -5917,6 +5970,11 @@ function openSettings(force = false) {
         onMountChange: (v) => {
           state.limitRuntimeMount = v;
           void invoke("save_settings", { args: { limit_runtime_mount: v } }).catch((e) => alert(String(e)));
+        },
+        allowHostCommands: state.allowHostCommands,
+        onHostCommandsChange: (v) => {
+          state.allowHostCommands = v;
+          void invoke("save_settings", { args: { allow_host_commands: v } }).catch((e) => alert(String(e)));
         },
         checkVpn: () => invoke<VpnStatus>("vpn_status"),
         describeVpn,
