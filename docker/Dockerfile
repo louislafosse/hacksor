@@ -347,7 +347,12 @@ RUN set -eux; \
     # points them at the user's home.
     mkdir -p /opt/mcp-reverse/.index-cache; \
     chmod 1777 /opt/mcp-reverse/.index-cache; \
-    node /opt/mcp-reverse/bin/mcp-reverse.mjs stats >/dev/null; \
+    # Upstream is cloned from main, and its CLI is not a stable surface: the
+    # entry point was renamed (bin/mcp-reverse.mjs -> bin/decompile.mjs) and
+    # the `stats` subcommand removed, which broke this build a week after it
+    # last passed. So check what this image actually depends on — the server
+    # entry named by `main` — and let the tools/list probe below be the gate.
+    node -e 'const m=require("/opt/mcp-reverse/package.json");const f="/opt/mcp-reverse/"+(m.main||"dist/index.js");if(!require("node:fs").existsSync(f)){console.error("BUILD FAILED: mcp-reverse entry missing:",f);process.exit(1)}console.log("mcp-reverse entry:",f)'; \
     node -e 'const{spawn}=require("node:child_process");const p=spawn("mcp-reverse",[],{stdio:["pipe","pipe","inherit"]});let b="";p.stdout.on("data",d=>{b+=d;for(const l of b.split("\n")){let m;try{m=JSON.parse(l)}catch{continue}if(m.id===2){const n=(m.result&&m.result.tools||[]).length;console.log("mcp-reverse tools:",n);if(n<50){console.error("BUILD FAILED: mcp-reverse advertised only "+n+" tools");process.exit(1)}p.kill();process.exit(0)}}});p.stdin.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"initialize",params:{protocolVersion:"2025-06-18",capabilities:{},clientInfo:{name:"build",version:"0"}}})+"\n");setTimeout(()=>{p.stdin.write(JSON.stringify({jsonrpc:"2.0",method:"notifications/initialized"})+"\n");p.stdin.write(JSON.stringify({jsonrpc:"2.0",id:2,method:"tools/list",params:{}})+"\n")},1500);setTimeout(()=>{console.error("BUILD FAILED: mcp-reverse did not answer tools/list");process.exit(1)},90000)'; \
     rm -rf /root/.npm /root/.cache
 
