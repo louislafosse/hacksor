@@ -1,3 +1,15 @@
+# [1.24.0](https://github.com/louislafosse/hacksor/compare/v1.23.1...v1.24.0) (2026-11-23)
+
+
+### Bug Fixes
+
+* **runtime:** the real context window, a fresh browser, and a Windows start ([efc6a43](https://github.com/louislafosse/hacksor/commit/efc6a43db50f11a0d4109cf46b64430656c0a30e))
+
+
+### Features
+
+* **host:** run a command on the host from the container, with approval ([d965477](https://github.com/louislafosse/hacksor/commit/d965477af26a6ac21242f2d94c9db6a9b910c190))
+
 ## [1.23.1](https://github.com/louislafosse/hacksor/compare/v1.23.0...v1.23.1) (2026-11-15)
 
 
