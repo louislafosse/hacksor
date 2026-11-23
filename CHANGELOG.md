@@ -1,3 +1,10 @@
+## [1.24.1](https://github.com/louislafosse/hacksor/compare/v1.24.0...v1.24.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* **runtime image:** upstream renamed the CLI the build called ([4b55a47](https://github.com/louislafosse/hacksor/commit/4b55a47c7702eae2f87fc46aed20445092c48482))
+
 # [1.24.0](https://github.com/louislafosse/hacksor/compare/v1.23.1...v1.24.0) (2026-11-23)
 
 
