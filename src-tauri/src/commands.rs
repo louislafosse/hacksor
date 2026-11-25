@@ -356,7 +356,61 @@ async fn docker_runtime(state: &AppState) -> bool {
 /// all route through the proxy). Idempotent `provider add --force`; a removed
 /// key removes the upstream. Runs against host ocx or the container's ocx per
 /// mode. Returns true if anything was (re)configured.
+/// Serialise the upstream setup, and remember what it was last set to.
+///
+/// Two code paths call `ensure_opencodex` when the app starts, so this ran
+/// TWICE CONCURRENTLY — measured on Windows, each `ocx provider add` takes ~22s
+/// and they run one provider after another, so the picker sat behind ~90s of
+/// configuration that had usually not changed since the last start.
+static UPSTREAM_SETUP: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+/// A digest of the upstreams-and-keys this process wants configured.
+///
+/// Not cryptographic and deliberately not reversible: it only answers "is this
+/// the same configuration as last time", and nothing writes key material to
+/// disk. A Rust version bump changing the hasher costs one redundant setup.
+fn upstream_fingerprint(keys: &[(crate::models::Provider, &'static str, Option<String>)]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (_, upstream, key) in keys {
+        upstream.hash(&mut h);
+        key.as_deref().unwrap_or("").hash(&mut h);
+    }
+    format!("{:016x}", h.finish())
+}
+
+/// The stamp lives INSIDE ocx's own home, so it shares that config's lifetime:
+/// if the config is gone, the stamp is gone with it and the upstreams are set
+/// up again rather than being skipped against a config that no longer exists.
+async fn upstream_stamp(docker: bool, write: Option<&str>) -> Option<String> {
+    let path = format!("{}/upstreams.stamp", ocx_codex_home(docker));
+    if docker {
+        let script = match write {
+            Some(fp) => format!("mkdir -p $(dirname {p}) && printf %s {fp} > {p}", p = path, fp = fp),
+            None => format!("cat {path} 2>/dev/null"),
+        };
+        runtime::exec_output(
+            RUNTIME_CONTAINER,
+            vec!["sh".into(), "-c".into(), script],
+            None,
+            None,
+        )
+        .await
+        .map(|(out, _)| out.trim().to_string())
+        .ok()
+    } else {
+        match write {
+            Some(fp) => {
+                let _ = std::fs::write(&path, fp);
+                None
+            }
+            None => std::fs::read_to_string(&path).ok().map(|v| v.trim().to_string()),
+        }
+    }
+}
+
 async fn configure_ocx_upstreams(state: &AppState) -> bool {
+    let _guard = UPSTREAM_SETUP.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
     let docker = docker_runtime(state).await;
     let keys: Vec<(crate::models::Provider, &'static str, Option<String>)> = {
         let s = state.settings.lock().await;
@@ -365,6 +419,11 @@ async fn configure_ocx_upstreams(state: &AppState) -> bool {
             .filter_map(|p| p.ocx_upstream().map(|u| (*p, u, s.key_for(*p).map(String::from))))
             .collect()
     };
+    // Already configured exactly this way: skip ~90s of `ocx provider add`.
+    let fingerprint = upstream_fingerprint(&keys);
+    if upstream_stamp(docker, None).await.as_deref() == Some(fingerprint.as_str()) {
+        return false;
+    }
     let mut changed = false;
     for (provider, upstream, key) in keys {
         match key {
@@ -383,6 +442,11 @@ async fn configure_ocx_upstreams(state: &AppState) -> bool {
                 }
             }
         }
+    }
+    // Only stamp a configuration that actually went in, so a failed setup is
+    // retried next time instead of being remembered as done.
+    if changed {
+        let _ = upstream_stamp(docker, Some(&fingerprint)).await;
     }
     changed
 }
@@ -3742,8 +3806,16 @@ async fn start_runtime(
         return Err("Runtime image not available yet — it downloads/builds on first use.".into());
     }
     if !runtime_container_running().await {
-        let (host_home, container_home, extra_binds) =
+        let (host_home, container_home, mut extra_binds) =
             runtime_binds(codex_home, working_dir, narrow_mount);
+        // Keep ocx's own home in a named volume rather than the container's
+        // /tmp. It holds the provider config, the upstream stamp and the 15 MB
+        // model catalog, and recreating the container threw all of it away —
+        // so every start paid ~90s of `ocx provider add` (measured at ~22s per
+        // provider on Windows) to rebuild configuration that had not changed.
+        // A volume also keeps it off the bind-mounted home, which on Windows is
+        // 9p and ~50x slower than container-local storage for small files.
+        extra_binds.push(format!("hacksor-ocx-home:{OCX_CODEX_HOME_CONTAINER}"));
         let spec = runtime::RunSpec {
             image: RUNTIME_IMAGE.to_string(),
             name: RUNTIME_CONTAINER.to_string(),
@@ -3875,9 +3947,35 @@ async fn start_runtime(
     }
     let _ = codex_home; // the home mount already covers codex-home + working dirs
     // Refresh vuln intel in the background so each session has fresh CVE data.
+    //
+    // Deduplicated, rate-limited and de-prioritised, because this is heavier
+    // than it looks: on Kali `searchsploit -u` runs apt AND git-pulls
+    // exploitdb-papers, and /usr/share/exploitdb is ~290 MB. This fires on
+    // every runtime-ready call, and nothing used to stop the copies stacking —
+    // three concurrent refreshes were observed on one machine, saturating CPU,
+    // network and the 9p home mount while the model picker sat waiting on ocx
+    // for over a minute.
+    //
+    // `mkdir` is the lock because it is atomic on every filesystem here. The
+    // stamp lives in the user's home so it survives the container being
+    // recreated: restarting the app five times a day should cost one refresh,
+    // not five. `nice` keeps the agent's own work ahead of a data download.
     let _ = runtime::exec_detached(
         RUNTIME_CONTAINER,
-        vec!["sh".into(), "-c".into(), "nuclei -update-templates -silent >/dev/null 2>&1; searchsploit -u >/dev/null 2>&1".into()],
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "LOCK=/tmp/hacksor-intel.lock; \
+             STAMP=\"$HOME/.hacksor/intel.stamp\"; \
+             mkdir \"$LOCK\" 2>/dev/null || exit 0; \
+             trap 'rmdir \"$LOCK\" 2>/dev/null' EXIT INT TERM; \
+             if [ -f \"$STAMP\" ] && [ -z \"$(find \"$STAMP\" -mmin +1440 2>/dev/null)\" ]; then exit 0; fi; \
+             mkdir -p \"$(dirname \"$STAMP\")\" 2>/dev/null; \
+             nice -n 19 nuclei -update-templates -silent >/dev/null 2>&1; \
+             nice -n 19 searchsploit -u >/dev/null 2>&1; \
+             touch \"$STAMP\""
+                .into(),
+        ],
         exec_user(),
     )
     .await;
@@ -5599,6 +5697,52 @@ fn personality_section(personality: Option<&str>) -> String {
         _ => return String::new(),
     };
     format!("\n\n<personality>\n{body}\n</personality>")
+}
+
+#[cfg(test)]
+mod upstream_tests {
+    use super::upstream_fingerprint;
+    use crate::models::Provider;
+
+    fn pair(p: Provider, u: &'static str, k: Option<&str>) -> (Provider, &'static str, Option<String>) {
+        (p, u, k.map(String::from))
+    }
+
+    #[test]
+    fn the_same_keys_produce_the_same_fingerprint() {
+        // This is what lets a restart skip ~90s of provider setup, so an
+        // unchanged configuration must hash identically every time.
+        let a = vec![pair(Provider::OpenRouter, "openrouter", Some("k1"))];
+        let b = vec![pair(Provider::OpenRouter, "openrouter", Some("k1"))];
+        assert_eq!(upstream_fingerprint(&a), upstream_fingerprint(&b));
+    }
+
+    #[test]
+    fn a_changed_key_changes_the_fingerprint() {
+        // The opposite risk: a new key that is never applied because the old
+        // configuration is remembered as current.
+        let before = vec![pair(Provider::OpenRouter, "openrouter", Some("k1"))];
+        let after = vec![pair(Provider::OpenRouter, "openrouter", Some("k2"))];
+        assert_ne!(upstream_fingerprint(&before), upstream_fingerprint(&after));
+    }
+
+    #[test]
+    fn removing_a_key_changes_the_fingerprint() {
+        let with = vec![pair(Provider::Vercel, "vercel-ai-gateway", Some("k"))];
+        let without = vec![pair(Provider::Vercel, "vercel-ai-gateway", None)];
+        assert_ne!(upstream_fingerprint(&with), upstream_fingerprint(&without));
+    }
+
+    #[test]
+    fn no_key_material_appears_in_the_fingerprint() {
+        // It is written to disk inside the container, so it must not carry the
+        // key it was computed from.
+        let secret = "sk-or-v1-averydistinctivesecret";
+        let fp = upstream_fingerprint(&[pair(Provider::OpenRouter, "openrouter", Some(secret))]);
+        assert!(!fp.contains("sk-or"), "{fp}");
+        assert!(!fp.contains(secret), "{fp}");
+        assert_eq!(fp.len(), 16, "expected a short hex digest, got {fp}");
+    }
 }
 
 #[cfg(test)]
