@@ -1,3 +1,10 @@
+## [1.24.2](https://github.com/louislafosse/hacksor/compare/v1.24.1...v1.24.2) (2026-11-25)
+
+
+### Bug Fixes
+
+* **startup:** stop redoing the proxy setup and the intel download every launch ([6fab488](https://github.com/louislafosse/hacksor/commit/6fab488ca3017758fb2d73aecf956bf78c06c36f))
+
 ## [1.24.1](https://github.com/louislafosse/hacksor/compare/v1.24.0...v1.24.1) (2026-11-23)
 
 
