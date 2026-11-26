@@ -1,3 +1,15 @@
+# [1.25.0](https://github.com/louislafosse/hacksor/compare/v1.24.2...v1.25.0) (2026-11-26)
+
+
+### Bug Fixes
+
+* **startup:** say what the runtime is doing, and stop it racing itself ([c4b1bf6](https://github.com/louislafosse/hacksor/commit/c4b1bf61a3516cbdf809a3ffda8e6067cf124c23))
+
+
+### Features
+
+* **session:** export a session and continue it on another machine ([f6bbf62](https://github.com/louislafosse/hacksor/commit/f6bbf626702fa9ca5f47d3e52c553f2c1e8fb8c0))
+
 ## [1.24.2](https://github.com/louislafosse/hacksor/compare/v1.24.1...v1.24.2) (2026-11-25)
 
 
