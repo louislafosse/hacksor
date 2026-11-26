@@ -638,6 +638,7 @@ app.innerHTML = `
       <div class="section-label section-label-row">
         <span>Recents</span>
         <button class="cat-add" id="catadd" title="New category">+ Category</button>
+        <button class="cat-add" id="sessimport" title="Import a session exported from another machine">Import</button>
       </div>
       <div class="chat-list" id="sesslist"></div>
       <div class="chat-list" id="recentslist"></div>
@@ -1004,6 +1005,7 @@ window.addEventListener("keydown", (e) => {
 
 document.getElementById("newchat")!.addEventListener("click", () => newSession());
 document.getElementById("catadd")!.addEventListener("click", () => openCategoryDialog());
+document.getElementById("sessimport")!.addEventListener("click", () => openImportDialog());
 document.getElementById("settingsbtn")!.addEventListener("click", () => openSettings());
 document.getElementById("notesbtn")!.addEventListener("click", () => openNotes());
 document.getElementById("engagementbtn")!.addEventListener("click", () => openEngagement());
@@ -1787,7 +1789,12 @@ function renderSidebar() {
         if (s) archiveSession(s.id);
         else { archivedIds.add(row.key); saveSet("hacksor-archived", archivedIds); renderSidebar(); }
       };
-      openArchiveMenu(e.currentTarget as HTMLElement, justArchive, () => openPurgeDialog(row, s));
+      openArchiveMenu(
+        e.currentTarget as HTMLElement,
+        justArchive,
+        () => openPurgeDialog(row, s),
+        () => openExportDialog(row),
+      );
     });
     return item;
   };
@@ -2046,11 +2053,20 @@ function startRowDrag(item: HTMLElement, tid: string, title: string) {
 // and the note on disk. The button offers both, because "I am done with this"
 // and "no trace of this should remain" are different intentions and only the
 // second one is irreversible.
-function openArchiveMenu(anchorEl: HTMLElement, onArchive: () => void, onDelete: () => void) {
+const EXPORT_ICON =
+  `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>`;
+
+function openArchiveMenu(
+  anchorEl: HTMLElement,
+  onArchive: () => void,
+  onDelete: () => void,
+  onExport: () => void,
+) {
   document.querySelector(".ctx-pop")?.remove();
   const pop = el("div", "ctx-pop");
   pop.innerHTML =
     `<button class="ctx-item" data-a="archive">${ARCHIVE_ICON}<span>Archive chat</span></button>` +
+    `<button class="ctx-item" data-a="export">${EXPORT_ICON}<span>Export session…</span></button>` +
     `<button class="ctx-item danger" data-a="delete">${DELETE_ICON}<span>Delete data…</span></button>`;
   document.body.appendChild(pop);
   const r = anchorEl.getBoundingClientRect();
@@ -2063,8 +2079,204 @@ function openArchiveMenu(anchorEl: HTMLElement, onArchive: () => void, onDelete:
     const b = (ev.target as HTMLElement).closest(".ctx-item") as HTMLElement | null;
     if (!b) return;
     close();
-    if (b.dataset.a === "archive") onArchive(); else onDelete();
+    if (b.dataset.a === "archive") onArchive();
+    else if (b.dataset.a === "export") onExport();
+    else onDelete();
   });
+}
+
+// Report the outcome of an export or import. Both can end with something the
+// user must act on — a missing target file, an unencrypted bundle — so neither
+// ends silently.
+function showResult(title: string, html: string) {
+  const bg = el("div", "modal-bg");
+  bg.innerHTML = `
+    <div class="modal narrow">
+      <button class="modal-close" id="r-close" title="Close (Esc)">✕</button>
+      <h2>${title}</h2>
+      <p>${html}</p>
+      <div class="actions">
+        <button class="primary" id="r-ok">OK</button>
+      </div>
+    </div>`;
+  app.appendChild(bg);
+  const close = () => { document.removeEventListener("keydown", esc); bg.remove(); };
+  const esc = (e: KeyboardEvent) => { if (e.key === "Escape") { e.preventDefault(); close(); } };
+  document.addEventListener("keydown", esc);
+  bg.querySelector("#r-close")!.addEventListener("click", close);
+  bg.querySelector("#r-ok")!.addEventListener("click", close);
+  bg.addEventListener("mousedown", (e) => { if (e.target === bg) close(); });
+}
+
+// Export one chat to a file that another machine can continue from.
+//
+// Not a summary for a fresh agent to read: the bundle carries the conversation
+// itself, so resuming replays the real history, tool calls and results. The
+// passphrase is on by default because a pentest transcript routinely contains
+// credentials and client data, and this file is made to travel.
+async function openExportDialog(row: { key: string; tid?: string | null; title: string }) {
+  if (!row.tid) {
+    showResult("Nothing to export", "This chat has no stored conversation yet — send a message first.");
+    return;
+  }
+  const bg = el("div", "modal-bg");
+  bg.innerHTML = `
+    <div class="modal narrow">
+      <button class="modal-close" id="x-close" title="Close (Esc)">✕</button>
+      <h2>Export session</h2>
+      <p>Carries the conversation, the engagement notes, the analysis already
+         produced, and a hash of every file in the working directory so the other
+         machine can tell it has the same ones. Target files themselves and your
+         API keys are not included.</p>
+      <label class="purge-row">
+        <input type="checkbox" id="x-enc" checked />
+        <span><b>Protect with a passphrase</b><em>Encrypts the file (AES-256-GCM). Without this the transcript is readable by anyone who gets the file.</em></span>
+      </label>
+      <input class="x-pass" id="x-pw" type="password" placeholder="Passphrase" autocomplete="new-password" />
+      <p class="purge-msg" id="x-msg" hidden></p>
+      <div class="actions">
+        <button class="ghost" id="x-cancel">Cancel</button>
+        <button class="primary" id="x-go">Choose file…</button>
+      </div>
+    </div>`;
+  app.appendChild(bg);
+  const pw = bg.querySelector("#x-pw") as HTMLInputElement;
+  const enc = bg.querySelector("#x-enc") as HTMLInputElement;
+  const msg = bg.querySelector("#x-msg") as HTMLElement;
+  const go = bg.querySelector("#x-go") as HTMLButtonElement;
+  const syncPw = () => { pw.hidden = !enc.checked; };
+  syncPw();
+  enc.addEventListener("change", syncPw);
+  const close = () => { document.removeEventListener("keydown", esc); bg.remove(); };
+  const esc = (e: KeyboardEvent) => { if (e.key === "Escape") { e.preventDefault(); close(); } };
+  document.addEventListener("keydown", esc);
+  bg.querySelector("#x-close")!.addEventListener("click", close);
+  bg.querySelector("#x-cancel")!.addEventListener("click", close);
+  bg.addEventListener("mousedown", (e) => { if (e.target === bg) close(); });
+
+  go.addEventListener("click", async () => {
+    if (enc.checked && pw.value.length < 8) {
+      msg.hidden = false;
+      msg.textContent = "Use at least 8 characters, or turn the passphrase off deliberately.";
+      return;
+    }
+    const safe = (row.title || "session").replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 48);
+    const dest = await invoke<string | null>("plugin:dialog|save", {
+      options: {
+        title: "Export session",
+        defaultPath: `${safe}.hacksor`,
+        filters: [{ name: "Hacksor session", extensions: ["hacksor"] }],
+      },
+    }).catch(() => null);
+    if (!dest) return;
+    go.disabled = true;
+    go.textContent = "Exporting…";
+    try {
+      const out = await invoke<any>("export_session", {
+        threadId: row.tid,
+        dest,
+        passphrase: enc.checked ? pw.value : null,
+        title: row.title || null,
+      });
+      const mb = (out.bytes / 1048576).toFixed(1);
+      close();
+      showResult(
+        "Session exported",
+        `${mb} MB${out.encrypted ? ", encrypted" : ", NOT encrypted"} · ${out.manifest.model ?? "model unknown"}<br>` +
+          `${out.manifest.counts.rollout_lines} conversation records · ` +
+          `${out.manifest.counts.artifacts} analysis file(s) · ` +
+          `${out.manifest.counts.workspace_files} file(s) fingerprinted<br>` +
+          `<code>${out.path}</code>`,
+      );
+    } catch (e) {
+      msg.hidden = false;
+      msg.textContent = String(e);
+      go.disabled = false;
+      go.textContent = "Choose file…";
+    }
+  });
+}
+
+// Import a bundle and make it a chat here. The imported thread gets a NEW id,
+// so it can never overwrite a conversation already on this machine.
+async function openImportDialog() {
+  const src = await invoke<string | null>("plugin:dialog|open", {
+    options: {
+      title: "Import session",
+      multiple: false,
+      directory: false,
+      filters: [{ name: "Hacksor session", extensions: ["hacksor"] }],
+    },
+  }).catch(() => null);
+  if (!src) return;
+  const path = typeof src === "string" ? src : (src as any)?.path;
+  if (!path) return;
+
+  const run = async (passphrase: string | null): Promise<void> => {
+    try {
+      const out = await invoke<any>("import_session", { src: path, passphrase, targetCwd: null });
+      // Name it before the sidebar draws, so it never flashes up as the raw
+      // first message of someone else's machine.
+      setChatTitle(out.thread_id, out.title);
+      await loadRecents();
+      renderSidebar();
+      const lines = [
+        `Saved as <b>${out.title}</b> in Recents.`,
+        `Model: <b>${out.model ?? "unknown"}</b> — select it before continuing.`,
+        `Working directory here: <code>${out.local_cwd}</code>`,
+      ];
+      if (out.source_cwd && out.source_cwd !== out.local_cwd) {
+        lines.push(`It was <code>${out.source_cwd}</code> on the other machine; the chat has been told.`);
+      }
+      if (out.missing_files?.length) {
+        lines.push(`<b>${out.missing_files.length} file(s)</b> from that work are not on this machine.`);
+      }
+      if (out.changed_files?.length) {
+        lines.push(`<b>${out.changed_files.length} file(s)</b> here differ from the ones analysed.`);
+      }
+      if (out.restored_artifacts) {
+        lines.push(`${out.restored_artifacts} analysis file(s) restored to <code>.hacksor-imported/</code>.`);
+      }
+      lines.push('Open it in Recents and say <b>"Continue"</b>.');
+      showResult("Session imported", lines.join("<br>"));
+    } catch (e) {
+      const text = String(e);
+      if (text.includes("passphrase")) {
+        askPassphrase(text.includes("wrong passphrase") ? "That passphrase did not work." : "", run);
+        return;
+      }
+      showResult("Import failed", text);
+    }
+  };
+  await run(null);
+}
+
+// Ask for the passphrase of an encrypted bundle.
+function askPassphrase(note: string, then: (pw: string) => void) {
+  const bg = el("div", "modal-bg");
+  bg.innerHTML = `
+    <div class="modal narrow">
+      <button class="modal-close" id="i-close" title="Close (Esc)">✕</button>
+      <h2>Passphrase</h2>
+      <p>${note || "This session file is encrypted."}</p>
+      <input class="x-pass" id="i-pw" type="password" placeholder="Passphrase" autocomplete="off" />
+      <div class="actions">
+        <button class="ghost" id="i-cancel">Cancel</button>
+        <button class="primary" id="i-go">Import</button>
+      </div>
+    </div>`;
+  app.appendChild(bg);
+  const pw = bg.querySelector("#i-pw") as HTMLInputElement;
+  const close = () => { document.removeEventListener("keydown", esc); bg.remove(); };
+  const esc = (e: KeyboardEvent) => { if (e.key === "Escape") { e.preventDefault(); close(); } };
+  document.addEventListener("keydown", esc);
+  bg.querySelector("#i-close")!.addEventListener("click", close);
+  bg.querySelector("#i-cancel")!.addEventListener("click", close);
+  bg.addEventListener("mousedown", (e) => { if (e.target === bg) close(); });
+  const submit = () => { const v = pw.value; close(); then(v); };
+  bg.querySelector("#i-go")!.addEventListener("click", submit);
+  pw.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+  setTimeout(() => pw.focus(), 0);
 }
 
 // Choose exactly what to destroy. Nothing is pre-ticked: every box here is a
@@ -2186,6 +2398,60 @@ async function pickWorkingDir() {
 
 // ---------------------------------------------------------------- boot
 
+// The startup gate: nothing is usable until the runtime and the model list are
+// ready, so say so instead of looking idle.
+//
+// Opening Hacksor starts a container, a proxy, and a model-catalog fetch, which
+// together take from a few seconds to a few minutes on a cold machine. The app
+// used to sit there looking finished, and typing into it in that state fails in
+// confusing ways. This blocks interaction and reports the real phase.
+//
+// It can always be dismissed. A gate that cannot be escaped turns a slow or
+// broken runtime into an unusable app, so the button appears after fifteen
+// seconds and immediately on any error.
+let gateEl: HTMLElement | null = null;
+
+function showStartupGate(message: string, detail?: string) {
+  if (!gateEl) {
+    gateEl = el("div", "startup-gate");
+    gateEl.innerHTML =
+      `<div class="sg-box">` +
+      `<div class="sg-spin"></div>` +
+      `<div class="sg-msg"></div>` +
+      `<div class="sg-sub"></div>` +
+      `<button class="ghost sg-skip" type="button" hidden>Continue without waiting</button>` +
+      `</div>`;
+    app.appendChild(gateEl);
+    gateEl.querySelector(".sg-skip")!.addEventListener("click", () => hideStartupGate());
+    setTimeout(() => {
+      const b = gateEl?.querySelector(".sg-skip") as HTMLElement | undefined;
+      if (b) b.hidden = false;
+    }, 15000);
+  }
+  (gateEl.querySelector(".sg-msg") as HTMLElement).textContent = message;
+  (gateEl.querySelector(".sg-sub") as HTMLElement).textContent =
+    detail ?? "The agent cannot run until the runtime container and the model list are ready.";
+}
+
+/// Report a startup failure in the gate and let the user past it at once.
+function failStartupGate(message: string) {
+  if (!gateEl) showStartupGate(message);
+  gateEl?.classList.add("error");
+  (gateEl?.querySelector(".sg-msg") as HTMLElement).textContent = "Startup problem";
+  (gateEl?.querySelector(".sg-sub") as HTMLElement).textContent = message;
+  (gateEl?.querySelector(".sg-spin") as HTMLElement).hidden = true;
+  const b = gateEl?.querySelector(".sg-skip") as HTMLElement | undefined;
+  if (b) {
+    b.hidden = false;
+    b.textContent = "Continue anyway";
+  }
+}
+
+function hideStartupGate() {
+  gateEl?.remove();
+  gateEl = null;
+}
+
 async function boot() {
   state.providers = await invoke<ProviderInfo[]>("list_providers");
   const s = await invoke<SettingsView>("get_settings");
@@ -2263,7 +2529,23 @@ async function boot() {
   // ~19s) — minutes while Docker provisions. The sidebar stayed empty for all
   // of it, for no reason.
   loadRecents();
-  await loadModels();
+  // Before the model list, not after: list_models waits out the container and
+  // proxy start anyway, and running this first means those phases are reported
+  // while the user waits rather than afterwards.
+  prepareRuntime();
+  showStartupGate("Starting the runtime…");
+  try {
+    await loadModels();
+  } catch (e) {
+    failStartupGate(String(e));
+  }
+  if (state.models.length) hideStartupGate();
+  else if (state.keys.openrouter || state.keys.vercel) {
+    failStartupGate("The runtime started but no models were listed. Open Settings → Providers, or try again.");
+  } else {
+    // No key yet: onboarding below is the right next step, not a gate.
+    hideStartupGate();
+  }
   // First-run onboarding: with no key configured for any provider, open Settings
   // straight away so the user lands on the one thing they must do to begin.
   if (!state.keys.openrouter && !state.keys.vercel) {
@@ -5206,6 +5488,12 @@ listen<{ line: string }>("hacksor://runtime-log", (evt) => {
     body.scrollTop = body.scrollHeight;
   }
 });
+  if (gateEl) {
+    const pct = typeof percent === "number" && phase === "pulling" ? ` — ${percent}%` : "";
+    showStartupGate(message + pct, phase === "pulling"
+      ? "Downloading the runtime image. This happens once and is several GB."
+      : undefined);
+  }
 
 listen<{ phase: string; message: string; percent?: number }>("hacksor://runtime", (evt) => {
   const { phase, message, percent } = evt.payload;
@@ -6385,10 +6673,21 @@ window.addEventListener("contextmenu", (e) => {
       add("Delete permanently", () => deleteSession(sess.dataset.id!), true);
     } else if (s) {
       const tid = sess.dataset.tid;
+      // Markdown is for reading elsewhere; this is for CONTINUING elsewhere.
+      add("Export session (portable)…", () =>
+        openExportDialog({ key: s.id, tid: s.threadId, title: s.title }));
       add(tid && pinnedIds.has(tid) ? "Unpin" : "Pin", () => togglePin(tid));
       add("Rename", () => renameSession(s.id));
       add("Export to Markdown", () => exportChat(s));
       add("Archive chat", () => archiveSession(s.id));
+      if (tid) {
+        add("Export session (portable)…", () =>
+          openExportDialog({
+            key: tid,
+            tid,
+            title: storedTitle(tid) || sess.querySelector(".chat-title")?.textContent?.trim() || "session",
+          }));
+      }
     } else {
       const tid = sess.dataset.tid;
       add(tid && pinnedIds.has(tid) ? "Unpin" : "Pin", () => togglePin(tid));

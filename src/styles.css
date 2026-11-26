@@ -1825,3 +1825,25 @@ input[type="checkbox"]:disabled { opacity: .4; cursor: default; }
 }
 .reauth-code:focus { outline: none; border-color: var(--ring, var(--muted-foreground)); }
 .reauth-row .msg-act { border: 1px solid var(--border); }
+
+/* Passphrase field in the session export/import dialogs. Full width so a long
+   passphrase stays readable as it is typed, and hidden entirely when the user
+   turns encryption off rather than greyed out — a disabled box invites typing
+   into it. */
+.x-pass {
+  width: 100%;
+  margin: 8px 0 4px;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  color: var(--fg);
+  font: inherit;
+}
+.x-pass:focus {
+  outline: none;
+  border-color: var(--fg-dim);
+}
+.x-pass[hidden] {
+  display: none;
+}

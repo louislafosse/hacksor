@@ -6,6 +6,7 @@
 mod commands;
 mod harness;
 mod hostbridge;
+mod portable;
 mod models;
 mod platform;
 mod runtime;
@@ -143,6 +144,8 @@ pub fn run() {
             commands::save_persona,
             commands::stop_runtime,
             commands::refresh_intel,
+            commands::export_session,
+            commands::import_session,
             commands::services_status,
             commands::app_version,
             commands::check_update,

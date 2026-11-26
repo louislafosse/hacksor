@@ -296,6 +296,29 @@ async fn ocx_alive_in_container() -> bool {
 /// the colliding one is dropped and reported instead of taking the runtime with
 /// it. A port that cannot be tested is treated as free: guessing "taken" would
 /// break the normal case to protect the rare one.
+/// Is this loopback port free right now?
+fn port_free(p: u16) -> bool {
+    match std::net::TcpListener::bind(("127.0.0.1", p)) {
+        // Dropped at once: this only answers "is it free right now", and Docker
+        // binds it a moment later.
+        Ok(l) => {
+            drop(l);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// A free host port for a container port, preferring the same number.
+///
+/// Returning `None` used to mean "do not publish", which left the app talking
+/// to whatever already held the port — on a developer machine that is often
+/// their OWN OpenCodex, with other providers and other keys. Searching for a
+/// free port instead means Hacksor always reaches its own proxy.
+fn pick_host_port(preferred: u16, span: u16) -> Option<u16> {
+    (preferred..preferred.saturating_add(span)).find(|p| port_free(*p))
+}
+
 fn free_host_ports(want: &[u16]) -> Vec<u16> {
     want.iter()
         .copied()
@@ -6669,5 +6692,207 @@ mod review_tests {
         assert_eq!(parse_review("not json").decision, "ask");
         assert_eq!(parse_review(r#"{"decision":"approve","risk":"none","reason":"recon"}"#).decision, "approve");
         assert_eq!(parse_review(r#"{"decision":"nonsense"}"#).decision, "ask");
+    }
+}
+
+// ------------------------------------------------------- portable sessions
+
+/// Translate a path recorded inside the container back to this host.
+///
+/// On macOS and Linux the runtime mounts the home at its own path, so this is
+/// identity. On Windows the home is `/hacksorhome`, and a rollout written there
+/// names paths that do not exist on the host at all.
+fn host_path_from_container(p: &str) -> std::path::PathBuf {
+    let home = platform::container_home_env();
+    let home = home.trim_end_matches(['/', '\\']);
+    if !home.is_empty() && p.starts_with(home) {
+        let rest = p[home.len()..].trim_start_matches(['/', '\\']);
+        let mut local = platform::home_dir();
+        for part in rest.split(['/', '\\']).filter(|s| !s.is_empty()) {
+            local.push(part);
+        }
+        return local;
+    }
+    std::path::PathBuf::from(p)
+}
+
+/// A human label for the bundle: the first thing the user asked.
+fn thread_title(rollout: &str) -> String {
+    for line in rollout.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let p = v.get("payload").unwrap_or(&v);
+        if p.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let text = p
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.iter().find_map(|c| c.get("text").and_then(|t| t.as_str())))
+            .unwrap_or("");
+        let text = text.trim();
+        // Skip the environment preamble codex injects before the real request.
+        if text.is_empty() || text.starts_with('<') {
+            continue;
+        }
+        return truncate(text.lines().next().unwrap_or(text), 60);
+    }
+    "Hacksor session".into()
+}
+
+/// Export one chat to a `.hacksor` bundle.
+#[tauri::command]
+pub async fn export_session(
+    state: State<'_, AppState>,
+    thread_id: String,
+    dest: String,
+    passphrase: Option<String>,
+    // What the sidebar calls this chat. The rollout only knows the first
+    // message, so without this an export loses the name the user gave it.
+    title: Option<String>,
+) -> Result<crate::portable::ExportSummary, String> {
+    let codex_home = state.codex_home.clone();
+    let working_dir = {
+        let s = state.settings.lock().await;
+        s.working_dir.clone()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = find_rollout(&codex_home, &thread_id)
+            .ok_or_else(|| "That chat has no stored conversation to export.".to_string())?;
+        let rollout = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let meta = crate::portable::session_meta(&rollout);
+
+        // Prefer the directory the thread actually worked in; fall back to the
+        // app's configured one, since a thread can predate that record.
+        let cwd = meta
+            .cwd
+            .clone()
+            .map(|c| host_path_from_container(&c))
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| std::path::PathBuf::from(&working_dir));
+
+        let engagement = engagement_dir_in_rollout(&rollout).map(|d| host_path_from_container(&d));
+        let hacksor_home = platform::home_dir().join(".hacksor");
+        let memory: Vec<std::path::PathBuf> = ["lessons.jsonl", "fp-memory.jsonl"]
+            .iter()
+            .map(|n| hacksor_home.join(n))
+            .filter(|p| p.is_file())
+            .collect();
+
+        let manifest = crate::portable::Manifest {
+            schema: crate::portable::SCHEMA,
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            source_os: std::env::consts::OS.to_string(),
+            thread_id: thread_id.clone(),
+            title: title
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| thread_title(&rollout)),
+            model: crate::portable::model_from_rollout(&rollout),
+            provider: meta.provider.clone(),
+            context_window: meta.context_window,
+            cwd: meta.cwd.clone(),
+            engagement: engagement
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string()),
+            counts: Default::default(),
+        };
+
+        let (archive, manifest) = crate::portable::build_bundle(
+            &path,
+            manifest,
+            engagement.as_deref(),
+            &memory,
+            Some(cwd.as_path()),
+        )
+        .map_err(|e| e.to_string())?;
+
+        let encrypted = passphrase.as_deref().map(|p| !p.is_empty()).unwrap_or(false);
+        let sealed = crate::portable::seal(&archive, passphrase.as_deref())
+            .map_err(|e| e.to_string())?;
+        std::fs::write(&dest, &sealed).map_err(|e| format!("writing {dest}: {e}"))?;
+
+        Ok(crate::portable::ExportSummary {
+            path: dest,
+            bytes: sealed.len() as u64,
+            encrypted,
+            manifest,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Import a `.hacksor` bundle and make it a resumable chat on this machine.
+#[tauri::command]
+pub async fn import_session(
+    state: State<'_, AppState>,
+    src: String,
+    passphrase: Option<String>,
+    target_cwd: Option<String>,
+) -> Result<crate::portable::ImportSummary, String> {
+    let codex_home = state.codex_home.clone();
+    let working_dir = {
+        let s = state.settings.lock().await;
+        s.working_dir.clone()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = std::fs::read(&src).map_err(|e| format!("reading {src}: {e}"))?;
+        let archive = crate::portable::unseal(&file, passphrase.as_deref())
+            .map_err(|e| e.to_string())?;
+        let bundle = crate::portable::unpack(&archive).map_err(|e| e.to_string())?;
+
+        // Where the work continues here: what the user chose, else the same
+        // path if this machine happens to have it, else the configured one.
+        let local_cwd = target_cwd
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                bundle
+                    .manifest
+                    .cwd
+                    .as_deref()
+                    .map(host_path_from_container)
+                    .filter(|p| p.is_dir())
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from(&working_dir));
+        std::fs::create_dir_all(&local_cwd).map_err(|e| e.to_string())?;
+
+        let summary = crate::portable::install(
+            &bundle,
+            &codex_home,
+            &local_cwd,
+            &platform::home_dir().join(".hacksor"),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(summary)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::{pick_host_port, port_free};
+
+    #[test]
+    fn the_preferred_port_is_used_when_it_is_free() {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = l.local_addr().unwrap().port();
+        drop(l);
+        assert_eq!(pick_host_port(taken, 5), Some(taken));
+    }
+
+    #[test]
+    fn a_taken_port_moves_to_the_next_free_one() {
+        // The case that matters: the user's own OpenCodex already holds the
+        // port Hacksor prefers.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = held.local_addr().unwrap().port();
+        assert!(!port_free(taken));
+        let picked = pick_host_port(taken, 20).expect("a nearby port should be free");
+        assert_ne!(picked, taken, "must not hand back the port someone else holds");
+        assert!(picked > taken && picked < taken + 20, "picked {picked} for {taken}");
+        drop(held);
     }
 }

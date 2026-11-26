@@ -39,6 +39,12 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 bollard = "0.17"
 futures-util = "0.3"
 tar = "0.4"
+# Portable session bundles (.hacksor). All three are already in the dependency
+# tree — flate2 and sha2 transitively, ring via rustls — so naming them here
+# adds no compilation, and the bundle needs no new crypto stack of its own.
+flate2 = "1"
+sha2 = "0.10"
+ring = "0.17"
 
 [profile.release]
 codegen-units = 1
