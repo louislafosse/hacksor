@@ -3816,18 +3816,31 @@ fn runtime_binds(codex_home: &std::path::Path, working_dir: &str, narrow: bool) 
     (work.to_string(), work_c, vec![format!("{}:{}", codex_home.display(), home)])
 }
 
+/// One runtime start at a time.
+///
+/// Several paths want the runtime up the moment the app opens — the startup
+/// provisioning and the model list among them — and they used to race:
+/// each saw "not running", each cleared the stale container by name, and the
+/// second cleared the one the first had just created. That surfaces as
+/// `Conflict. The container name "/hacksor-runtime" is already in use`, which
+/// reads like a leftover container rather than two starts colliding.
+static RUNTIME_START: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
 async fn start_runtime(
     codex_home: &std::path::Path,
     services_always_on: bool,
     narrow_mount: bool,
     working_dir: &str,
 ) -> Result<(), String> {
+    let _guard = RUNTIME_START.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
     if let Some(reason) = runtime::docker_unavailable_reason().await {
         return Err(reason);
     }
     if !runtime_image_exists().await {
         return Err("Runtime image not available yet — it downloads/builds on first use.".into());
     }
+    // Re-checked INSIDE the lock: whoever held it may have just started the
+    // container, and starting it again would tear down a working one.
     if !runtime_container_running().await {
         let (host_home, container_home, mut extra_binds) =
             runtime_binds(codex_home, working_dir, narrow_mount);
@@ -3857,9 +3870,32 @@ async fn start_runtime(
             // already serving 10100 — it reads the same `~/.opencodex`, so the
             // host side loses nothing by talking to that one instead.
             publish_ports: if rootful_linux() {
+                // Host networking: the container shares the host's stack, so
+                // there is nothing to publish and nothing to remap.
                 vec![]
             } else {
-                free_host_ports(&[models::OPENCODEX_PORT, PROXY_PORT])
+                let mut pairs = Vec::new();
+                match pick_host_port(models::OPENCODEX_PORT, 20) {
+                    Some(host) => {
+                        if host != models::OPENCODEX_PORT {
+                            eprintln!(
+                                "hacksor: 127.0.0.1:{} is in use (another OpenCodex?), so the \
+                                 runtime proxy is published on {host} instead",
+                                models::OPENCODEX_PORT
+                            );
+                        }
+                        models::set_host_port(host);
+                        pairs.push((host, models::OPENCODEX_PORT));
+                    }
+                    None => eprintln!(
+                        "hacksor: no free port near {} - the app cannot reach the runtime proxy",
+                        models::OPENCODEX_PORT
+                    ),
+                }
+                for p in free_host_ports(&[PROXY_PORT]) {
+                    pairs.push((p, p));
+                }
+                pairs
             },
         };
         runtime::create_and_start(&spec).await?;

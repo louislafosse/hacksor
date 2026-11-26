@@ -745,7 +745,18 @@ enabled = true\n",
     // In Docker mode the OpenCodex proxy runs INSIDE the same container as the
     // app-server, so it's reached at the container's own `127.0.0.1` on every
     // platform. In host mode both are on the host — also `127.0.0.1`. So the
-    // base_url is always the pinned loopback port.
+    // Which side of the container boundary this config will be read from.
+    //
+    // In Docker mode codex runs INSIDE the container and reaches ocx on the
+    // container's own loopback, which is always 10100. The app may be reaching
+    // the same proxy on a different published port, because the user can have
+    // their own OpenCodex on 10100 — writing the app's port here would send
+    // codex to a port that does not exist in its namespace.
+    let proxy_url = if is_docker {
+        crate::models::container_base_url()
+    } else {
+        Provider::OpenCodex.base_url()
+    };
     for provider in Provider::ALL {
         if provider.is_local_proxy() {
             // OpenCodex proxy: no env_key (local, optional bearer via header).
@@ -753,7 +764,7 @@ enabled = true\n",
                 "\n[model_providers.{id}]\nname = \"{name}\"\nbase_url = \"{url}\"\nwire_api = \"responses\"\nrequest_max_retries = 4\nstream_max_retries = 5\n[model_providers.{id}.env_http_headers]\nx-opencodex-api-key = \"{env}\"\n",
                 id = provider.id(),
                 name = provider.display(),
-                url = provider.base_url(),
+                url = proxy_url,
                 env = provider.env_key(),
             ));
         } else {

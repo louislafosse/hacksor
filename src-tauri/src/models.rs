@@ -4,7 +4,33 @@ use serde::Serialize;
 /// an OpenAI-compatible `/v1/responses` endpoint, the only wire API Codex speaks,
 /// plus a `/models` catalog we fetch live.
 /// Local OpenCodex proxy port (translates Codex Responses -> any provider).
+/// The port ocx listens on INSIDE the runtime container. Fixed, because
+/// nothing outside the container competes for it.
 pub const OPENCODEX_PORT: u16 = 10100;
+
+/// The port the APP reaches ocx on, which is not always the same number.
+///
+/// A user may already be running their own OpenCodex on 10100 — for their own
+/// codex session, say. Hacksor used to skip publishing in that case and then go
+/// on addressing 127.0.0.1:10100, which is that other instance: different
+/// providers, different keys, someone else's billing, and no sign anything was
+/// wrong. So the host side takes the first free port instead and the container
+/// keeps 10100.
+static HOST_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(OPENCODEX_PORT);
+
+pub fn host_port() -> u16 {
+    HOST_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_host_port(port: u16) {
+    HOST_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Where ocx is addressed from INSIDE the container (and by codex's config in
+/// Docker mode), as opposed to [`Provider::base_url`] which is the app's view.
+pub fn container_base_url() -> String {
+    format!("http://127.0.0.1:{OPENCODEX_PORT}/v1")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,12 +141,13 @@ impl Provider {
     }
 
     /// Everything now talks to the local OpenCodex proxy.
-    pub fn base_url(self) -> &'static str {
-        "http://127.0.0.1:10100/v1"
+    /// The app's own route to the proxy. See [`host_port`].
+    pub fn base_url(self) -> String {
+        format!("http://127.0.0.1:{}/v1", host_port())
     }
 
-    pub fn models_url(self) -> &'static str {
-        "http://127.0.0.1:10100/v1/models"
+    pub fn models_url(self) -> String {
+        format!("http://127.0.0.1:{}/v1/models", host_port())
     }
 
     pub fn env_key(self) -> &'static str {
@@ -312,14 +339,34 @@ mod tests {
     }
 
     #[test]
+    fn the_container_keeps_10100_whatever_port_the_app_uses() {
+        // The two sides are addressed differently on purpose: codex inside the
+        // container always reaches ocx on 10100, while the app may have been
+        // pushed onto another published port because the user runs their own
+        // OpenCodex. Writing the app's port into codex's config would send it
+        // to a port that does not exist in its namespace.
+        set_host_port(10107);
+        assert!(Provider::OpenCodex.base_url().contains("10107"));
+        assert!(Provider::OpenCodex.models_url().contains("10107"));
+        assert!(container_base_url().contains("10100"));
+        assert!(!container_base_url().contains("10107"));
+        set_host_port(OPENCODEX_PORT);
+        assert!(Provider::OpenCodex.base_url().contains("10100"));
+    }
+
+    #[test]
     fn all_providers_route_through_opencodex_proxy() {
         // Every composer provider now talks to the local OpenCodex proxy on the
         // pinned port and creates its Codex thread under the "opencodex" block;
         // the upstream is chosen by the model-id prefix.
         for p in Provider::ALL {
             assert!(p.is_local_proxy(), "{} should route via the proxy", p.id());
-            assert!(p.base_url().contains(&OPENCODEX_PORT.to_string()));
-            assert!(p.models_url().contains(&OPENCODEX_PORT.to_string()));
+            // The SHAPE, not the number: another test moves the host port, and
+            // comparing against a global that a parallel test can change makes
+            // this fail at random rather than when something is wrong.
+            assert!(p.base_url().starts_with("http://127.0.0.1:"), "{}", p.base_url());
+            assert!(p.base_url().ends_with("/v1"), "{}", p.base_url());
+            assert!(p.models_url().ends_with("/v1/models"), "{}", p.models_url());
             assert_eq!(p.codex_provider_id(), "opencodex");
             assert!(!p.models_need_key());
         }

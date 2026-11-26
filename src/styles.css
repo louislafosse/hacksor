@@ -1847,3 +1847,55 @@ input[type="checkbox"]:disabled { opacity: .4; cursor: default; }
 .x-pass[hidden] {
   display: none;
 }
+
+/* The startup gate. Covers everything because half-ready is the state that
+   produces confusing failures: a message typed before the proxy is up fails in
+   a way that looks like the model is broken. */
+.startup-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  display: grid;
+  place-items: center;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(3px);
+}
+.startup-gate .sg-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  max-width: 420px;
+  padding: 28px 32px;
+  text-align: center;
+}
+.startup-gate .sg-spin {
+  width: 22px;
+  height: 22px;
+  border: 2px solid var(--border);
+  border-top-color: var(--fg);
+  border-radius: 50%;
+  animation: sg-rot 0.8s linear infinite;
+}
+@keyframes sg-rot {
+  to { transform: rotate(360deg); }
+}
+/* Respect a reduced-motion preference: the spinner is decoration, the text is
+   the information. */
+@media (prefers-reduced-motion: reduce) {
+  .startup-gate .sg-spin { animation: none; opacity: 0.5; }
+}
+.startup-gate .sg-msg {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--fg);
+}
+.startup-gate .sg-sub {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--fg-dim);
+}
+/* The same amber the runtime banner uses for trouble, so the two read as
+   one system rather than two conventions. */
+.startup-gate.error .sg-msg { color: #e0a500; }
+.startup-gate .sg-skip { margin-top: 6px; }

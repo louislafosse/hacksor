@@ -236,7 +236,9 @@ pub struct RunSpec {
     /// RootlessKit's namespace (not the real host) and can't grant SYS_ADMIN/tun.
     pub host_net: bool,
     pub tun: bool,              // /dev/net/tun present (Linux)
-    pub publish_ports: Vec<u16>,// ports to publish to 127.0.0.1 (Docker Desktop)
+    /// (host, container) pairs published to 127.0.0.1 (Docker Desktop). The
+    /// two differ when the host port is already taken by something else.
+    pub publish_ports: Vec<(u16, u16)>,
 }
 
 /// Create + start the runtime container via the `docker` CLI. bollard's
@@ -248,6 +250,10 @@ pub struct RunSpec {
 pub async fn create_and_start(spec: &RunSpec) -> Result<(), String> {
     // Clear any stale container so `--name` never conflicts.
     let _ = docker_cli(&["rm", "-f", &spec.name], None).await;
+    // Docker can still report the name as taken: the removal above is
+    // asynchronous inside the daemon, and a container that was mid-create when
+    // it ran may register its name afterwards. One retry after a fresh removal
+    // turns a failed launch into a slightly slower one.
 
     let binds = format!("{}:{}", spec.host_home, spec.container_home);
     let home_env = format!("HOME={}", spec.container_home);
@@ -281,9 +287,9 @@ pub async fn create_and_start(spec: &RunSpec) -> Result<(), String> {
         }
         args.push("--security-opt".into());
         args.push("seccomp=unconfined".into());
-        for p in &spec.publish_ports {
+        for (host, container) in &spec.publish_ports {
             args.push("-p".into());
-            args.push(format!("127.0.0.1:{p}:{p}/tcp"));
+            args.push(format!("127.0.0.1:{host}:{container}/tcp"));
         }
     }
     args.push("-v".into());
@@ -301,7 +307,17 @@ pub async fn create_and_start(spec: &RunSpec) -> Result<(), String> {
     args.push("infinity".into());
 
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (out, code) = docker_cli(&argv, None).await?;
+    let (mut out, mut code) = docker_cli(&argv, None).await?;
+    // The name can still be taken: removal inside the daemon is asynchronous,
+    // and a container that was mid-create when we cleared it registers its name
+    // afterwards. Clear it again and make one more attempt, which turns a
+    // failed launch into a slightly slower one.
+    if code != 0 && out.contains("already in use by container") {
+        let _ = docker_cli(&["rm", "-f", &spec.name], None).await;
+        let (retry_out, retry_code) = docker_cli(&argv, None).await?;
+        out = retry_out;
+        code = retry_code;
+    }
     if code != 0 {
         let msg = out.trim();
         // `docker run` falls back to pulling an absent image from Docker Hub,

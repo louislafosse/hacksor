@@ -2453,6 +2453,7 @@ function hideStartupGate() {
 }
 
 async function boot() {
+  showStartupGate("Starting Hacksor…");
   state.providers = await invoke<ProviderInfo[]>("list_providers");
   const s = await invoke<SettingsView>("get_settings");
   state.provider = s.provider;
@@ -2552,10 +2553,6 @@ async function boot() {
     hint.textContent = "Add an API key in Settings to begin.";
     openSettings(true);
   }
-  // Provision the runtime UP FRONT (download/build the image + start the
-  // container + proxy) so it's ready before the first message — not lazily on
-  // send. Runs in the background; progress shows in the runtime banner.
-  prepareRuntime();
   // Last, so it never delays the UI coming up: if this launch is the first
   // after an update, show what changed.
   void showUpdateNotesOnce();
@@ -5488,15 +5485,15 @@ listen<{ line: string }>("hacksor://runtime-log", (evt) => {
     body.scrollTop = body.scrollHeight;
   }
 });
+
+listen<{ phase: string; message: string; percent?: number }>("hacksor://runtime", (evt) => {
+  const { phase, message, percent } = evt.payload;
   if (gateEl) {
     const pct = typeof percent === "number" && phase === "pulling" ? ` — ${percent}%` : "";
     showStartupGate(message + pct, phase === "pulling"
       ? "Downloading the runtime image. This happens once and is several GB."
       : undefined);
   }
-
-listen<{ phase: string; message: string; percent?: number }>("hacksor://runtime", (evt) => {
-  const { phase, message, percent } = evt.payload;
   const banner = ensureRuntimeBanner();
   banner.classList.remove("error");
   (banner.querySelector(".rt-bar") as HTMLElement).hidden = false;
@@ -6673,13 +6670,16 @@ window.addEventListener("contextmenu", (e) => {
       add("Delete permanently", () => deleteSession(sess.dataset.id!), true);
     } else if (s) {
       const tid = sess.dataset.tid;
-      // Markdown is for reading elsewhere; this is for CONTINUING elsewhere.
-      add("Export session (portable)…", () =>
-        openExportDialog({ key: s.id, tid: s.threadId, title: s.title }));
       add(tid && pinnedIds.has(tid) ? "Unpin" : "Pin", () => togglePin(tid));
       add("Rename", () => renameSession(s.id));
       add("Export to Markdown", () => exportChat(s));
+      // Markdown is for reading elsewhere; this is for CONTINUING elsewhere.
+      add("Export session (portable)…", () =>
+        openExportDialog({ key: s.id, tid: s.threadId, title: s.title }));
       add("Archive chat", () => archiveSession(s.id));
+    } else {
+      const tid = sess.dataset.tid;
+      add(tid && pinnedIds.has(tid) ? "Unpin" : "Pin", () => togglePin(tid));
       if (tid) {
         add("Export session (portable)…", () =>
           openExportDialog({
@@ -6688,9 +6688,6 @@ window.addEventListener("contextmenu", (e) => {
             title: storedTitle(tid) || sess.querySelector(".chat-title")?.textContent?.trim() || "session",
           }));
       }
-    } else {
-      const tid = sess.dataset.tid;
-      add(tid && pinnedIds.has(tid) ? "Unpin" : "Pin", () => togglePin(tid));
       if (tid) add("Archive chat", () => { archivedIds.add(tid); saveSet("hacksor-archived", archivedIds); renderSidebar(); });
     }
   } else if (bubble) {
